@@ -2,18 +2,23 @@
 name: utf8-guard
 description: >-
   Use in Windows projects with Chinese filenames, comments, docs, or terminal
-  output when an agent may hit UTF-8 versus GBK/CP936 issues. The key rule is:
-  do not assume garbled Chinese means file corruption. First distinguish real
+  output when an agent may hit UTF-8 versus GBK/CP936 issues. Prevention rules
+  (apply these from the description alone, without reading the body): do not
+  assume garbled Chinese means file corruption — first distinguish real
   content corruption from display-layer mis-decoding, wrong default file
   encoding, Git `core.quotepath` escaping of Chinese paths, or a non-UTF-8
-  terminal code page. When reading or writing text, prefer UTF-8 explicitly
-  (`encoding="utf-8"` or `PYTHONUTF8=1`) and only "fix" files after verifying
-  the underlying bytes are actually wrong.
+  terminal code page; when reading or writing text, prefer UTF-8 explicitly
+  (`encoding="utf-8"` or `PYTHONUTF8=1`); write UTF-8 without BOM unless the
+  project requires otherwise; before piping non-ASCII text to a native command
+  in Windows PowerShell 5.1, set `$OutputEncoding` to UTF-8 (it defaults to
+  ASCII and silently corrupts Chinese); only "fix" files after verifying the
+  underlying bytes are actually wrong. Read the body only when an actual
+  encoding failure needs troubleshooting.
 ---
 
 # UTF-8 Guard
 
-> Related: see `$powershell-guard` for PowerShell-specific syntax and execution issues in Windows.
+> Related: see `powershell-guard` for PowerShell-specific syntax and execution issues in Windows.
 
 Use this skill to avoid accidental encoding breakage in Windows environments.
 
@@ -157,9 +162,19 @@ Get-Content -Path "some-file.txt" -Encoding UTF8 -TotalCount 25
 ```
 
 ```powershell
-# Detect and strip UTF-8 BOM (U+FEFF / 0xEFBBBF)
-$content = Get-Content -Raw "some-file.txt"
-if ($content[0] -eq [char]0xFEFF) { $content = $content.Substring(1); Write-Host 'BOM detected and stripped' } else { Write-Host 'No BOM' }
+# Detect and strip UTF-8 BOM (0xEF 0xBB 0xBF) at the byte level.
+# Get-Content consumes a BOM as an encoding signature, so checking the first
+# char of its output cannot detect a BOM reliably — inspect raw bytes instead.
+$path = "some-file.txt"
+$bytes = [System.IO.File]::ReadAllBytes($path)
+if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+    $rest = New-Object byte[] ($bytes.Length - 3)
+    [Array]::Copy($bytes, 3, $rest, 0, $rest.Length)
+    [System.IO.File]::WriteAllBytes($path, $rest)
+    Write-Host 'BOM detected and stripped'
+} else {
+    Write-Host 'No BOM'
+}
 ```
 
 ## Decision Pattern

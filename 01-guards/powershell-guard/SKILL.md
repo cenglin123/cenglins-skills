@@ -1,17 +1,23 @@
 ---
 name: powershell-guard
 description: >-
-  Use in Windows projects when an agent may hit PowerShell-specific syntax or
-  execution issues. This is a guard skill: load it only when diagnosing or
-  fixing PowerShell command failures. It covers &&/|| incompatibility, workdir
-  vs cd, redirection behavior, $env: variables, alias traps (rm -rf, cp -r,
-  curl), quoting, and execution-policy errors. Agent should not read this skill
-  unless a PowerShell execution problem is suspected. Key rules: never use && or || in PowerShell 5.1; always use $env:VAR for environment variables; prefer the shell tool workdir parameter over cd.
+  Use in Windows projects when writing or running PowerShell commands, or when
+  diagnosing PowerShell command failures. Prevention rules (apply these from
+  the description alone, without reading the body): never use `&&` or `||` in
+  Windows PowerShell 5.1 — use `cmd1; if ($?) { cmd2 }`; read environment
+  variables as `$env:VAR` (never `$VAR` or `%VAR%`); prefer the shell tool's
+  workdir parameter over `cd`; `rm`, `cp`, `curl`, `ls`, `cat` are cmdlet
+  aliases that reject Unix flags — use `Remove-Item -Recurse -Force`,
+  `Copy-Item -Recurse`, `Invoke-WebRequest` or `curl.exe`; use `$LASTEXITCODE`
+  for numeric exit codes (`$?` is a boolean); `>` redirection writes UTF-16 in
+  PS 5.1 — use `Out-File -Encoding utf8` when other tools must read the file;
+  double-quote paths containing spaces. Read the body only when an actual
+  PowerShell failure needs troubleshooting.
 ---
 
 # PowerShell Guard
 
-> Related: see `$utf8-guard` for encoding/character-set issues in Windows PowerShell.
+> Related: see `utf8-guard` for encoding/character-set issues in Windows PowerShell.
 
 Use this skill to avoid accidental shell execution errors in Windows PowerShell environments.
 
@@ -76,13 +82,13 @@ Fix:
 
 Example:
 
-```powershell
-# Good
+```text
+# Good (shell tool call parameters, not PowerShell syntax)
 workdir: /foo/bar
 command: pytest tests
 ```
 
-```powershell
+```text
 # Bad
 cd /foo/bar && pytest tests
 ```
@@ -101,6 +107,7 @@ Cause:
 Fix:
 - for simple text logging, `>` and `>>` usually suffice
 - for byte-exact or binary redirection, prefer piping through `Out-File -Encoding utf8` or use `cmd /c`
+- note: in Windows PowerShell 5.1, `Out-File -Encoding utf8` writes UTF-8 **with BOM**; for BOM-less UTF-8 use `[System.IO.File]::WriteAllText($path, $text, [System.Text.UTF8Encoding]::new($false))`
 - when cross-platform compatibility matters, invoke `cmd /c "..."` for bash-style redirection
 
 ### Environment Variables
@@ -217,7 +224,7 @@ powershell -ExecutionPolicy Bypass -File script.ps1
 ### Line Endings (CRLF vs LF)
 
 Symptom:
-- scripts, here-strings (@'...'@"), or piped output behave differently between Windows and Unix
+- scripts, here-strings (`@'...'@`), or piped output behave differently between Windows and Unix
 - Git shows spurious `\r` diffs
 - native Linux tools fail to parse PowerShell-generated files
 
@@ -226,7 +233,12 @@ Cause:
 
 Fix:
 - configure Git: `git config --global core.autocrlf true`
-- for here-strings, use `...'@.Trim()` to strip trailing CR
+- when a Unix tool must consume PowerShell-generated text, normalize line endings explicitly before writing:
+
+```powershell
+$text = $text -replace "`r`n", "`n"
+```
+
 - use `.editorconfig` with `end_of_line = lf` for cross-platform projects
 
 
