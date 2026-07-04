@@ -5,15 +5,22 @@ description: >-
   Git, or when diagnosing CRLF/LF line-ending warnings. Prevention rules
   (apply these from the description alone, without reading the body): on
   Windows, most tools (Write/Edit/PowerShell Set-Content) produce CRLF by
-  default — after editing any text file, check for CRLF before committing;
-  the project should have `.gitattributes` with `* text=auto eol=lf` — if
-  missing, add it before editing files; never do bulk "normalize to CRLF"
-  commits — always normalize to LF; avoid PowerShell `Set-Content` for
-  text files (produces CRLF) — prefer `[System.IO.File]::WriteAllText`
-  with UTF-8 no-BOM encoding; after `git rm --cached` to untrack files,
-  verify the server's working copy still has the files (git reset --hard
-  deletes previously-tracked files). Read the body only when an actual CRLF
-  warning appears or line-ending issues need troubleshooting.
+  default — after editing any text file, check for CRLF with `git ls-files
+  --eol | Select-String "w/crlf"` before committing; if any files show
+  CRLF, convert them with `python -c "f='path'; open(f,'wb').write(open(f,
+  'rb').read().replace(b'\r\n',b'\n'))"` or batch-fix all with `python -c
+  "import os; [open(os.path.join(r,f),'wb').write(open(os.path.join(r,f),
+  'rb').read().replace(b'\r\n',b'\n')) for r,_,fs in os.walk('.') if
+  '.git' not in r for f in fs if f.endswith(('.md','.js','.jsx','.py',
+  '.json','.css','.html')) and b'\r\n' in open(os.path.join(r,f),
+  'rb').read()]"`; the project should have `.gitattributes` with `*
+  text=auto eol=lf` — if missing, add it before editing files; never do
+  bulk "normalize to CRLF" commits — always normalize to LF; avoid
+  PowerShell `Set-Content` for text files (produces CRLF) — prefer
+  `[System.IO.File]::WriteAllText` with UTF-8 no-BOM encoding; after
+  `git rm --cached` to untrack files, verify the server's working copy
+  still has the files (git reset --hard deletes previously-tracked
+  files). Read the body only when deeper troubleshooting is needed.
 ---
 
 # CRLF Guard
