@@ -7,13 +7,16 @@ description: >-
   Windows, most tools (Write/Edit/PowerShell Set-Content) produce CRLF by
   default — after editing any text file, check for CRLF with `git ls-files
   --eol | Select-String "w/crlf"` before committing; if any files show
-  CRLF, convert them with `python -c "f='path'; open(f,'wb').write(open(f,
-  'rb').read().replace(b'\r\n',b'\n'))"` or batch-fix all with `python -c
-  "import os; [open(os.path.join(r,f),'wb').write(open(os.path.join(r,f),
-  'rb').read().replace(b'\r\n',b'\n')) for r,_,fs in os.walk('.') if
-  '.git' not in r for f in fs if f.endswith(('.md','.js','.jsx','.py',
-  '.json','.css','.html')) and b'\r\n' in open(os.path.join(r,f),
-  'rb').read()]"`; the project should have `.gitattributes` with `*
+  CRLF, convert them with `python -c "f='path'; d=open(f,'rb').read();
+  open(f,'wb').write(d.replace(b'\r\n',b'\n'))"` (read into a variable
+  BEFORE opening write mode — open(f,'wb') truncates, so a nested
+  open(f,'rb').read() inside write() reads an already-emptied file and
+  silently yields a 0-byte file) or batch-fix all with `python -c
+  "import os; [open(p,'wb').write(d.replace(b'\r\n',b'\n')) for r,_,fs
+  in os.walk('.') if '.git' not in r for f in fs if f.endswith(('.md',
+  '.js','.jsx','.py','.json','.css','.html')) for p in
+  [os.path.join(r,f)] for d in [open(p,'rb').read()] if b'\r\n' in d]"`;
+  the project should have `.gitattributes` with `*
   text=auto eol=lf` — if missing, add it before editing files; never do
   bulk "normalize to CRLF" commits — always normalize to LF; avoid
   PowerShell `Set-Content` for text files (produces CRLF) — prefer
@@ -119,13 +122,17 @@ When a CRLF warning appears after editing files:
 ### Quick Fix (Single File)
 
 ```powershell
-python -c "f='path/to/file'; open(f,'wb').write(open(f,'rb').read().replace(b'\r\n',b'\n'))"
+python -c "f='path/to/file'; d=open(f,'rb').read(); open(f,'wb').write(d.replace(b'\r\n',b'\n'))"
 ```
+
+> **Read before write (order matters)**: bind the bytes to `d` first. `open(f,'wb')` truncates the file immediately — if you nest `open(f,'rb').read()` inside the `write()` call, the read sees an already-emptied file and silently produces a 0-byte file. (Real incident: an agent emptied `CHANGELOG.md` this way and committed the empty file.)
 
 ### Batch Fix (All Text Files)
 
+The `for p in [os.path.join(r,f)] for d in [open(p,'rb').read()]` clauses read each file into `d` **before** the `open(p,'wb')` in the expression body truncates it — inlining the read into the write call hits the same 0-byte trap as the single-file fix:
+
 ```powershell
-python -c "import os; [open(os.path.join(r,f),'wb').write(open(os.path.join(r,f),'rb').read().replace(b'\r\n',b'\n')) for r,_,fs in os.walk('.') if '.git' not in r and 'node_modules' not in r for f in fs if f.endswith(('.js','.jsx','.md','.css','.py','.json','.html','.txt')) and b'\r\n' in open(os.path.join(r,f),'rb').read()]"
+python -c "import os; [open(p,'wb').write(d.replace(b'\r\n',b'\n')) for r,_,fs in os.walk('.') if '.git' not in r and 'node_modules' not in r for f in fs if f.endswith(('.js','.jsx','.md','.css','.py','.json','.html','.txt')) for p in [os.path.join(r,f)] for d in [open(p,'rb').read()] if b'\r\n' in d]"
 ```
 
 ### Python Inline vs Script File
