@@ -11,10 +11,12 @@ param(
     [string[]]$Targets = @("$env:USERPROFILE\.agents\skills", "$env:USERPROFILE\.claude\skills")
 )
 
-$src = $PSScriptRoot
+$src = Join-Path $PSScriptRoot "skills"
 $synced = 0
 
-$skillFiles = Get-ChildItem $src -Recurse -Filter SKILL.md -File
+$skillFiles = Get-ChildItem $src -Directory | ForEach-Object {
+    Get-Item (Join-Path $_.FullName "SKILL.md") -ErrorAction Stop
+}
 foreach ($sf in $skillFiles) {
     $skillDir = $sf.Directory.FullName
     $skillName = $sf.Directory.Name
@@ -39,4 +41,5 @@ foreach ($sf in $skillFiles) {
     }
 }
 
-Write-Output "done: $synced copies synced" + $(if ($drift -gt 0) { " ($drift DRIFT remaining)" } else { ", 0 DRIFT" })
+$driftSummary = if ($drift -gt 0) { " ($drift DRIFT remaining)" } else { ", 0 DRIFT" }
+Write-Output "done: $synced copies synced$driftSummary"

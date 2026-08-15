@@ -1,0 +1,15 @@
+{
+  "name": "zhihu-answer-extractor",
+  "version": "1.0.0",
+  "description": "批量抓取知乎问题回答，绕过反爬检测",
+  "type": "module",
+  "scripts": {
+    "extract": "node extract.mjs",
+    "open": "node open.mjs"
+  },
+  "dependencies": {
+    "puppeteer-core": "^24.0.0",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
+  }
+}
