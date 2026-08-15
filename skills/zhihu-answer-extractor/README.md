@@ -37,23 +37,13 @@ node scripts/get-cookie.mjs
 3. 在知乎页面点击扩展图标 → 导出 → 选择 **Netscape HTTP Cookie File** 格式
 4. 保存为 `scripts/www.zhihu.com_cookies.txt`
 
-### 3. 修改参数
-
-编辑 `scripts/extract.mjs`，修改顶部 3 个参数：
-
-```javascript
-const QUESTION_URL = 'https://www.zhihu.com/question/XXXXXXXX';  // 目标问题 URL
-const ANSWERS_NEEDED = 50;                                         // 抓取数量
-const OUTPUT_FILE = '';  // 留空则自动生成到脚本同目录
-```
-
-### 4. 运行
+### 3. 运行
 
 ```bash
-node scripts/extract.mjs
+node scripts/extract.mjs --url "https://www.zhihu.com/question/XXXXXXXX" --count 50 --output "回答.txt"
 ```
 
-约 25 秒完成 50 条回答抓取。
+`--count` 默认为 50；省略 `--output` 时保存到脚本目录。`--max-wait` 可调整最长加载等待秒数，默认 180。
 
 ## 三种模式
 
@@ -70,7 +60,7 @@ node scripts/get-cookie.mjs
 headless 运行，速度快，输出 txt 文件：
 
 ```bash
-node scripts/extract.mjs
+node scripts/extract.mjs --url "https://www.zhihu.com/question/XXXXXXXX" --count 50
 ```
 
 ### 浏览模式（open.mjs）
@@ -95,6 +85,8 @@ URL: https://www.zhihu.com/question/2042649810709239000
 2,345 个回答
 抓取时间: 2026/8/10 16:56:05
 本次抓取: 50 条回答
+目标数量: 50 条回答
+停止原因: 达到目标数量 50
 ================================================================================
 
 【题干】
@@ -159,9 +151,12 @@ URL: https://www.zhihu.com/question/2042649810709239000
 
 知乎回答采用无限滚动加载。脚本通过以下方式确保加载足够数量：
 
-1. 每次滚动 1500px，间隔 1.2 秒
-2. 自动点击"展开"按钮，展开折叠的回答内容
-3. 连续 8 次滚动无新内容时自动停止（防止死循环）
+1. 优先定位包含回答列表的独立滚动容器，同时用页面滚动兜底
+2. 定位最后一条回答并继续下移，触发懒加载
+3. 自动展开折叠正文并点击“加载更多/查看更多回答”等按钮
+4. 使用多组回答选择器，并持续对照已加载数量和页面报告总数
+5. 达到目标数量、确认无更多内容，或在滚动末端持续无变化/超过最长等待时间后停止
+6. 在控制台和输出文件中记录停止原因，数量不足时给出警告
 
 ## 常见问题
 
@@ -181,7 +176,10 @@ Cookie 无效。解决：
 正常现象。可能原因：
 - 该问题回答数本身就不足目标数量
 - 部分回答被折叠且无法展开
-- 连续滚动无新内容，脚本自动停止
+- 网络或知乎接口响应超过 `--max-wait`
+- 知乎页面结构发生变化，备用选择器也未匹配
+
+先查看输出文件中的“停止原因”和终端显示的实际抓取数量。若是超时，可增大 `--max-wait` 后重试；若页面显示的回答数明显更多但仍提前结束，应保留日志并更新加载按钮或回答选择器。
 
 ### Q: 窗口模式下浏览器关闭了
 

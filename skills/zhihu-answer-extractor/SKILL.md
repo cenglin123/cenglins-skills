@@ -55,21 +55,16 @@ Cookie 有效期约 6 个月。如果抓取返回 403 或重定向到登录页�
 
 ### 1. 抓取回答到 txt 文件
 
-修改 `scripts/extract.mjs` 顶部的 3 个参数：
-
-```javascript
-const QUESTION_URL = 'https://www.zhihu.com/question/XXXXXXXX';  // 目标问题 URL
-const ANSWERS_NEEDED = 50;                                         // 抓取数量
-const OUTPUT_FILE = 'C:\\path\\to\\output.txt';                    // 输出路径
-```
-
-运行：
-
 ```powershell
-node <SKILL_DIR>/scripts/extract.mjs
+node <SKILL_DIR>/scripts/extract.mjs `
+  --url "https://www.zhihu.com/question/XXXXXXXX" `
+  --count 50 `
+  --output "<OUTPUT_FILE>"
 ```
 
-约 25 秒完成 50 条回答抓取。
+`--count` 默认为 50；省略 `--output` 时，文件自动保存到脚本目录。网络较慢或回答较多时，可用 `--max-wait <秒数>` 调整最长加载时间（默认 180 秒）。
+
+脚本会滚动回答区的独立容器并以页面滚动兜底，同时尝试点击“加载更多/查看更多回答”。停止条件是达到目标数量、加载到页面报告的总回答数、出现明确的无更多内容提示，或在滚动末端持续无变化/达到最长等待时间。输出文件和控制台都会记录停止原因；若实际数量低于目标，应根据停止原因判断是回答总数不足、页面结构变化还是加载超时，不要把“无新增”直接视为抓取完成。
 
 ### 2. 打开浏览器手动浏览
 
@@ -160,7 +155,7 @@ URL: https://www.zhihu.com/question/XXXXXXXX
 |------|------|------|
 | 返回 40362 | Cookie 过期或被检测 | 重新运行 `get-cookie.mjs` 获取 |
 | 重定向到登录页 | Cookie 无效 | 确认 `z_c0` 存在且未过期 |
-| 回答数量不够 | 折叠内容未展开 | 脚本已内置展开逻辑，连续 8 次无新内容自动停止 |
+| 回答数量不够 | 页面报告总数不足、网络超时、加载按钮失效或知乎结构变化 | 查看输出中的“停止原因”和“实际抓取/目标数量”；必要时增大 `--max-wait` 并检查日志中的滚动与加载按钮状态 |
 | 窗口打开后关闭 | 进程退出回收 | 用 `Start-Process` 后台启动 |
 
 ## 文件说明
