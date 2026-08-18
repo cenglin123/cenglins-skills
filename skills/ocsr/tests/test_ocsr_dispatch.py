@@ -1435,11 +1435,11 @@ class TestModelAllowlist:
 
     ALLOWED = [
         "deepseek/deepseek-v4-flash",
-        "deepseek/deepseek-v4-pro",
         "xiaomi/mimo-v2.5",
         "xiaomi/mimo-v2.5-pro",
     ]
     DISALLOWED = [
+        "deepseek/deepseek-v4-pro",
         "deepseek/deepseek-v3",
         "deepseek/deepseek-r1",
         "xiaomi/mimo-v2.5-pro-ultraspeed",
@@ -1462,7 +1462,7 @@ class TestModelAllowlist:
 
     def test_allowed_models_is_frozenset(self):
         assert isinstance(mod.ALLOWED_MODELS, frozenset)
-        assert len(mod.ALLOWED_MODELS) == 4
+        assert len(mod.ALLOWED_MODELS) == 3
 
     def test_allowed_models_exact_set(self):
         assert mod.ALLOWED_MODELS == frozenset(self.ALLOWED)

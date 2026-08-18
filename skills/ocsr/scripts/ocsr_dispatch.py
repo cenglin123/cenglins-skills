@@ -143,7 +143,6 @@ _USER_HOME_FORWARD = _USER_HOME.replace("\\", "/")
 # ─── 模型白名单 ───────────────────────────────────────────────────────
 ALLOWED_MODELS = frozenset({
     "deepseek/deepseek-v4-flash",
-    "deepseek/deepseek-v4-pro",
     "xiaomi/mimo-v2.5",
     "xiaomi/mimo-v2.5-pro",
 })

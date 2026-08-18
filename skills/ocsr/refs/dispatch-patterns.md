@@ -68,7 +68,7 @@ python scripts/ocsr_dispatch.py dispatch   --worker "prompts/r1.md|xiaomi/mimo-v
    # launcher.ps1
    $prompt = Get-Content "$PSScriptRoot\prompt.txt" -Raw -Encoding UTF8
     opencode run $prompt -m xiaomi/mimo-v2.5-pro --title reviewer-r1 *> "$PSScriptRoot\run.log"
-    # OCSR 可选模型仅限: deepseek/deepseek-v4-flash, deepseek/deepseek-v4-pro, xiaomi/mimo-v2.5, xiaomi/mimo-v2.5-pro
+    # OCSR 可选模型仅限: deepseek/deepseek-v4-flash, xiaomi/mimo-v2.5, xiaomi/mimo-v2.5-pro
    ```
 2. 用 `Start-Process` 完全脱离 harness 生命周期启动（`-WindowStyle Hidden` 不弹窗）：
    ```powershell

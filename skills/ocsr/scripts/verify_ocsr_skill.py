@@ -333,12 +333,11 @@ def check_allowlist():
     if not isinstance(allowed, frozenset):
         print("FAIL: ALLOWED_MODELS is not a frozenset")
         ok = False
-    if len(allowed) != 4:
-        print(f"FAIL: ALLOWED_MODELS has {len(allowed)} entries, expected 4")
+    if len(allowed) != 3:
+        print(f"FAIL: ALLOWED_MODELS has {len(allowed)} entries, expected 3")
         ok = False
     expected = frozenset({
         "deepseek/deepseek-v4-flash",
-        "deepseek/deepseek-v4-pro",
         "xiaomi/mimo-v2.5",
         "xiaomi/mimo-v2.5-pro",
     })

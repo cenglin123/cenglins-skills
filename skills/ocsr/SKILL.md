@@ -209,7 +209,7 @@ grep -rn "MUTATION\|XXX-TEMP" <被改动的源码路径>
 失败切换阶梯（3 次总尝试上限含在内，幂等性约束逐字保留）：
 
 1. 第 1 次失败 → **同模型重派一次**（排除偶发 API 抖动）。
-2. 第 2 次失败 → 第 3 次尝试**切换 family**（判断密集角色在 `xiaomi/mimo-v2.5-pro` 与 `deepseek/deepseek-v4-pro` 之间切换——后者通过 preflight 验证可用后方可作为切换目标，family 以 `opencode models --verbose` 为准）；切换时把前两次失败原因写进新 prompt 的【边界与禁区】残差。
+2. 第 2 次失败 → 第 3 次尝试**切换 family**（判断密集角色在 `xiaomi/mimo-v2.5-pro` 与 `xiaomi/mimo-v2.5` 之间切换——后者通过 preflight 验证可用后方可作为切换目标，family 以 `opencode models --verbose` 为准）；切换时把前两次失败原因写进新 prompt 的【边界与禁区】残差。
 3. 第 3 次失败 → 既有硬停止，交回用户。
 
 **通道例外**：失败明确归因于**通道**（如后台 kill 指纹 = 日志 0 字节 + 无产物 + 进程被终止）时，**修通道不换模型**——通道失败换模型无意义。该通道修复次**不计入**"同模型重试名额"判断，但**计入总尝试 3 次上限**（总上限兜底，防止借"通道问题"无限重试）。
@@ -282,14 +282,13 @@ grep -rn "MUTATION\|XXX-TEMP" <被改动的源码路径>
 
 ## 八、模型选择（默认池与分工）
 
-OCSR 可选模型严格限于以下四个 qualified ID（未在列表中的模型——包括 `xiaomi/mimo-v2.5-pro-ultraspeed`——不可选）：
+OCSR 可选模型严格限于以下三个 qualified ID（未在列表中的模型——包括 `xiaomi/mimo-v2.5-pro-ultraspeed`——不可选）：
 
 - `deepseek/deepseek-v4-flash`
-- `deepseek/deepseek-v4-pro`
 - `xiaomi/mimo-v2.5`
 - `xiaomi/mimo-v2.5-pro`
 
-执行 worker 默认 `deepseek/deepseek-v4-flash`；判断密集角色在 `xiaomi/mimo-v2.5-pro` 与 `deepseek/deepseek-v4-pro` 中按角色需求选择（并列共同默认）。完整角色→模型→cost 对照表见 `refs/model-defaults.md`。
+执行 worker 默认 `deepseek/deepseek-v4-flash`；判断密集角色默认 `xiaomi/mimo-v2.5-pro`（轻量判断可用 `xiaomi/mimo-v2.5`）。完整角色→模型→cost 对照表见 `refs/model-defaults.md`。
 
 规则：
 
@@ -311,7 +310,7 @@ OCSR 可选模型严格限于以下四个 qualified ID（未在列表中的模�
 
 1. 判定：这个任务值得派发吗？（§一）
 2. 拆解任务 → 每个子代理一份自足 prompt，用六要素模板（残差四件套已内嵌其中，§四）
-3. 运行 `opencode models --verbose`，从模型块标题行原样复制 qualified ID（§八规则 2），禁止凭块内 `id`、`providerID`、`name` 或裸名拼接 `-m`；然后用该 qualified ID 选模型：执行用 `deepseek/deepseek-v4-flash`、判断用 `xiaomi/mimo-v2.5-pro` 或 `deepseek/deepseek-v4-pro`。OCSR 可选模型仅限四个（见 §八），不在列表中的模型不可选。首次使用某模型的链路验证用 `preflight` 子命令（消耗真实模型调用）探查可用性；异构评议按 §六C 规则选择模型
+3. 运行 `opencode models --verbose`，从模型块标题行原样复制 qualified ID（§八规则 2），禁止凭块内 `id`、`providerID`、`name` 或裸名拼接 `-m`；然后用该 qualified ID 选模型：执行用 `deepseek/deepseek-v4-flash`、判断用 `xiaomi/mimo-v2.5-pro`（轻量判断可用 `xiaomi/mimo-v2.5`）。OCSR 可选模型仅限三个（见 §八），不在列表中的模型不可选。首次使用某模型的链路验证用 `preflight` 子命令（消耗真实模型调用）探查可用性；异构评议按 §六C 规则选择模型
 4. 派发：prompt 写临时文件（UTF-8），`opencode run (Get-Content … -Raw -Encoding UTF8) -m <model>`；harness 前台超时够用就前台 + 调大超时，不够用就走 §三 脱管派发模式；产物优先 Write 直写文件
 5. 回收：文件存在性 + 大小 + 抽样内容，逐项确定性验证，不信自我报告（§五）；脱管/后台派发的进程挂看门狗（§五），禁止无阈值人工轮询
 6. 重派与上限：失败按 §五 失败切换阶梯（同模型→换 family→硬停），每 worker 最多 **3 次总尝试**；达到上限后停止，交回用户选择；有副作用的 worker 须声明幂等性，否则禁止自动重派
