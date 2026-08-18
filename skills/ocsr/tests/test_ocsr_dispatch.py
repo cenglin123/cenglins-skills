@@ -2005,3 +2005,34 @@ class TestWatchReadAudit:
             assert "读路径审计" not in out
             assert "read_audit" not in rows[0]
             assert "forbid_paths" not in rows[0]
+
+
+# ─── 产物命名与 pattern 不符的检测（watcher 失败语义分层，plan 20260818-converge-loop-driver） ───
+class TestDetectNameMismatch:
+    def test_mismatch_by_suffix(self, tmp_path):
+        # 期望产物 uv-report-uv-r1.md 缺失，但存在同后缀新文件 uv-report-R1.md
+        (tmp_path / "uv-report-R1.md").write_text("report", encoding="utf-8")
+        out = tmp_path / "uv-report-uv-r1.md"
+        candidates = mod._detect_name_mismatch(out, {}, "uv-r1")
+        assert candidates == ["uv-report-R1.md"]
+
+    def test_mismatch_by_label_in_name(self, tmp_path):
+        (tmp_path / "custom-uv-r1-output.txt").write_text("x", encoding="utf-8")
+        out = tmp_path / "expected.md"
+        candidates = mod._detect_name_mismatch(out, {}, "uv-r1")
+        assert candidates == ["custom-uv-r1-output.txt"]
+
+    def test_no_mismatch_when_only_ledger(self, tmp_path):
+        (tmp_path / mod.CONVERGE_LEDGER_NAME).write_text("{}", encoding="utf-8")
+        out = tmp_path / "expected.md"
+        assert mod._detect_name_mismatch(out, {}, "w0") == []
+
+    def test_preexisting_files_excluded(self, tmp_path):
+        (tmp_path / "old.md").write_text("x", encoding="utf-8")
+        before = {"old.md": (1, 1)}
+        out = tmp_path / "expected.md"
+        assert mod._detect_name_mismatch(out, before, "w0") == []
+
+    def test_missing_dir_returns_empty(self, tmp_path):
+        out = tmp_path / "no-such-dir" / "expected.md"
+        assert mod._detect_name_mismatch(out, {}, "w0") == []

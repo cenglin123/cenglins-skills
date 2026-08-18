@@ -490,6 +490,31 @@ def _snapshot_dir(path: Path) -> dict[str, tuple[int, int]]:
     return snap
 
 
+def _detect_name_mismatch(output: Path, snapshot_before: dict, label: str) -> list[str]:
+    """产物命名与 --output-pattern 不符的候选检测（watcher 失败语义分层）。
+
+    当期望产物 output 缺失时，在输出目录的快照差异中找「疑似产物」：
+    新增文件（不在 snapshot_before）且（与期望产物同后缀 或 文件名含 label）。
+    返回候选文件名列表（可能为空）。用途：把「产物未落盘」与「产物落盘为其他
+    文件名」（prompt 写死路径与 pattern 不一致）区分为两类不同失败——后者
+    产物其实有效，不应按 0 产物重派（2026-08-18 uv-init 轮三连虚报实证）。
+    """
+    candidates: list[str] = []
+    try:
+        for p in output.parent.iterdir():
+            if not p.is_file():
+                continue
+            if p.name == output.name or p.name == CONVERGE_LEDGER_NAME:
+                continue
+            if p.name in snapshot_before:
+                continue
+            if p.suffix == output.suffix or label.lower() in p.name.lower():
+                candidates.append(p.name)
+    except (FileNotFoundError, NotADirectoryError, PermissionError):
+        pass
+    return sorted(candidates)
+
+
 def _converge_ledger_path(output_dir: Path, explicit: str | None) -> Path | None:
     """定位派发账本。仅支持显式 --ledger-dir；不执行自动路径探测。"""
     if explicit:
@@ -1224,6 +1249,15 @@ def _watch_loop(
                     reason = "opencode_exit_0_no_artifact"
                     human = (f"[ocsr] ❌ {p['label']} opencode 正常退出 (exit=0) 但期望产物未落盘"
                              f" → 优先怀疑写入路径错误（见收口的 path_anomaly 记录）")
+                    # 失败语义分层：产物可能落盘为其他文件名（prompt 写死路径与
+                    # --output-pattern 不一致）——与「0 产物」是两类失败，处置不同
+                    mismatch = _detect_name_mismatch(output, snapshot_before, p["label"])
+                    if mismatch:
+                        od = "error:exit_0_name_mismatch"
+                        reason = "opencode_exit_0_name_mismatch"
+                        human = (f"[ocsr] ⚠️ {p['label']} 期望产物未落盘，但检测到疑似产物"
+                                 f"命名与 pattern 不符：{', '.join(mismatch[:5])}"
+                                 f"（产物或已有效落盘——先核对文件名再判定，勿按 0 产物重派）")
                 else:
                     od = _parse_outcome_detail("error", exit_code=exit_code, log_text=log_text)
                     reason = f"opencode_exit_{exit_code}"
