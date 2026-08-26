@@ -5,6 +5,10 @@
 
 Agent 入口是 [`SKILL.md`](SKILL.md)；本文件面向直接动手的人。
 
+只想拿来用、不装 skill 的话，Release 里有打好的完整分发包（多一层 `docs/` 与 `toolkit/`
+的人读布局，内容与本目录一致）：
+[WinX-WT-Takeover.zip](https://github.com/cenglin123/cenglins-skills/releases/tag/winx-wt-takeover-v1.0.0)
+
 ## 核心结论
 
 Win+X 的这两个条目，TWINUI 启动的**不是** WinX 目录里的 .lnk，而是
