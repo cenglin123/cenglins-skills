@@ -122,7 +122,9 @@ def transcribe(args: argparse.Namespace) -> Path:
     temporary = output.with_name(output.name + ".tmp")
     try:
         with temporary.open("w", encoding="utf-8", newline="\n") as handle:
-            with tqdm(total=duration, unit="s", desc="转写进度") as progress:
+            interactive_progress = sys.stderr.isatty()
+            next_report = 0
+            with tqdm(total=duration, unit="s", desc="转写进度", disable=not interactive_progress) as progress:
                 for index, segment in enumerate(segments, start=1):
                     text = segment.text.strip()
                     if not text:
@@ -131,7 +133,16 @@ def transcribe(args: argparse.Namespace) -> Path:
                         f"{index}\n{format_timestamp(segment.start)} --> "
                         f"{format_timestamp(segment.end)}\n{text}\n\n"
                     )
-                    progress.update(max(0.0, min(segment.end, duration) - progress.n))
+                    processed = max(0.0, min(segment.end, duration))
+                    progress.update(processed - progress.n)
+                    percent = int(processed * 100 / duration) if duration else 100
+                    if not interactive_progress and (percent >= next_report or processed >= duration):
+                        print(
+                            f"转写进度：{format_timestamp(processed)} / {format_timestamp(duration)} "
+                            f"({percent}%)",
+                            flush=True,
+                        )
+                        next_report = min(100, (percent // 5 + 1) * 5)
         os.replace(temporary, output)
     finally:
         if temporary.exists():
