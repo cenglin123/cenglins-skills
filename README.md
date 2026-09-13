@@ -101,7 +101,6 @@ git clone https://github.com/cenglin123/cenglins-skills.git "$env:USERPROFILE\.a
 | Skill | 用途 |
 |---|---|
 | `crlf-guard` | 防止 Windows Git 项目中的 CRLF/LF 与文本写入事故 |
-| `ocsr` | 通过 headless OpenCode 调度跨厂商子代理、廉价批处理 worker 与独立评审 |
 | `powershell-guard` | 规避 Windows PowerShell 5.1 的语法、别名与编码陷阱 |
 | `utf8-guard` | 区分并处理 Windows 中文文本的 UTF-8、GBK 与显示层问题 |
 | `video-to-srt` | 下载视频、用 faster-whisper 生成字幕，并由 Agent 安全校对和导出文本 |
