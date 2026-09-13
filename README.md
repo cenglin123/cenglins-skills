@@ -19,6 +19,9 @@ cenglins-skills/
 │   │   └── SKILL.md
 │   ├── utf8-guard/
 │   │   └── SKILL.md
+│   ├── video-to-srt/
+│   │   ├── SKILL.md
+│   │   └── scripts/
 │   ├── winx-wt-takeover/
 │   │   ├── SKILL.md
 │   │   ├── README.md
@@ -101,6 +104,7 @@ git clone https://github.com/cenglin123/cenglins-skills.git "$env:USERPROFILE\.a
 | `ocsr` | 通过 headless OpenCode 调度跨厂商子代理、廉价批处理 worker 与独立评审 |
 | `powershell-guard` | 规避 Windows PowerShell 5.1 的语法、别名与编码陷阱 |
 | `utf8-guard` | 区分并处理 Windows 中文文本的 UTF-8、GBK 与显示层问题 |
+| `video-to-srt` | 下载视频、用 faster-whisper 生成字幕，并由 Agent 安全校对和导出文本 |
 | `winx-wt-takeover` | 诊断 Windows 控制台交接失效，并让 Win+X 的 PowerShell 项打开 Windows Terminal |
 | `zhihu-answer-extractor` | 批量抓取知乎问题回答并保存为结构化文本 |
 

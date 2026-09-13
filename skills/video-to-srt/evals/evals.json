@@ -1,0 +1,23 @@
+{
+  "skill_name": "video-to-srt",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "把这个 B 站视频下载到当前项目的 Videos 目录，并生成中文字幕。",
+      "expected_output": "安全使用本地 Cookie（如有），下载媒体，检查环境后转写为同名 UTF-8 SRT。",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "校对这份中文技术视频字幕，重点检查模型名和英文缩写，绝对不能改时间轴。",
+      "expected_output": "先创建 .bak，由 Agent 按上下文校对正文，再用 srt_guard.py 验证结构。",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "把这个目录下的所有视频批量转成字幕，已有 SRT 的不要重复跑。",
+      "expected_output": "检测 Python、ffmpeg 与硬件环境，调用 batch_transcribe.py 并跳过已有结果。",
+      "files": []
+    }
+  ]
+}
