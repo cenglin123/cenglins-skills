@@ -11,6 +11,9 @@ cenglins-skills/
 ├── skills/
 │   ├── crlf-guard/
 │   │   └── SKILL.md
+│   ├── bilibili-comment-extractor/
+│   │   ├── SKILL.md
+│   │   └── scripts/
 │   ├── ocsr/
 │   │   ├── SKILL.md
 │   │   ├── refs/
@@ -100,6 +103,7 @@ git clone https://github.com/cenglin123/cenglins-skills.git "$env:USERPROFILE\.a
 
 | Skill | 用途 |
 |---|---|
+| `bilibili-comment-extractor` | 通过 B 站 API 抓取主评论和楼中楼，并保存为结构化文本 |
 | `crlf-guard` | 防止 Windows Git 项目中的 CRLF/LF 与文本写入事故 |
 | `powershell-guard` | 规避 Windows PowerShell 5.1 的语法、别名与编码陷阱 |
 | `utf8-guard` | 区分并处理 Windows 中文文本的 UTF-8、GBK 与显示层问题 |

@@ -1,0 +1,16 @@
+{
+  "name": "bilibili-comment-extractor",
+  "version": "1.0.0",
+  "description": "无头抓取 B 站视频评论区（纯 API + WBI 签名）",
+  "type": "module",
+  "scripts": {
+    "extract": "node extract.mjs",
+    "get-cookie": "node get-cookie.mjs",
+    "open": "node open.mjs"
+  },
+  "dependencies": {
+    "puppeteer-core": "^24.0.0",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "skill_name": "bilibili-comment-extractor",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "把这个 B 站视频最热的 200 条主评论抓下来，保存成文本。",
+      "expected_output": "检查登录 Cookie 后按热度分页抓取、去重，并将结构化 TXT 保存到当前工作目录。",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "完整导出这个 BV 号的评论和全部楼中楼回复。",
+      "expected_output": "使用时间排序和楼中楼展开，遵守请求间隔，并明确记录停止原因和实际抓取数量。",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "分析这份 B 站评论，告诉我主要观点和争议点。",
+      "expected_output": "按评论规模选择直接分析或低成本独立子代理交叉分析，并让最终结论可追溯到原始评论。",
+      "files": []
+    }
+  ]
+}
