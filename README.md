@@ -14,10 +14,6 @@ cenglins-skills/
 │   ├── bilibili-comment-extractor/
 │   │   ├── SKILL.md
 │   │   └── scripts/
-│   ├── ocsr/
-│   │   ├── SKILL.md
-│   │   ├── refs/
-│   │   └── scripts/
 │   ├── powershell-guard/
 │   │   └── SKILL.md
 │   ├── utf8-guard/
