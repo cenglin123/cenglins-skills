@@ -3,6 +3,13 @@
  *
  * 使用 puppeteer-extra + stealth 绕过知乎反爬检测
  *
+ * 回答加载机制（2026-09 实测）：
+ *   - 首屏静态渲染前几条回答，更多回答通过「查看剩余 N 条回答」按钮分页加载
+ *   - 该按钮常是普通 div + cursor:pointer（React pointer 事件驱动），
+ *     页内 el.click() 合成事件不可靠，必须在 Node 侧用 elementHandle.click()
+ *     发送真实 CDP 鼠标事件（isTrusted）
+ *   - 点击展开后可能切换为无限滚动，故保留滚动作为兜底
+ *
  * 使用方法：
  *   1. 确保已安装依赖：npm install（在 scripts/ 目录下）
  *   2. 准备 Cookie 文件：www.zhihu.com_cookies.txt（Netscape 格式）
@@ -24,6 +31,10 @@ const ANSWER_SELECTORS = [
   '.List-item [itemprop="answer"]',
   'article[itemprop="answer"]',
 ];
+
+// 「查看剩余 N 条回答」等加载按钮的完整文本匹配
+// 注意：必须是 ^...$ 全匹配——外层容器 innerText 可能包含标签外的其他内容
+const LOAD_MORE_PATTERN = /^(?:查看剩余\s*\d+\s*条回答|加载更多(?:回答)?|查看更多(?:回答)?|查看全部回答|更多回答|展开更多回答|下一页)(?:\s*[（(]?\d+[）)]?)?$/;
 
 function printHelp() {
   console.log(`用法：
@@ -155,6 +166,144 @@ function parseCookieFile(path) {
   return cookies;
 }
 
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// ── 页内辅助（在 page.evaluate 中执行）───────────────────────
+
+// 统计当前已加载的回答数
+async function countAnswers(page) {
+  return page.evaluate(selectors => {
+    const rawItems = Array.from(document.querySelectorAll(selectors.join(',')));
+    const items = rawItems.map(item =>
+      item.matches('.AnswerItem') ? item :
+        item.querySelector('.AnswerItem') || item.closest('.AnswerItem') || item,
+    );
+    return new Set(items).size;
+  }, ANSWER_SELECTORS);
+}
+
+// 关闭可能遮挡点击的弹窗（登录墙除外——那是要上报的状态）
+async function dismissOverlays(page) {
+  await page.evaluate(() => {
+    document.querySelectorAll(
+      '[class*="Modal-closeButton"], button[aria-label="关闭"], .Modal-closeButton',
+    ).forEach(btn => {
+      try { btn.click(); } catch { /* ignore */ }
+    });
+  });
+}
+
+// 探测「查看剩余 N 条回答」等加载按钮，返回 ElementHandle 或 null。
+// 关键点：知乎的加载按钮常是 div + cursor:pointer（React pointer 事件），
+// 返回 handle 后必须在 Node 侧 click() 走真实 CDP 鼠标事件。
+async function findLoadMoreHandle(page) {
+  const handle = await page.evaluateHandle(patternSource => {
+    const pattern = new RegExp(patternSource);
+    const isVisible = element => {
+      const rect = element.getBoundingClientRect();
+      const style = window.getComputedStyle(element);
+      return rect.width > 0 && rect.height > 0 &&
+        style.visibility !== 'hidden' && style.display !== 'none';
+    };
+    const matches = [];
+    for (const el of document.querySelectorAll('button, [role="button"], a, div, span')) {
+      if (el.children.length > 4) continue;
+      const text = (el.innerText || el.textContent || '').trim();
+      if (!pattern.test(text)) continue;
+      if (!isVisible(el)) continue;
+      // 取最小匹配（最内层），避免点到外层容器
+      if (matches.some(prev => prev.contains(el))) continue;
+      matches.push(el);
+    }
+    return matches.length ? matches[matches.length - 1] : null;
+  }, LOAD_MORE_PATTERN.source);
+  return handle.asElement();
+}
+
+// 检测是否出现登录墙（Cookie 失效时点击加载会触发）
+async function hasLoginWall(page) {
+  return page.evaluate(() => {
+    const modal = document.querySelector('[class*="Modal-wrapper"], [class*="signFlowModal"], [id*="Modal"]');
+    if (!modal) return false;
+    return /登录|扫码|验证码/.test(modal.innerText || '');
+  });
+}
+
+// 检测页面明确的“无更多内容”提示
+async function detectExplicitEnd(page) {
+  return page.evaluate(() => {
+    const nodes = document.querySelectorAll('.List-end, .List-footer, [class*="List-end"]');
+    for (const node of nodes) {
+      const text = (node.innerText || '').trim();
+      const hit = text.match(/(没有更多|已显示全部|没有更多内容|到底了)/);
+      if (hit) return hit[0];
+    }
+    return '';
+  });
+}
+
+// 滚动兜底：优先独立滚动容器，否则滚窗口
+async function scrollToBottom(page) {
+  return page.evaluate(selectors => {
+    const rawItems = Array.from(document.querySelectorAll(selectors.join(',')));
+    const answerItems = [...new Set(rawItems.map(item =>
+      item.matches('.AnswerItem') ? item :
+        item.querySelector('.AnswerItem') || item.closest('.AnswerItem') || item,
+    ))];
+    const lastAnswer = answerItems.at(-1) || null;
+
+    // 展开已加载回答的折叠正文
+    document.querySelectorAll(
+      'button.QuestionRichText-more, button.ContentItem-more, .RichContent button[class*="more"]',
+    ).forEach(button => {
+      if (!button.disabled) button.click();
+    });
+
+    // 找独立滚动容器
+    const candidates = [];
+    let ancestor = lastAnswer?.parentElement || null;
+    while (ancestor && ancestor !== document.body) {
+      candidates.push(ancestor);
+      ancestor = ancestor.parentElement;
+    }
+    for (const selector of [
+      '[data-za-detail-view-path-module="QuestionAnswers"]',
+      '.Question-mainColumn',
+      '.List',
+      '[role="main"]',
+      'main',
+    ]) {
+      document.querySelectorAll(selector).forEach(el => candidates.push(el));
+    }
+
+    let scrollContainer = null;
+    let bestScore = 0;
+    for (const candidate of new Set(candidates)) {
+      const style = window.getComputedStyle(candidate);
+      const range = candidate.scrollHeight - candidate.clientHeight;
+      const containsLast = lastAnswer ? candidate.contains(lastAnswer) : false;
+      const score = range + (containsLast ? 1_000_000_000 : 0);
+      if (/(auto|scroll|overlay)/.test(style.overflowY) && range > 20 && score > bestScore) {
+        scrollContainer = candidate;
+        bestScore = score;
+      }
+    }
+
+    if (scrollContainer) {
+      lastAnswer?.scrollIntoView({ block: 'end', behavior: 'instant' });
+      scrollContainer.scrollTop = Math.min(
+        scrollContainer.scrollTop + Math.max(1500, scrollContainer.clientHeight * 0.9),
+        scrollContainer.scrollHeight,
+      );
+      return { mode: 'container', atEnd: scrollContainer.scrollTop + scrollContainer.clientHeight >= scrollContainer.scrollHeight - 10 };
+    }
+    lastAnswer?.scrollIntoView({ block: 'end', behavior: 'instant' });
+    window.scrollBy(0, Math.max(1500, window.innerHeight));
+    const root = document.scrollingElement || document.documentElement;
+    return { mode: 'window', atEnd: root.scrollTop + root.clientHeight >= root.scrollHeight - 10 };
+  }, ANSWER_SELECTORS);
+}
+
 // ── 主流程 ───────────────────────────────────────────────────
 async function main() {
   console.log('=== 知乎回答批量抓取 ===\n');
@@ -193,12 +342,12 @@ async function main() {
   const resp = await page.goto(QUESTION_URL, { waitUntil: 'networkidle2', timeout: 30000 });
 
   // 等待页面完全加载
-  await new Promise(r => setTimeout(r, 2000));
+  await sleep(2000);
 
   let title;
   try {
     title = await page.title();
-  } catch (e) {
+  } catch {
     title = await page.evaluate(() => document.title);
   }
   console.log(`      状态: ${resp.status()}, 标题: ${title}`);
@@ -221,14 +370,13 @@ async function main() {
                     document.querySelector('.QuestionRichText .ContentItem-more');
     if (moreBtn) moreBtn.click();
   });
-  await new Promise(r => setTimeout(r, 500));
+  await sleep(500);
 
   const questionMeta = await page.evaluate(() => {
     // 题干（问题描述）
     const descEl = document.querySelector('.QuestionRichText');
     let description = '';
     if (descEl) {
-      // 获取 itemprop="text" 的内容，或者直接获取 innerText
       const textEl = descEl.querySelector('[itemprop="text"]') || descEl;
       description = textEl.innerText
         .replace(/显示全部\s*$/g, '')
@@ -278,160 +426,75 @@ async function main() {
     console.log(`      页面报告回答总数: ${reportedTotal}`);
   }
 
-  // 6. 滚动加载回答
-  console.log(`[5/6] 滚动加载 ${ANSWERS_NEEDED} 条回答...`);
+  // 6. 循环加载回答：真实点击「查看剩余」按钮为主，滚动兜底
+  console.log(`[5/6] 加载回答（目标 ${ANSWERS_NEEDED} 条）...`);
   const loadingStartedAt = Date.now();
   let lastProgressAt = loadingStartedAt;
   let lastCount = -1;
   let noNewCount = 0;
-  let endBoundaryCount = 0;
   let stopReason = 'unknown';
 
   while (true) {
-    const currentCount = await page.evaluate(
-      selectors => {
-        const rawItems = Array.from(document.querySelectorAll(selectors.join(',')));
-        const items = rawItems.map(item =>
-          item.matches('.AnswerItem') ? item :
-            item.querySelector('.AnswerItem') || item.closest('.AnswerItem') || item,
-        );
-        return new Set(items).size;
-      },
-      ANSWER_SELECTORS,
-    );
+    const currentCount = await countAnswers(page);
 
-    if (currentCount > lastCount) {
+    if (currentCount > lastCount && lastCount >= 0) {
       console.log(`      已加载 ${currentCount} 条`);
+    }
+    if (currentCount > lastCount) {
       lastProgressAt = Date.now();
       noNewCount = 0;
     } else {
       noNewCount++;
     }
+    lastCount = currentCount;
 
     if (currentCount >= ANSWERS_NEEDED) {
       stopReason = `达到目标数量 ${ANSWERS_NEEDED}`;
       break;
     }
-
     if (reportedTotal !== null && currentCount >= reportedTotal) {
       stopReason = `已加载页面报告的全部 ${reportedTotal} 条回答`;
       break;
     }
 
-    const loadState = await page.evaluate((selectors) => {
-      const isVisible = element => {
-        const rect = element.getBoundingClientRect();
-        const style = window.getComputedStyle(element);
-        return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
-      };
+    await dismissOverlays(page);
 
-      const rawItems = Array.from(document.querySelectorAll(selectors.join(',')));
-      const answerItems = [...new Set(rawItems.map(item =>
-        item.matches('.AnswerItem') ? item :
-          item.querySelector('.AnswerItem') || item.closest('.AnswerItem') || item,
-      ))];
-      const lastAnswer = answerItems.at(-1) || null;
-
-      // 展开已加载回答的折叠正文。
-      document.querySelectorAll(
-        'button.QuestionRichText-more, button.ContentItem-more, .RichContent button[class*="more"]',
-      ).forEach(button => {
-        if (isVisible(button) && !button.disabled) button.click();
-      });
-
-      // 主动触发知乎可能出现的分页/加载按钮。
-      const loadMorePattern = /^(?:加载更多(?:回答)?|查看更多|查看更多回答|查看全部回答|更多回答|展开更多回答)(?:\s*[（(]?\d+[）)]?)?$/;
-      const clickedLabels = [];
-      const loadButtons = Array.from(document.querySelectorAll('button, [role="button"]'))
-        .filter(button => loadMorePattern.test((button.innerText || button.textContent || '').trim()))
-        .filter(button => isVisible(button) && !button.disabled && button.getAttribute('aria-disabled') !== 'true');
-      for (const button of loadButtons) {
-        clickedLabels.push((button.innerText || button.textContent || '').trim());
-        button.click();
+    // 主路径：找到加载按钮 → 真实点击
+    const loadMoreEl = await findLoadMoreHandle(page);
+    let action = 'none';
+    if (loadMoreEl) {
+      try {
+        await page.evaluate(el => el.scrollIntoView({ block: 'center', behavior: 'instant' }), loadMoreEl);
+        await sleep(300);
+        await loadMoreEl.click();  // 真实 CDP 鼠标事件（isTrusted）
+        action = 'click';
+      } catch (err) {
+        console.log(`      ⚠️ 点击加载按钮失败: ${err.message.split('\n')[0]}，改用滚动`);
+      } finally {
+        await loadMoreEl.dispose();
       }
-
-      // 优先滚动包含回答列表的独立滚动容器，再以页面滚动兜底。
-      const candidates = [];
-      let ancestor = lastAnswer?.parentElement || null;
-      while (ancestor && ancestor !== document.body) {
-        candidates.push(ancestor);
-        ancestor = ancestor.parentElement;
-      }
-      for (const selector of [
-        '[data-za-detail-view-path-module="QuestionAnswers"]',
-        '.Question-mainColumn',
-        '.List',
-        '[role="main"]',
-        'main',
-      ]) {
-        document.querySelectorAll(selector).forEach(element => candidates.push(element));
-      }
-
-      let scrollContainer = null;
-      let bestScrollScore = 0;
-      for (const candidate of new Set(candidates)) {
-        const style = window.getComputedStyle(candidate);
-        const range = candidate.scrollHeight - candidate.clientHeight;
-        const containsLastAnswer = lastAnswer ? candidate.contains(lastAnswer) : false;
-        const score = range + (containsLastAnswer ? 1_000_000_000 : 0);
-        if (/(auto|scroll|overlay)/.test(style.overflowY) && range > 20 && score > bestScrollScore) {
-          scrollContainer = candidate;
-          bestScrollScore = score;
-        }
-      }
-
-      let scrollMode = 'window';
-      let atEnd = false;
-      if (scrollContainer) {
-        scrollMode = scrollContainer.className || scrollContainer.tagName;
-        if (lastAnswer) lastAnswer.scrollIntoView({ block: 'end', behavior: 'instant' });
-        const distance = Math.max(1500, Math.floor(scrollContainer.clientHeight * 0.9));
-        scrollContainer.scrollTop = Math.min(
-          scrollContainer.scrollTop + distance,
-          scrollContainer.scrollHeight,
-        );
-        atEnd = scrollContainer.scrollTop + scrollContainer.clientHeight >= scrollContainer.scrollHeight - 10;
-      } else {
-        if (lastAnswer) lastAnswer.scrollIntoView({ block: 'end', behavior: 'instant' });
-        window.scrollBy(0, Math.max(1500, window.innerHeight));
-        const root = document.scrollingElement || document.documentElement;
-        atEnd = root.scrollTop + root.clientHeight >= root.scrollHeight - 10;
-      }
-
-      const endCandidates = document.querySelectorAll(
-        '.List-end, .List-footer, [class*="List-end"], [class*="Pagination"]',
-      );
-      const explicitEnd = Array.from(endCandidates)
-        .map(element => (element.innerText || element.textContent || '').trim())
-        .find(text => /(没有更多|已显示全部|没有更多内容|到底了)/.test(text));
-
-      return {
-        atEnd,
-        scrollMode: String(scrollMode).slice(0, 80),
-        clickedLabels,
-        loadMoreAvailable: loadButtons.length > 0,
-        explicitEnd: explicitEnd || '',
-      };
-    }, ANSWER_SELECTORS);
-
-    if (loadState.clickedLabels.length) {
-      console.log(`      点击加载按钮: ${[...new Set(loadState.clickedLabels)].join(', ')}`);
-    }
-    if (noNewCount > 0 && noNewCount % 3 === 0) {
-      console.log(
-        `      等待新回答：连续 ${noNewCount} 次无变化，滚动区=${loadState.scrollMode}，末端=${loadState.atEnd ? '是' : '否'}`,
-      );
     }
 
-    if (loadState.explicitEnd) {
-      stopReason = `页面明确提示无更多内容：${loadState.explicitEnd}`;
+    // 兜底：滚动（点击展开后知乎可能切换为无限滚动，每轮都滚一点无害）
+    const scrollState = await scrollToBottom(page);
+    if (action === 'none') action = `scroll:${scrollState.mode}`;
+
+    if (action === 'click') {
+      console.log(`      点击「查看剩余」加载按钮`);
+    } else if (noNewCount > 0 && noNewCount % 5 === 0) {
+      console.log(`      等待新回答：连续 ${noNewCount} 轮无变化（方式=${action}，末端=${scrollState.atEnd ? '是' : '否'}）`);
+    }
+
+    // 登录墙检测：点击加载后弹登录框说明 Cookie 失效
+    if (noNewCount >= 2 && await hasLoginWall(page)) {
+      stopReason = '触发登录墙（Cookie 可能失效），无法继续加载';
       break;
     }
 
-    if (loadState.atEnd && !loadState.loadMoreAvailable) {
-      endBoundaryCount++;
-    } else {
-      endBoundaryCount = 0;
+    const explicitEnd = await detectExplicitEnd(page);
+    if (explicitEnd) {
+      stopReason = `页面明确提示无更多内容：${explicitEnd}`;
+      break;
     }
 
     const now = Date.now();
@@ -440,18 +503,17 @@ async function main() {
       break;
     }
 
+    // 无加载按钮 + 滚动末端 + 持续无新增 → 判定到头
     if (
-      noNewCount >= 12 &&
-      now - lastProgressAt >= 30000 &&
-      endBoundaryCount >= 3 &&
-      !loadState.loadMoreAvailable
+      noNewCount >= 10 &&
+      now - lastProgressAt >= 20000 &&
+      scrollState.atEnd
     ) {
-      stopReason = `页面位于滚动末端且连续 ${noNewCount} 次、至少 30 秒无新增回答`;
+      stopReason = `滚动末端且连续 ${noNewCount} 轮、至少 20 秒无新增回答（页面可能仍有未展开的回答）`;
       break;
     }
 
-    lastCount = currentCount;
-    await new Promise(r => setTimeout(r, loadState.clickedLabels.length ? 1800 : 1200));
+    await sleep(action === 'click' ? 2500 : 1200);
   }
 
   console.log(`      停止原因: ${stopReason}`);
@@ -459,6 +521,15 @@ async function main() {
   // 7. 提取回答数据
   console.log('[6/6] 提取并保存...');
   const answers = await page.evaluate((limit, selectors) => {
+    // 「赞同 1.6 万」→ 16000；优先 aria-label，其次按钮文本
+    const parseVotes = el => {
+      if (!el) return 0;
+      const raw = (el.getAttribute('aria-label') || el.textContent || '').trim();
+      const wan = raw.match(/([\d.]+)\s*万/);
+      if (wan) return Math.round(parseFloat(wan[1]) * 10000);
+      const digits = raw.replace(/[^\d]/g, '');
+      return digits ? Number(digits) : 0;
+    };
     const rawItems = Array.from(document.querySelectorAll(selectors.join(',')));
     const items = [...new Set(rawItems.map(item =>
       item.matches('.AnswerItem') ? item :
@@ -476,18 +547,17 @@ async function main() {
       const voteEl = item.querySelector('button[aria-label*="赞同"]') ||
                      item.querySelector('.VoteButton--up') ||
                      item.querySelector('[class*="VoteButton"]');
-      const votes = voteEl ? voteEl.textContent.replace(/[^0-9]/g, '') : '0';
       const contentEl = item.querySelector('.RichContent-inner .RichText') ||
                         item.querySelector('.RichContent-inner') ||
                         item.querySelector('[itemprop="text"]');
       const content = contentEl ? contentEl.innerText.trim() : '[内容提取失败]';
-      results.push({ index: i + 1, author, bio, votes, content });
+      results.push({ index: i + 1, author, bio, votes: parseVotes(voteEl), content });
     }
     return results;
   }, ANSWERS_NEEDED, ANSWER_SELECTORS);
 
   // 8. 格式化并保存
-  const cleanTitle = title.replace(' - 知乎', '').replace(/^\(\d+ 条消息\) /, '');
+  const cleanTitle = title.replace(' - 知乎', '').replace(/^\([^)]*(?:条消息|封私信)[^)]*\)\s*/, '');
   let output = `知乎问题：${cleanTitle}\n`;
   output += `URL: ${QUESTION_URL}\n`;
   if (questionMeta.author) output += `提问者: ${questionMeta.author}\n`;
