@@ -45,7 +45,7 @@ node scripts/extract.mjs --url "https://www.zhihu.com/question/XXXXXXXX" --count
 
 `--count` 默认为 50；省略 `--output` 时保存到脚本目录。`--max-wait` 可调整最长加载等待秒数，默认 180。
 
-## 三种模式
+## 五种模式
 
 ### Cookie 获取（get-cookie.mjs）
 
@@ -72,6 +72,37 @@ node scripts/open.mjs
 ```
 
 修改 `open.mjs` 顶部的 `TARGET_URL` 即可。
+
+### 分层抽样（strat-sample.mjs）
+
+争议题（粉丝战争/圈地争议/政治话题）用：走 `answers` API 全量枚举，按赞同数分层随机抽样，避免「只看高赞」的排序偏置。纯 `fetch`，无需浏览器。
+
+```bash
+node scripts/strat-sample.mjs --url "https://www.zhihu.com/question/XXXXXXXX" \
+  --per-band 15 --facets scripts/facets.example.json --out-dir ./out
+```
+
+产出 `_census.json`（全量）/ `_sample.txt`（抽样正文）/ `_ledger.json`（判读表）/ `_stats.json`（分层统计）。
+
+### 立场估计（stance-estimate.mjs）
+
+对抽样结果做**设计加权占比 + 置信区间**，并对全量做关键词交叉验证：
+
+```bash
+node scripts/stance-estimate.mjs --ledger out/X_ledger.json --census out/X_census.json \
+  --verdicts verdicts.txt --categories "A=反X,B=挺X,N=中立,O=无关" --output report.md
+```
+
+`verdicts.txt` 由 agent 精读 `sample.txt` 后按 `rid` 归类填写：
+
+```
+# A
+12 13 14
+# B
+119
+```
+
+无 `verdicts` 时可用 `--use-autohint --facets <file>` 做低置信预览。
 
 ## 输出示例
 
@@ -121,6 +152,8 @@ URL: https://www.zhihu.com/question/2042649810709239000
 - 子代理初读节省工作量，但初读不能代替主代理的第一手判断
 - 至少两个独立视角（子代理 + 主代理自己）才能避免偏误
 - 分歧必须由主代理回到原文裁决，而不是取平均
+
+> **争议题额外一步**：若问题带有明显站队性，先跑 `strat-sample.mjs` 做分层随机抽样，再对样本精读判读、用 `stance-estimate.mjs` 给出加权占比与置信区间——这样结论不会被高赞区（排序偏置）带跑，且能显式报告「中立/噪音」占比与不确定性。
 
 详见 `SKILL.md` 中的流程与子代理 Prompt 模板。
 
@@ -213,11 +246,14 @@ zhihu-answer-extractor/
 ├── SKILL.md                    # Agent 技能定义
 ├── README.md                   # 本文档
 └── scripts/
-    ├── package.json            # npm 依赖声明
-    ├── get-cookie.mjs          # Cookie 一键获取脚本
-    ├── extract.mjs             # 批量抓取脚本（headless）
-    ├── open.mjs                # 浏览器打开模式（可视化）
-    └── www.zhihu.com_cookies.txt  # Cookie 文件（由 get-cookie.mjs 生成）
+    ├── package.json                 # npm 依赖声明
+    ├── get-cookie.mjs               # Cookie 一键获取脚本
+    ├── extract.mjs                  # 批量抓取脚本（headless）
+    ├── strat-sample.mjs             # 全量枚举 + 分层随机抽样
+    ├── stance-estimate.mjs          # 立场加权估计 + 置信区间
+    ├── facets.example.json          # 阵营关键词配置示例
+    ├── open.mjs                     # 浏览器打开模式（可视化）
+    └── www.zhihu.com_cookies.txt    # Cookie 文件（由 get-cookie.mjs 生成）
 ```
 
 ## 环境要求

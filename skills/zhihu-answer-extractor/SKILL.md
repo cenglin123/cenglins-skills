@@ -4,8 +4,10 @@ description: >-
   批量抓取知乎问题下的回答并保存为 txt 文档。使用 puppeteer-extra + stealth 插件
   绕过知乎反爬检测（40362），支持「查看剩余 N 条回答」分页按钮真实点击加载、
   无限滚动兜底、展开折叠内容，提取题干/提问者/话题标签/关注数/浏览数/作者/
-  赞同数（含「1.6 万」万级换算）/正文。触发条件：用户要求下载/抓取/采集知乎回答、
-  将知乎问题保存为文本、批量获取知乎内容。
+  赞同数（含「1.6 万」万级换算）/正文。另含争议题分析：answers API 全量枚举 +
+  分层随机抽样 + 立场加权估计（含置信区间）与子代理独立裁决工作流。
+  触发条件：用户要求下载/抓取/采集知乎回答、将知乎问题保存为文本、批量获取知乎内容，
+  或要求估计某争议问题的真实立场分布（避免只看高赞的排序偏置）。
 ---
 
 # 知乎回答批量抓取
@@ -141,6 +143,70 @@ URL: https://www.zhihu.com/question/XXXXXXXX
 - 至少两个独立视角（子代理 + 主代理自己）才能避免单一视角偏误；两份子代理报告互查时，总赞同数等可复算指标应能互相咬合
 - 分歧本身就是有价值的发现，但分歧必须由主代理回到原文裁决后才能进入最终结论
 
+## 争议题采样分析（全量枚举 + 分层随机抽样 + 立场判读）
+
+当问题带有**争议性/站队性**（粉丝战争、圈地争议、政治话题等）时，直接用 `extract.mjs` 抓「前 N 条高赞」会得到**排序偏置**：高赞被最响亮的一方垄断，少数派与不表态的噪音被排序机制滤掉，容易把「胜利者框架」误当成「全体共识」。此时改用两段式脚本，从 API 全量枚举后做分层随机抽样，得到可外推的立场分布。
+
+> 实测：某争议题 top-50 里对立阵营占 95%，但按赞同分层随机抽样 165 条后回落到约 85%（另 6% 中立、9% 噪音）——排序偏置真实存在，但幅度有限；更重要的价值是**把「沉默的噪音」和置信区间也纳入了描述**。
+
+### 第一步：分层随机抽样（strat-sample.mjs）
+
+```powershell
+node <SKILL_DIR>/scripts/strat-sample.mjs `
+  --url "https://www.zhihu.com/question/XXXXXXXX" `
+  --per-band 15 `
+  --facets <SKILL_DIR>/scripts/facets.example.json `
+  --out-dir <OUTPUT_DIR>
+```
+
+- 走 `answers` API 全量枚举（`limit=20` 分页、纯 `fetch`、无需浏览器），拿到每条**精确赞同数**（比页面显示的「1 万」更准）与正文
+- 按赞同数分 11 层，每层随机抽 `--per-band` 条（`--seed` 固定，结果可复现）
+- 产出四件套：
+  - `<qid>_census.json` — 全量数据（含正文/赞同/时间）
+  - `<qid>_sample.txt` — 抽样正文（供 agent 精读）
+  - `<qid>_ledger.json` — 逐条判读表（`verdict` 留空，交 agent 填）
+  - `<qid>_stats.json` — 分层统计（层规模/赞同/抽样数）
+- `--facets` 给每条样本打 `auto_hint` 关键词提示，**仅辅助分诊，不是判读**
+- 已有 census 时加 `--census <file>` 可跳过枚举直接重抽样
+- 指定 `--bands` 可自定义分层上界
+
+### 第二步：立场判读（agent）+ 加权估计（stance-estimate.mjs）
+
+1. **agent 精读** `sample.txt`，逐条判读立场，写成 `verdicts.txt`（分组文本，按 `rid` 归类）：
+   ```
+   # A
+   12 13 14 20
+   # B
+   119
+   # N
+   22 33
+   # O
+   17 18
+   ```
+2. 运行估计（脚本完成加权、区间、交叉验证）：
+   ```powershell
+   node <SKILL_DIR>/scripts/stance-estimate.mjs `
+     --ledger <qid>_ledger.json --census <qid>_census.json `
+     --verdicts <verdicts.txt> `
+     --categories "A=反X/挺Y,B=挺X,N=中立调和,O=无关难判" `
+     --output <report.md>
+   ```
+3. 输出：**设计加权占比 + 95% 置信区间**（分层方差 + 有限总体校正）、未加权 Wilson 参考区间、以及对全量 census 的**关键词交叉验证**（不依赖 agent 判读）
+
+无 `verdicts` 时可用 `--use-autohint --facets <file>` 做**低置信预览**（关键词粗分类，会大量漏判，仅用于快速摸底）。
+
+### 设计哲学（与 harness 原则一致）
+
+脚本负责一切**确定性**的事：枚举、分页、分层、随机、加权、置信区间、关键词交叉验证与记账；「每条回答属于哪个阵营」这个**需要判断**的事留在 agent 手里——脚本只给 `auto_hint` 辅助分诊，绝不替 agent 下判断（`verdict` 字段由 agent 填）。
+
+### 两条路径怎么选
+
+| 场景 | 用什么 |
+|---|---|
+| 总结主流观点、需要完整正文 | `extract.mjs`（前 N 高赞） |
+| 估计真实立场分布、防排序偏置 | `strat-sample.mjs` + `stance-estimate.mjs` |
+| 两者结合 | 先 `strat-sample` 抽样，再精读 `sample.txt`，高赞部分可另用 `extract.mjs` |
+
 ## 反检测原理
 
 - **puppeteer-extra + stealth 插件**：自动隐藏 WebDriver、修改浏览器指纹
@@ -164,6 +230,9 @@ URL: https://www.zhihu.com/question/XXXXXXXX
 |------|------|
 | `scripts/get-cookie.mjs` | 一键获取 Cookie（打开浏览器→用户登录→自动导出） |
 | `scripts/extract.mjs` | 批量抓取脚本（headless，速度快） |
+| `scripts/strat-sample.mjs` | 全量枚举 + 分层随机抽样（争议题防排序偏置） |
+| `scripts/stance-estimate.mjs` | 立场加权估计 + 置信区间 + 关键词交叉验证 |
+| `scripts/facets.example.json` | 阵营关键词配置示例（供 strat-sample 的 auto_hint） |
 | `scripts/open.mjs` | 浏览器打开模式（可视化，手动操作） |
 | `scripts/package.json` | npm 依赖声明 |
 | `scripts/www.zhihu.com_cookies.txt` | Cookie 文件（由 get-cookie.mjs 生成或手动导出） |
