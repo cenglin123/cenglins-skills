@@ -10,11 +10,10 @@
  *   3. 如需关闭浏览器，手动关闭窗口或在任务管理器结束 chrome.exe
  */
 
-import puppeteer from 'puppeteer-extra';
-import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import { readFileSync, existsSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { resolveCookieFile, requireDepsOrExit } from './lib/env.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -28,10 +27,8 @@ const TARGET_URL = 'https://www.zhihu.com/question/XXXXXXXX';  // 目标页面 U
 // ▲▲▲ 配置区结束 ▲▲▲
 // ═══════════════════════════════════════════════════════════════
 
-const COOKIE_FILE = resolve(__dirname, 'www.zhihu.com_cookies.txt');
+const COOKIE_FILE = resolveCookieFile();
 const PROFILE_DIR = resolve(__dirname, '.chrome-profile');
-
-puppeteer.use(StealthPlugin());
 
 // 自动检测 Chrome 路径
 function findChrome() {
@@ -71,7 +68,13 @@ function parseCookieFile(path) {
   return cookies;
 }
 
-const cookies = parseCookieFile(COOKIE_FILE);
+async function main() {
+  requireDepsOrExit();
+  const { default: puppeteer } = await import('puppeteer-extra');
+  const { default: StealthPlugin } = await import('puppeteer-extra-plugin-stealth');
+  puppeteer.use(StealthPlugin());
+
+  const cookies = parseCookieFile(COOKIE_FILE);
 console.log(`加载 ${cookies.length} 个 Cookie`);
 
 const browser = await puppeteer.launch({
@@ -109,3 +112,9 @@ console.log(content.includes('40362') ? '❌ 被拦截（40362）' : '✅ 加载
 
 browser.disconnect();
 console.log('浏览器窗口保持打开，可手动操作');
+}
+
+main().catch((err) => {
+  console.error('❌ ' + (err && err.message ? err.message : err));
+  process.exit(1);
+});

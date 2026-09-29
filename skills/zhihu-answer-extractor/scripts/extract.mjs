@@ -19,6 +19,7 @@
 import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { resolveCookieFile, requireDepsOrExit } from './lib/env.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -125,7 +126,7 @@ const {
   maxWaitMs: MAX_WAIT_MS,
 } = options;
 
-const COOKIE_FILE = resolve(__dirname, 'www.zhihu.com_cookies.txt');
+const COOKIE_FILE = resolveCookieFile();
 
 // 自动检测 Chrome 路径
 function findChrome() {
@@ -308,6 +309,7 @@ async function scrollToBottom(page) {
 async function main() {
   console.log('=== 知乎回答批量抓取 ===\n');
 
+  requireDepsOrExit();
   const [{ default: puppeteer }, { default: StealthPlugin }] = await Promise.all([
     import('puppeteer-extra'),
     import('puppeteer-extra-plugin-stealth'),

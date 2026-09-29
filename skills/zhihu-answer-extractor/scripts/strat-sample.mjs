@@ -22,9 +22,10 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { resolveCookieFile } from './lib/env.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const COOKIE_FILE = resolve(__dirname, 'www.zhihu.com_cookies.txt');
+const COOKIE_FILE = resolveCookieFile();
 
 // API 硬上限：limit 超过 20 会返回 400（2026-09 实测）
 const API_LIMIT = 20;
@@ -340,6 +341,7 @@ async function main() {
       : null,
     rows: sampled.map((r) => ({
       rid: r.rid,
+      id: r.id,
       stratum: stratumOf(r.votes || 0, bandDefs).label,
       votes: r.votes || 0,
       author: r.author,

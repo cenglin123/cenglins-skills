@@ -4,10 +4,12 @@ description: >-
   批量抓取知乎问题下的回答并保存为 txt 文档。使用 puppeteer-extra + stealth 插件
   绕过知乎反爬检测（40362），支持「查看剩余 N 条回答」分页按钮真实点击加载、
   无限滚动兜底、展开折叠内容，提取题干/提问者/话题标签/关注数/浏览数/作者/
-  赞同数（含「1.6 万」万级换算）/正文。另含争议题分析：answers API 全量枚举 +
-  分层随机抽样 + 立场加权估计（含置信区间）与子代理独立裁决工作流。
+  赞同数（含「1.6 万」万级换算）/正文；另含争议题分析：answers API 全量枚举 +
+  分层随机抽样 + 立场加权估计（含置信区间）+ 回答下面热评的「评论层」抓取，
+  以及子代理独立裁决工作流。
   触发条件：用户要求下载/抓取/采集知乎回答、将知乎问题保存为文本、批量获取知乎内容，
-  或要求估计某争议问题的真实立场分布（避免只看高赞的排序偏置）。
+  或要求估计某争议问题的真实立场分布（避免只看高赞的排序偏置）、或需要连同回答
+  下面的热评/评论区一起分析。
 ---
 
 # 知乎回答批量抓取
@@ -19,12 +21,28 @@ description: >-
 1. Node.js 18+ 已安装
 2. Chrome 浏览器已安装
 
-## 安装依赖
+## 安装依赖（及环境自愈）
+
+依赖与本 skill 的 Cookie 都存放在 **skill 目录之外**（默认 `~/.zhihu-answer-extractor/`）。这样
+cc-switch 等管理器从 GitHub 重装本 skill（只会带回仓库里的文件，`node_modules`/Cookie 因
+`.gitignore` 不入库）时，不会把它们一并清空。
+
+推荐用自愈脚本一键就位——安装外部依赖、把 Cookie 迁到外部、并在 skill 内建软链/junction：
 
 ```powershell
-cd <SKILL_DIR>/scripts
-npm install
+node <SKILL_DIR>/scripts/setup.mjs
 ```
+
+- 每次用 cc-switch 重装本 skill 后，重跑一次 `node setup.mjs`（几秒，只重建软链，不重新下载依赖）
+- 快速检查环境：`node setup.mjs --check`（非 0 表示有缺失）
+- 外部家目录结构：
+  - `~/.zhihu-answer-extractor/www.zhihu.com_cookies.txt` — Cookie
+  - `~/.zhihu-answer-extractor/deps/node_modules` — 依赖（经 `scripts/node_modules` 软链暴露）
+- 可用环境变量覆盖：`ZHIHU_EXTRACTOR_HOME`（外部家目录）、`ZHIHU_COOKIE_FILE`（Cookie 路径）
+
+> 仅 3 个脚本需要依赖（`extract.mjs` / `open.mjs` / `get-cookie.mjs`，用 puppeteer）；
+> `strat-sample.mjs` / `stance-estimate.mjs` / `fetch-comments.mjs` 只用 Node 全局 `fetch`，
+> 无依赖——只要 Cookie 在，它们在 cc-switch 重装后仍可直接运行。
 
 ## Cookie 获取（两种方式）
 
@@ -41,7 +59,7 @@ node <SKILL_DIR>/scripts/get-cookie.mjs
 2. 用户在浏览器中手动登录（扫码/验证码/密码/微信/QQ 均可）
 3. 脚本每 2 秒自动检测登录状态
 4. 登录成功后自动提取 Cookie 并保存为 Netscape 格式
-5. 保存到 `<SKILL_DIR>/scripts/www.zhihu.com_cookies.txt`
+5. 保存到外部路径 `~/.zhihu-answer-extractor/www.zhihu.com_cookies.txt`（跨 cc-switch 重装存活）
 
 > ⚠️ **风险提示**：导出的 Cookie 包含知乎登录凭证（`z_c0`），任何获得此文件的人都可以以你的身份访问知乎。请妥善保管，不要分享给他人或上传到公共仓库。
 
@@ -50,7 +68,7 @@ node <SKILL_DIR>/scripts/get-cookie.mjs
 1. 用 Chrome 登录 zhihu.com
 2. 安装浏览器扩展 [EditThisCookie](https://chromewebstore.google.com/detail/editthiscookie/fngmhnnpilhplaeedifhccceomclgfbg) 或 [Cookie-Editor](https://chromewebstore.google.com/detail/cookie-editor/hlkenndednhfkekhgcdicdfddnkalmdm)
 3. 在知乎页面点击扩展 → 导出 → 选择 "Netscape HTTP Cookie File" 格式
-4. 保存到 `<SKILL_DIR>/scripts/www.zhihu.com_cookies.txt`
+4. 保存到外部路径 `~/.zhihu-answer-extractor/www.zhihu.com_cookies.txt`（脚本也会兼容读取 skill 内的旧路径）
 
 Cookie 有效期约 6 个月。如果抓取返回 403 或重定向到登录页，重新获取即可。
 
@@ -195,6 +213,30 @@ node <SKILL_DIR>/scripts/strat-sample.mjs `
 
 无 `verdicts` 时可用 `--use-autohint --facets <file>` 做**低置信预览**（关键词粗分类，会大量漏判，仅用于快速摸底）。
 
+### 第三步（可选）：评论层分析（fetch-comments.mjs）
+
+回答区容易被排序机制压成同质化，而**反驳/质疑/反例往往沉在评论区**。用本步把「回答下面的热评」单独抓成一个观察层：
+
+```powershell
+node <SKILL_DIR>/scripts/fetch-comments.mjs `
+  --census <qid>_census.json --ledger <qid>_ledger.json `
+  --only-sampled --per-answer 10 --out-dir <OUTPUT_DIR>
+```
+
+- `--only-sampled`：只抓分层抽样那批回答的热评（请求量最小，推荐）；省略则按赞同降序抓全量，可用 `--top n` / `--max-answers n` 限流
+- `--per-answer K`：每条回答取前 K 条热评（默认 10，按赞 `order_by=score`）
+- `--replies K`：每条热评再抓 K 条楼中楼（默认 0；每加 1 会按热评数成倍增加请求）
+- 产出 `<qid>_comments.json`（结构化）+ `<qid>_comments.txt`（供精读）
+- 复用 answers 评论 API（纯 `fetch`，无浏览器）；注意评论赞数字段是 `vote_count`（不是 answers 的 `voteup_count`），作者在 `author.member.name`
+
+**评论层只做三件事，且必须与回答区分开报告：**
+
+1. **争议点定位**：哪些论点在评论区被反驳/质疑最多
+2. **两区对照**：回答区立场分布 vs 评论区立场分布（回答区一边倒时，评论区是否出现异议）
+3. **信息增量**：评论里出现的新事实、反例、更正
+
+> ⚠️ **不要做的事**：不要把评论并进回答区的立场统计。评论是**挂在具体回答下的、非独立的**样本——同意靠点赞、反对才留言，会系统性放大分歧、压低共识，且更易被刷。它给的是「反应/争议分布」，不是「公众意见」；把它当独立层看有价值，混进正文统计就是灾难。
+
 ### 设计哲学（与 harness 原则一致）
 
 脚本负责一切**确定性**的事：枚举、分页、分层、随机、加权、置信区间、关键词交叉验证与记账；「每条回答属于哪个阵营」这个**需要判断**的事留在 agent 手里——脚本只给 `auto_hint` 辅助分诊，绝不替 agent 下判断（`verdict` 字段由 agent 填）。
@@ -218,6 +260,7 @@ node <SKILL_DIR>/scripts/strat-sample.mjs `
 
 | 问题 | 原因 | 解决 |
 |------|------|------|
+| **依赖/Cookie 突然消失（`Cannot find package 'puppeteer-extra'` 或 `Cookie 文件不存在`）** | cc-switch 等从 GitHub 重装 skill，把 skill 内被 `.gitignore` 排除的 `node_modules`、Cookie 一并清空 | 运行 `node <SKILL_DIR>/scripts/setup.mjs` 自愈（Cookie 与依赖已移到 `~/.zhihu-answer-extractor/`，重装不受影响） |
 | 返回 40362 | Cookie 过期或被检测 | 重新运行 `get-cookie.mjs` 获取 |
 | 重定向到登录页 | Cookie 无效 | 确认 `z_c0` 存在且未过期 |
 | **停止原因=触发登录墙** | **Cookie 被服务端吊销**（别处退出登录/会话轮换）。注意：z_c0 纸面有效期未到也可能失效；问题页匿名可看（状态 200、标题正常），但点击「查看剩余」展开更多回答时强制登录 | 用页面右上角显示「登录/注册」而非头像来快速确认登录态失效；重新运行 `get-cookie.mjs` 手动登录 |
@@ -228,11 +271,14 @@ node <SKILL_DIR>/scripts/strat-sample.mjs `
 
 | 文件 | 用途 |
 |------|------|
-| `scripts/get-cookie.mjs` | 一键获取 Cookie（打开浏览器→用户登录→自动导出） |
+| `scripts/get-cookie.mjs` | 一键获取 Cookie（打开浏览器→用户登录→自动导出到外部路径） |
+| `scripts/setup.mjs` | 环境自愈：安装外部依赖 + 迁移 Cookie + 在 skill 内建软链（cc-switch 重装后跑它） |
+| `scripts/lib/env.mjs` | 共享路径解析（外部家目录 / Cookie / 依赖链接），零依赖 |
 | `scripts/extract.mjs` | 批量抓取脚本（headless，速度快） |
 | `scripts/strat-sample.mjs` | 全量枚举 + 分层随机抽样（争议题防排序偏置） |
 | `scripts/stance-estimate.mjs` | 立场加权估计 + 置信区间 + 关键词交叉验证 |
+| `scripts/fetch-comments.mjs` | 抓取回答下面的热评（评论层，可选第三步） |
 | `scripts/facets.example.json` | 阵营关键词配置示例（供 strat-sample 的 auto_hint） |
 | `scripts/open.mjs` | 浏览器打开模式（可视化，手动操作） |
 | `scripts/package.json` | npm 依赖声明 |
-| `scripts/www.zhihu.com_cookies.txt` | Cookie 文件（由 get-cookie.mjs 生成或手动导出） |
+| `scripts/www.zhihu.com_cookies.txt` | Cookie 文件（旧路径；现由 get-cookie.mjs 写到 `~/.zhihu-answer-extractor/`，脚本兼容读取此处） |

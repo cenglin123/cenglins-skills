@@ -6,12 +6,15 @@
 
 ## 快速开始
 
-### 1. 安装依赖
+### 1. 安装依赖（及环境自愈）
+
+依赖与 Cookie 存放在 **skill 目录之外**（默认 `~/.zhihu-answer-extractor/`），以免 cc-switch 从 GitHub 重装 skill 时（只会带回仓库里的文件）把它们清空。推荐用自愈脚本一键就位：
 
 ```bash
-cd scripts
-npm install
+node scripts/setup.mjs
 ```
+
+每次用 cc-switch 重装本 skill 后重跑一次即可（几秒，只重建软链，不重新下载依赖）；`node scripts/setup.mjs --check` 可检查环境是否就绪。
 
 ### 2. 获取 Cookie
 
@@ -24,7 +27,7 @@ node scripts/get-cookie.mjs
 脚本会自动打开浏览器，你只需：
 1. 在弹出的浏览器中登录知乎（扫码/验证码/密码均可）
 2. 登录成功后脚本自动检测并导出 Cookie
-3. Cookie 保存到 `scripts/www.zhihu.com_cookies.txt`
+3. Cookie 保存到外部路径 `~/.zhihu-answer-extractor/www.zhihu.com_cookies.txt`（跨重装存活）
 
 > ⚠️ **风险提示**：导出的 Cookie 包含你的知乎登录凭证（`z_c0`），任何获得此文件的人都可以以你的身份访问知乎。请妥善保管，不要分享给他人或上传到公共仓库。
 
@@ -35,7 +38,7 @@ node scripts/get-cookie.mjs
    - [EditThisCookie](https://chromewebstore.google.com/detail/editthiscookie/fngmhnnpilhplaeedifhccceomclgfbg)（推荐）
    - [Cookie-Editor](https://chromewebstore.google.com/detail/cookie-editor/hlkenndednhfkekhgcdicdfddnkalmdm)
 3. 在知乎页面点击扩展图标 → 导出 → 选择 **Netscape HTTP Cookie File** 格式
-4. 保存为 `scripts/www.zhihu.com_cookies.txt`
+4. 保存为 `~/.zhihu-answer-extractor/www.zhihu.com_cookies.txt`（脚本也兼容读取 skill 内的旧路径）
 
 ### 3. 运行
 
@@ -45,7 +48,7 @@ node scripts/extract.mjs --url "https://www.zhihu.com/question/XXXXXXXX" --count
 
 `--count` 默认为 50；省略 `--output` 时保存到脚本目录。`--max-wait` 可调整最长加载等待秒数，默认 180。
 
-## 五种模式
+## 六种模式
 
 ### Cookie 获取（get-cookie.mjs）
 
@@ -104,6 +107,22 @@ node scripts/stance-estimate.mjs --ledger out/X_ledger.json --census out/X_censu
 
 无 `verdicts` 时可用 `--use-autohint --facets <file>` 做低置信预览。
 
+### 评论层（fetch-comments.mjs）
+
+抓「回答下面的热评」，作为与回答区相互独立的第二观察层（反驳往往沉在评论区）：
+
+```bash
+node scripts/fetch-comments.mjs --census out/X_census.json --ledger out/X_ledger.json \
+  --only-sampled --per-answer 10 --out-dir ./out
+```
+
+- `--only-sampled`：只抓分层抽样那批回答（推荐，请求量最小）；省略则按赞同降序抓全量，可用 `--top n` / `--max-answers n` 限流
+- `--per-answer K`：每条回答取前 K 条热评（默认 10）
+- `--replies K`：每条热评再抓 K 条楼中楼（默认 0，会成倍增加请求）
+- 产出 `_comments.json` + `_comments.txt`
+
+> ⚠️ 评论是回答的**附属、非独立**样本（同意靠点赞、反对才留言），会放大分歧、压低共识。它给的是「反应/争议分布」，**不要并进回答区的立场统计**。
+
 ## 输出示例
 
 ```
@@ -153,7 +172,7 @@ URL: https://www.zhihu.com/question/2042649810709239000
 - 至少两个独立视角（子代理 + 主代理自己）才能避免偏误
 - 分歧必须由主代理回到原文裁决，而不是取平均
 
-> **争议题额外一步**：若问题带有明显站队性，先跑 `strat-sample.mjs` 做分层随机抽样，再对样本精读判读、用 `stance-estimate.mjs` 给出加权占比与置信区间——这样结论不会被高赞区（排序偏置）带跑，且能显式报告「中立/噪音」占比与不确定性。
+> **争议题额外一步**：若问题带有明显站队性，先跑 `strat-sample.mjs` 做分层随机抽样，再对样本精读判读、用 `stance-estimate.mjs` 给出加权占比与置信区间——这样结论不会被高赞区（排序偏置）带跑，且能显式报告「中立/噪音」占比与不确定性。若还想看异议/反驳，用 `fetch-comments.mjs` 抓回答下面的热评作为**独立评论层**分析（见 SKILL.md「评论层分析」），但不要与回答区立场混算。
 
 详见 `SKILL.md` 中的流程与子代理 Prompt 模板。
 
@@ -191,6 +210,12 @@ URL: https://www.zhihu.com/question/2042649810709239000
 7. 赞同数支持「1.6 万」万级换算（优先读 `aria-label`，避免把 1.6 万解析成 16）
 
 ## 常见问题
+
+### Q: 依赖或 Cookie 突然消失（`Cannot find package 'puppeteer-extra'` / `Cookie 文件不存在`）
+
+原因：cc-switch 等管理器从 GitHub 重装本 skill 时，会整体替换 skill 目录，把被 `.gitignore` 排除的 `node_modules`、Cookie 一并清空。
+
+解决：运行 `node scripts/setup.mjs` 自愈。Cookie 与依赖现已放在 `~/.zhihu-answer-extractor/`，重装不受影响，setup 只需重建软链（无需重新下载）。
 
 ### Q: 返回 40362 错误
 
@@ -248,9 +273,12 @@ zhihu-answer-extractor/
 └── scripts/
     ├── package.json                 # npm 依赖声明
     ├── get-cookie.mjs               # Cookie 一键获取脚本
+    ├── setup.mjs                    # 环境自愈（外部依赖 + Cookie 迁移 + 建软链）
+    ├── lib/env.mjs                  # 共享路径解析（外部家目录/Cookie/依赖链接）
     ├── extract.mjs                  # 批量抓取脚本（headless）
     ├── strat-sample.mjs             # 全量枚举 + 分层随机抽样
     ├── stance-estimate.mjs          # 立场加权估计 + 置信区间
+    ├── fetch-comments.mjs           # 回答下面热评的评论层抓取
     ├── facets.example.json          # 阵营关键词配置示例
     ├── open.mjs                     # 浏览器打开模式（可视化）
     └── www.zhihu.com_cookies.txt    # Cookie 文件（由 get-cookie.mjs 生成）

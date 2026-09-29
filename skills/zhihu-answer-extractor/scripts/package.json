@@ -7,6 +7,7 @@
     "extract": "node extract.mjs",
     "strat": "node strat-sample.mjs",
     "estimate": "node stance-estimate.mjs",
+    "comments": "node fetch-comments.mjs",
     "open": "node open.mjs"
   },
   "dependencies": {

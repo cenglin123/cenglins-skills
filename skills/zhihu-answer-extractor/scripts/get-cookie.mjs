@@ -16,11 +16,10 @@
  *   - Cookie 有效期约 6 个月，过期需重新获取
  */
 
-import puppeteer from 'puppeteer-extra';
-import StealthPlugin from 'puppeteer-extra-plugin-stealth';
-import { writeFileSync, existsSync } from 'fs';
+import { writeFileSync, existsSync, mkdirSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { EXTERNAL_HOME, EXTERNAL_COOKIE, requireDepsOrExit } from './lib/env.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -28,7 +27,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 // ▼▼▼ 配置区 ▼▼▼
 // ═══════════════════════════════════════════════════════════════
 
-const OUTPUT_FILE = resolve(__dirname, 'www.zhihu.com_cookies.txt');
+const OUTPUT_FILE = EXTERNAL_COOKIE;  // 存到 skill 目录之外，避免重装被清空
 const LOGIN_URL = 'https://www.zhihu.com/signin';
 const HOME_URL = 'https://www.zhihu.com';
 const CHECK_INTERVAL = 2000;  // 每 2 秒检查一次登录状态
@@ -37,8 +36,6 @@ const MAX_WAIT = 300000;      // 最长等待 5 分钟
 // ═══════════════════════════════════════════════════════════════
 // ▲▲▲ 配置区结束 ▲▲▲
 // ═══════════════════════════════════════════════════════════════
-
-puppeteer.use(StealthPlugin());
 
 // 自动检测 Chrome 路径
 function findChrome() {
@@ -104,6 +101,11 @@ async function isLoggedIn(page) {
 
 // ── 主流程 ───────────────────────────────────────────────────
 async function main() {
+  requireDepsOrExit();
+  const { default: puppeteer } = await import('puppeteer-extra');
+  const { default: StealthPlugin } = await import('puppeteer-extra-plugin-stealth');
+  puppeteer.use(StealthPlugin());
+
   console.log('╔══════════════════════════════════════════════╗');
   console.log('║       知乎 Cookie 获取工具                  ║');
   console.log('╚══════════════════════════════════════════════╝');
@@ -183,6 +185,7 @@ async function main() {
 
   // 5. 保存
   const netscapeContent = toNetscapeFormat(allCookies);
+  mkdirSync(EXTERNAL_HOME, { recursive: true });
   writeFileSync(OUTPUT_FILE, netscapeContent, 'utf-8');
 
   console.log(`\n✅ Cookie 已保存到: ${OUTPUT_FILE}`);
