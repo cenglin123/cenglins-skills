@@ -13,8 +13,10 @@ $ver   = '3.12.8'
 $file  = "python-$ver-embed-amd64.zip"
 $sha256 = '8d3f33be9eb810f23c102f08475af2854e50484b8e4e06275e937be61ce3d2fb'
 $urls = @(
-    "https://mirrors.huaweicloud.com/python/$ver/$file",   # 国内镜像优先
-    "https://www.python.org/ftp/python/$ver/$file"          # 官方源回退
+    "https://mirrors.huaweicloud.com/python/$ver/$file",            # 华为云
+    "https://mirrors.tuna.tsinghua.edu.cn/python/$ver/$file",       # 清华 TUNA
+    "https://registry.npmmirror.com/-/binary/python/$ver/$file",    # 淘宝 npmmirror
+    "https://www.python.org/ftp/python/$ver/$file"                  # 官方源回退
 )
 
 $tmp = Join-Path $env:TEMP $file
