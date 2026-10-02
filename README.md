@@ -14,6 +14,11 @@ cenglins-skills/
 │   ├── bilibili-comment-extractor/
 │   │   ├── SKILL.md
 │   │   └── scripts/
+│   ├── foxmail-grep/
+│   │   ├── SKILL.md
+│   │   ├── README.md
+│   │   ├── refs/
+│   │   └── scripts/
 │   ├── powershell-guard/
 │   │   └── SKILL.md
 │   ├── utf8-guard/
@@ -101,6 +106,7 @@ git clone https://github.com/cenglin123/cenglins-skills.git "$env:USERPROFILE\.a
 |---|---|
 | `bilibili-comment-extractor` | 通过 B 站 API 抓取主评论和楼中楼，并保存为结构化文本 |
 | `crlf-guard` | 防止 Windows Git 项目中的 CRLF/LF 与文本写入事故 |
+| `foxmail-grep` | 免密码检索 Foxmail 本地邮件（7.2 / 7.0-7.1 / 5.x-6.x），支持附件提取与 POP3 拉取 |
 | `powershell-guard` | 规避 Windows PowerShell 5.1 的语法、别名与编码陷阱 |
 | `utf8-guard` | 区分并处理 Windows 中文文本的 UTF-8、GBK 与显示层问题 |
 | `video-to-srt` | 下载视频、用 faster-whisper 生成字幕，并由 Agent 安全校对和导出文本 |
