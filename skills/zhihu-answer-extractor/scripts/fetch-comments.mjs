@@ -2,10 +2,10 @@
 /**
  * 评论层抓取（争议题采样分析 · 可选第三步）
  *
- * 抓取「回答下面的热评」，作为与回答区相互独立的第二个观察层。
+ * 抓取「回答下面的热评」，作为与回答区**分开报告**的第二观察层（评论是回答的附属、非独立样本）。
  *
  * 为什么要单独一层（而不是并进答案立场统计）：
- *   - 回答区容易被排序机制压成同质化（实测争议题 ~85-90% 一边倒），
+ *   - 回答区容易被排序机制压成同质化（经验：争议题高赞区常 ~85-90% 一边倒），
  *     而反驳/质疑/反例往往沉在评论区——评论是「异议暴露层」。
  *   - 但评论是**挂在具体回答下的、非独立的**样本：同意靠点赞、反对才留言，
  *     评论区会系统性放大分歧、压低共识，且更易被刷。
@@ -66,8 +66,8 @@ function printHelp() {
   <qid>_comments.json   结构化评论（含楼中楼）
   <qid>_comments.txt    可读版（供 agent 精读）
 
-成本提示：每条约 1 个请求（--replies 0）。--only-sampled 抽样 165 条约 3 分钟；
-全量 1500 条约 30 分钟。楼中楼每加一条会按「热评数」成倍增加请求。`);
+成本提示（约数，视网络）：每条约 1 个请求（--replies 0）；抽样 165 条约数分钟，
+全量 1500 条约数十分钟。楼中楼每加一条会按「热评数」成倍增加请求。`);
 }
 
 function parseArgs(argv) {
@@ -189,7 +189,7 @@ async function fetchRootComments(aid, want, orderBy, cookieHeader, throttle) {
     total = d.paging ? d.paging.totals : total;
     const data = d.data || [];
     for (const c of data) out.push(mapComment(c));
-    if (!data.length || (d.paging && d.paging.is_end) || out.length >= total) break;
+    if (!data.length || (d.paging && d.paging.is_end) || (total !== null && out.length >= total)) break;
     offset += API_LIMIT;
     await sleep(throttle * (0.6 + Math.random() * 0.8));
   }
@@ -197,10 +197,18 @@ async function fetchRootComments(aid, want, orderBy, cookieHeader, throttle) {
 }
 
 async function fetchReplies(cid, want, cookieHeader, throttle) {
-  const url = `${API_HOST}/api/v4/comments/${cid}/child_comments?limit=${Math.min(API_LIMIT, want)}&offset=0`;
-  const d = await withRetry(() => apiGet(url, cookieHeader), `comment ${cid} 楼中楼`);
-  const out = (d.data || []).map(mapComment);
-  await sleep(throttle * (0.5 + Math.random() * 0.5));
+  const out = [];
+  let offset = 0;
+  while (out.length < want) {
+    const url = `${API_HOST}/api/v4/comments/${cid}/child_comments?limit=${API_LIMIT}&offset=${offset}`;
+    const d = await withRetry(() => apiGet(url, cookieHeader), `comment ${cid} 楼中楼`);
+    const data = d.data || [];
+    for (const c of data) out.push(mapComment(c));
+    const total = d.paging ? d.paging.totals : null;
+    if (!data.length || (d.paging && d.paging.is_end) || (total !== null && out.length >= total)) break;
+    offset += API_LIMIT;
+    await sleep(throttle * (0.5 + Math.random() * 0.5));
+  }
   return out.slice(0, want);
 }
 

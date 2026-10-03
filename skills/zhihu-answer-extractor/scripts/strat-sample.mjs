@@ -27,7 +27,7 @@ import { resolveCookieFile } from './lib/env.mjs';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const COOKIE_FILE = resolveCookieFile();
 
-// API 硬上限：limit 超过 20 会返回 400（2026-09 实测）
+// API 硬上限：limit 超过 20 会返回 400（经验值，接口可能变化）
 const API_LIMIT = 20;
 const API_HOST = 'https://www.zhihu.com';
 const USER_AGENT =
@@ -174,6 +174,7 @@ async function enumerateAll(opts, cookieHeader) {
   let offset = 0;
   let totals = null;
   let fails = 0;
+  let ended = false;
   const pages = [];
   while (pages.length < opts.maxPages) {
     let data;
@@ -201,16 +202,23 @@ async function enumerateAll(opts, cookieHeader) {
     }
     pages.push(offset);
     if (pages.length % 10 === 0) console.log(`  已枚举 ${rows.length}/${totals ?? '?'}`);
-    if (!data.length || offset + API_LIMIT >= (totals ?? Infinity)) break;
+    if (!data.length || offset + API_LIMIT >= (totals ?? Infinity)) { ended = true; break; }
     offset += API_LIMIT;
     await sleep(opts.throttle * (0.6 + Math.random() * 0.8));
   }
-  return { totals, rows };
+  const truncated = !ended && totals != null && rows.length < totals;
+  return { totals, rows, truncated };
 }
 
 // ── 分层与抽样 ───────────────────────────────────────────────
 
 function buildBands(edges) {
+  if (!edges.length || edges[0] !== 0) {
+    throw new Error('分层下界必须以 0 开始，否则低赞回答会静默落入最高层、污染权重。请让 --bands 以 0 开头。');
+  }
+  for (let i = 1; i < edges.length; i++) {
+    if (!(edges[i] > edges[i - 1])) throw new Error(`分层上界必须严格递增：${edges[i - 1]} -> ${edges[i]}`);
+  }
   const out = [];
   for (let i = 0; i < edges.length; i++) {
     const lo = edges[i];
@@ -237,6 +245,7 @@ async function main() {
 
   let rows;
   let totals = null;
+  let truncated = false;
   let censusPath = opts.census ? resolve(opts.census) : resolve(outDir, `${opts.qid}_census.json`);
 
   if (opts.census && existsSync(censusPath)) {
@@ -247,6 +256,7 @@ async function main() {
     } else {
       rows = raw.rows;
       totals = raw.totals ?? null;
+      truncated = !!raw.truncated;
       if (raw.qid && !opts.qid) opts.qid = raw.qid;
     }
   } else {
@@ -255,7 +265,15 @@ async function main() {
     const res = await enumerateAll(opts, cookieHeader);
     rows = res.rows;
     totals = res.totals;
+    truncated = res.truncated;
     console.log(`      枚举完成：${rows.length} 条（页面报告 ${totals}）`);
+    if (truncated) {
+      console.log(`      ⚠️ 达到 --max-pages=${opts.maxPages} 截断：仅枚举 ${rows.length}/${totals} 条，占比会被系统性高估`);
+    }
+  }
+
+  if (!opts.qid) {
+    throw new Error('无法确定 qid：请提供 --url，或使用本脚本生成的（含 qid 的）census 文件');
   }
 
   // 稳定编号：按赞同降序，rid 从 1 开始
@@ -266,7 +284,7 @@ async function main() {
   if (!opts.census || !existsSync(censusPath)) {
     writeFileSync(
       censusPath,
-      JSON.stringify({ qid: opts.qid, totals: totals ?? N, fetched_at: new Date().toISOString(), rows }, null, 1),
+      JSON.stringify({ qid: opts.qid, totals: totals ?? N, truncated, fetched_at: new Date().toISOString(), rows }, null, 1),
       'utf-8',
     );
     console.log(`      census 已保存: ${censusPath}`);
@@ -306,6 +324,7 @@ async function main() {
   L.push(`全量枚举 + 分层随机抽样`);
   L.push(`问题 qid: ${opts.qid}`);
   L.push(`总体: ${N} 条回答（页面报告 ${totals ?? '?'}）`);
+  if (truncated) L.push(`⚠️ 枚举被 --max-pages 截断：仅 ${N}/${totals} 条；据此外推的占比会被高估，勿直接采信`);
   L.push(`分层: ${bandDefs.map((b) => b.label).join(' ')}`);
   L.push(`每层抽样: ${opts.perBand}   种子: ${opts.seed}   合计抽样: ${sampled.length}`);
   if (facets) L.push(`阵营关键词: ${Object.entries(facets).map(([c, d]) => `${c}=${d.label || c}`).join(', ')}`);
@@ -357,6 +376,8 @@ async function main() {
   const stats = {
     qid: opts.qid,
     population: N,
+    reported_totals: totals ?? N,
+    truncated,
     total_votes: rows.reduce((s, r) => s + (r.votes || 0), 0),
     sampled: sampled.length,
     bands: bandDefs.map((b) => ({

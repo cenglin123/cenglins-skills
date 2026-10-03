@@ -11,9 +11,9 @@
  */
 
 import { readFileSync, existsSync } from 'fs';
-import { resolve, dirname } from 'path';
+import { resolve, dirname, join } from 'path';
 import { fileURLToPath } from 'url';
-import { resolveCookieFile, requireDepsOrExit } from './lib/env.mjs';
+import { resolveCookieFile, requireDepsOrExit, EXTERNAL_HOME } from './lib/env.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -28,7 +28,7 @@ const TARGET_URL = 'https://www.zhihu.com/question/XXXXXXXX';  // 目标页面 U
 // ═══════════════════════════════════════════════════════════════
 
 const COOKIE_FILE = resolveCookieFile();
-const PROFILE_DIR = resolve(__dirname, '.chrome-profile');
+const PROFILE_DIR = join(EXTERNAL_HOME, 'chrome-profile'); // 放 skill 之外，避免重装清空
 
 // 自动检测 Chrome 路径
 function findChrome() {

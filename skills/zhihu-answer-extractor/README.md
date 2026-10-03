@@ -109,7 +109,7 @@ node scripts/stance-estimate.mjs --ledger out/X_ledger.json --census out/X_censu
 
 ### 评论层（fetch-comments.mjs）
 
-抓「回答下面的热评」，作为与回答区相互独立的第二观察层（反驳往往沉在评论区）：
+抓「回答下面的热评」，作为与回答区**分开报告**的第二观察层（反驳往往沉在评论区）：
 
 ```bash
 node scripts/fetch-comments.mjs --census out/X_census.json --ledger out/X_ledger.json \
@@ -123,7 +123,7 @@ node scripts/fetch-comments.mjs --census out/X_census.json --ledger out/X_ledger
 
 > ⚠️ 评论是回答的**附属、非独立**样本（同意靠点赞、反对才留言），会放大分歧、压低共识。它给的是「反应/争议分布」，**不要并进回答区的立场统计**。
 
-**复核清单与反串识别**：给 `fetch-comments.mjs` 加 `--ledger`，输出的每条回答会连同「判读 + 正文节选」一起列出——即一张**复核清单**。用它做**反串/阴阳校验**：文本语气可能骗人（如一句「劝对方别理会黑子」表面像支持，其评论区却全是反方在叫好 → 实为反串），此时以**评论区归属**定立场。校正后重跑 `stance-estimate.mjs --alt <校正判读>` 做**敏感性**：某阵营占比一校正就垮塌，说明结论不稳。
+**复核清单与反串识别**：给 `fetch-comments.mjs` 加 `--ledger`，输出的每条回答会连同「判读 + 正文节选」一起列出——即一张**复核清单**。用它做反串/阴阳校验时注意：文本语气可能骗人（如一句「劝对方别理会黑子」表面像支持，评论区却全是反方叫好）。但**启发式只降置信、不直接改判**；只有「文本没有明确立场」**且**「评论区归属一致且明确」同时满足时才据评论区定立场，否则标「待复核」。校正后重跑 `stance-estimate.mjs --alt <校正判读>` 做**敏感性**：某阵营占比一校正就垮塌，说明结论不稳。
 
 ## 输出示例
 
@@ -283,7 +283,7 @@ zhihu-answer-extractor/
     ├── fetch-comments.mjs           # 回答下面热评的评论层抓取
     ├── facets.example.json          # 阵营关键词配置示例
     ├── open.mjs                     # 浏览器打开模式（可视化）
-    └── www.zhihu.com_cookies.txt    # Cookie 文件（由 get-cookie.mjs 生成）
+    └── www.zhihu.com_cookies.txt    # 旧路径；现由 get-cookie.mjs 写入 ~/.zhihu-answer-extractor/（脚本兼容读取）
 ```
 
 ## 环境要求

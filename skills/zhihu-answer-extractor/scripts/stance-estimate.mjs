@@ -124,7 +124,7 @@ function parseVerdicts(text) {
     const line = raw.trim();
     if (!line) continue;
     if (line.startsWith('#')) {
-      current = line.slice(1).split('=')[0].trim();
+      current = line.slice(1).split('=')[0].trim().split(/\s+/)[0];
       continue;
     }
     if (!current) continue;
@@ -154,6 +154,8 @@ function main() {
   const ledger = JSON.parse(readFileSync(resolve(opts.ledger), 'utf-8'));
   const censusRaw = JSON.parse(readFileSync(resolve(opts.census), 'utf-8'));
   const censusRows = Array.isArray(censusRaw) ? censusRaw : censusRaw.rows;
+  const censusTotals = Array.isArray(censusRaw) ? null : (censusRaw.totals ?? null);
+  const censusTruncated = !Array.isArray(censusRaw) && !!censusRaw.truncated;
 
   const rows = ledger.rows || [];
   const bandLabels = ledger.bands || [...new Set(rows.map((r) => r.stratum))];
@@ -178,16 +180,32 @@ function main() {
     verdicts = parseVerdicts(readFileSync(resolve(opts.verdicts), 'utf-8'));
     source = 'agent 判读 (--verdicts)';
   } else {
+    let fromLedger = 0;
+    let fromHint = 0;
     for (const r of rows) {
-      if (r.verdict) verdicts[String(r.rid)] = r.verdict;
-      else if (opts.useAutoHint && Array.isArray(r.auto_hint) && r.auto_hint.length) {
+      if (r.verdict) {
+        verdicts[String(r.rid)] = r.verdict;
+        fromLedger++;
+      } else if (opts.useAutoHint && Array.isArray(r.auto_hint) && r.auto_hint.length) {
         verdicts[String(r.rid)] = r.auto_hint[0];
+        fromHint++;
       }
     }
-    source = opts.verdicts ? 'ledger.verdict' : '关键词 auto_hint（低置信，仅预览）';
+    source = fromLedger && fromHint
+      ? `ledger.verdict(${fromLedger}) + auto_hint(${fromHint})（混合）`
+      : fromLedger
+        ? `ledger.verdict(${fromLedger})`
+        : `关键词 auto_hint(${fromHint})（低置信，仅预览）`;
   }
 
   const cats = opts.categories;
+  const unknownCats = [...new Set(Object.values(verdicts))].filter((v) => !(v in cats));
+  if (unknownCats.length) {
+    throw new Error(
+      `判读里出现未在 --categories 中声明的类别: ${unknownCats.join(', ')}。` +
+        `请检查拼写，或用 --categories 补充（否则这些条目会被静默丢弃）。`,
+    );
+  }
 
   // 给定一份判读映射，算出加权计数、未判读、设计方差（供主判读与 --alt 复用）
   const tally = (vmap) => {
@@ -233,6 +251,9 @@ function main() {
   L.push(`- 总体: ${N} 条回答；抽样: ${rows.length} 条（每层 ${ledger.per_band}，seed=${ledger.seed}）`);
   L.push(`- 判读来源: ${source}`);
   L.push(`- 未判读: ${unjudged.length} 条`);
+  if (censusTruncated || (censusTotals && censusTotals > N)) {
+    L.push(`- ⚠️ **census 被截断**：仅 ${N} 条，页面报告 ${censusTotals ?? '?'} 条 → 总体 N 被低估，所有占比会被系统性高估`);
+  }
   L.push('');
   L.push('## 分层抽样设计');
   L.push('');
@@ -289,15 +310,22 @@ function main() {
     const none = censusRows.filter((r) => !allMarkers.some((m) => (r.text || '').includes(m))).length;
     L.push(`| （未命中任何关键词） | ${none} | ${pct(none / N)} |`);
     L.push('');
+    L.push('> 命中可重叠：同一回答可能同时命中多个阵营的关键词，故各行占比**不可相加**（与上方互斥的加权占比不可直接比较）。');
+    L.push('');
   }
 
   // 敏感性：主判读 vs 校正判读（--alt）
   if (opts.alt) {
     const altVerdicts = parseVerdicts(readFileSync(resolve(opts.alt), 'utf-8'));
+    const altUnknown = [...new Set(Object.values(altVerdicts))].filter((v) => !(v in cats));
+    if (altUnknown.length) {
+      throw new Error(`校正判读里出现未在 --categories 中声明的类别: ${altUnknown.join(', ')}（检查拼写；否则这些条目会静默消失、伪装成「结论不稳」）。`);
+    }
     const altRes = tally(altVerdicts);
     L.push('## 敏感性：主判读 vs 校正判读');
     L.push('');
     L.push(`校正判读来源: ${opts.alt}（如：把反串/需复核项改判、或把边缘项移入中立后）`);
+    L.push(`- 未判读：主判读 ${unjudged.length} 条，校正判读 ${altRes.unjudged.length} 条（两者差得太大通常是类别拼写/落项问题，而非真实变化）`);
     L.push('');
     L.push('| 阵营 | 主判读 | 校正判读 | 变化 |');
     L.push('|---|---:|---:|---:|');
@@ -315,10 +343,12 @@ function main() {
 
   L.push('## 方法与局限');
   L.push('');
-  L.push('- 层内为简单随机抽样，点估计按 N_h/n_h 加权；CI 用分层比例方差 + 有限总体校正。');
-  L.push('- 稀有类别（如仅个别命中）的设计方差会偏小，应结合 Wilson 参考区间与关键词交叉验证判断。');
+  L.push('- 层内为简单随机抽样，点估计按 N_h/n_h 加权；设计 CI 用分层比例方差 + 有限总体校正。');
+  L.push('- 逐类别 CI 是**边际**区间、未计类别间协方差，**不支持「A 是否多于 B」式的差值检验**。');
+  L.push('- 稀有类别（仅个别命中）的设计方差会偏小甚至为 0；表内「Wilson」列是**未加权**区间（非设计一致，仅供量级判断）。');
+  L.push('- 若 census 被截断（见 census.truncated / stats.truncated），总体 N 被低估，所有占比会被高估——应先重抓全量。');
   L.push('- 本报告只描述「回答区」的立场分布，不等于全体访问者/事件参与者的分布。');
-  L.push('- 关键词交叉验证只反映「是否出现某阵营的标志性话术」，会漏掉用词不同的同立场回答。');
+  L.push('- 关键词交叉验证只反映「是否出现某阵营的标志性话术」，会漏掉用词不同的同阵营回答，且命中可重叠。');
   L.push('');
 
   const report = L.join('\n');

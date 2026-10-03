@@ -19,10 +19,11 @@
  */
 
 import {
-  existsSync, mkdirSync, copyFileSync, lstatSync, rmSync, symlinkSync, readdirSync,
+  existsSync, mkdirSync, copyFileSync, lstatSync, rmSync, symlinkSync, readdirSync, readFileSync, writeFileSync,
 } from 'fs';
 import { join } from 'path';
 import { spawnSync } from 'child_process';
+import { createHash } from 'crypto';
 import {
   SCRIPTS_DIR, EXTERNAL_HOME, EXTERNAL_COOKIE, LEGACY_COOKIE,
   EXTERNAL_DEPS, DEPS_NODE_MODULES, LINK_PATH,
@@ -65,12 +66,23 @@ function linkStatus() {
   return isLink(LINK_PATH) ? 'link' : 'realdir';
 }
 
+function fileHash(p) {
+  try {
+    return createHash('sha256').update(readFileSync(p)).digest('hex');
+  } catch {
+    return null;
+  }
+}
+function wantPkgHash() {
+  return [fileHash(join(SCRIPTS_DIR, 'package.json')), fileHash(join(SCRIPTS_DIR, 'package-lock.json'))].join(':');
+}
+
 if (CHECK) {
   const c = cookieStatus(), d = depsStatus(), l = linkStatus();
   log(`Cookie : ${c} (${c === 'external' ? EXTERNAL_COOKIE : c === 'legacy' ? LEGACY_COOKIE : '无'})`);
   log(`Deps   : ${d}`);
-  log(`Link   : ${l}`);
-  const ok = c === 'external' && d === 'present' && l === 'link';
+  log(`Link   : ${l}${l === 'realdir' ? '（实体目录，可运行；欲跨重装存活请 --force）' : ''}`);
+  const ok = c === 'external' && (l === 'link' || l === 'realdir');
   log(ok ? 'OK：环境就绪' : 'NEEDS SETUP：请运行 node setup.mjs');
   process.exit(ok ? 0 : 1);
 }
@@ -103,11 +115,16 @@ for (const f of ['package.json', 'package-lock.json']) {
 }
 
 let ds = depsStatus();
+const pkgHashFile = join(EXTERNAL_DEPS, '.pkg-hash');
+const wantHash = wantPkgHash();
+const haveHash = existsSync(pkgHashFile) ? readFileSync(pkgHashFile, 'utf-8').trim() : '';
+const pkgChanged = ds === 'present' && !!haveHash && haveHash !== wantHash;
 if (NO_INSTALL) {
   log(`[deps] 跳过安装（--no-install）；当前状态: ${ds}`);
-} else if (ds === 'present' && !REINSTALL) {
-  log('[deps] 外部依赖已安装，跳过');
+} else if (ds === 'present' && !REINSTALL && !pkgChanged) {
+  log('[deps] 外部依赖已安装且 package 声明未变，跳过');
 } else {
+  if (pkgChanged) log('[deps] 检测到 package.json/lock 变化，重装依赖...');
   const useCi = existsSync(join(EXTERNAL_DEPS, 'package-lock.json'));
   const cmd = useCi ? ['ci'] : ['install'];
   log(`[deps] 安装到 ${EXTERNAL_DEPS}（npm ${cmd[0]}）...`);
@@ -121,6 +138,7 @@ if (NO_INSTALL) {
   }
   ds = depsStatus();
 }
+if (ds === 'present') writeFileSync(pkgHashFile, wantHash, 'utf-8');
 
 // ── 4. 建链 scripts/node_modules → 外部 deps ──
 const ls = linkStatus();
