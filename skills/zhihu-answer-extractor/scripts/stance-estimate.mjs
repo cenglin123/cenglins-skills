@@ -56,6 +56,7 @@ function printHelp() {
 选项：
   --categories "A=反X,B=挺X,N=中立,O=无关"   类别标签（默认 A/B/N/O 占位）
   --facets <file>     阵营关键词 JSON（用于关键词交叉验证；--use-autohint 时必需）
+  --alt <file>        校正判读文件（如同格式）。给出后额外输出「主判读 vs 校正判读」敏感性对比
   --output <file>     把 markdown 报告写入文件
 
 verdicts 分组文本示例：
@@ -103,6 +104,7 @@ function parseArgs(argv) {
     verdicts: values.get('verdicts') || '',
     useAutoHint: !!values.get('use-autohint'),
     facets: values.get('facets') || '',
+    alt: values.get('alt') || '',
     output: values.get('output') || '',
     categories,
   };
@@ -186,39 +188,42 @@ function main() {
   }
 
   const cats = opts.categories;
-  // 归入统计
-  const unjudged = [];
-  const count = {}; // cat -> {unweighted, weighted}
-  for (const c of Object.keys(cats)) count[c] = { unweighted: 0, weighted: 0 };
-  for (const r of rows) {
-    const v = verdicts[String(r.rid)];
-    if (!v || !(v in count)) {
-      unjudged.push(r.rid);
-      continue;
-    }
-    const nH = sampledByBand.get(r.stratum) || 1;
-    const NH = popSize.get(r.stratum) || nH;
-    const w = NH / nH;
-    count[v].unweighted += 1;
-    count[v].weighted += w;
-  }
 
-  // 设计方差（分层比例估计 + FPC）
-  const varOf = {};
-  for (const c of Object.keys(cats)) varOf[c] = 0;
-  for (const b of bandLabels) {
-    const nH = sampledByBand.get(b) || 0;
-    const NH = popSize.get(b) || 0;
-    if (nH === 0) continue;
-    const Wh = NH / N;
-    for (const c of Object.keys(cats)) {
-      const nHc = rows.filter((r) => r.stratum === b && verdicts[String(r.rid)] === c).length;
-      const pHc = nHc / nH;
-      const fpc = NH > 1 ? 1 - nH / NH : 0;
-      const v = fpc * (pHc * (1 - pHc)) / Math.max(1, nH - 1);
-      varOf[c] += Wh * Wh * v;
+  // 给定一份判读映射，算出加权计数、未判读、设计方差（供主判读与 --alt 复用）
+  const tally = (vmap) => {
+    const count = {}; // cat -> {unweighted, weighted}
+    for (const c of Object.keys(cats)) count[c] = { unweighted: 0, weighted: 0 };
+    const unjudged = [];
+    for (const r of rows) {
+      const v = vmap[String(r.rid)];
+      if (!v || !(v in count)) {
+        unjudged.push(r.rid);
+        continue;
+      }
+      const nH = sampledByBand.get(r.stratum) || 1;
+      const NH = popSize.get(r.stratum) || nH;
+      const w = NH / nH;
+      count[v].unweighted += 1;
+      count[v].weighted += w;
     }
-  }
+    const varOf = {};
+    for (const c of Object.keys(cats)) varOf[c] = 0;
+    for (const b of bandLabels) {
+      const nH = sampledByBand.get(b) || 0;
+      const NH = popSize.get(b) || 0;
+      if (nH === 0) continue;
+      const Wh = NH / N;
+      for (const c of Object.keys(cats)) {
+        const nHc = rows.filter((r) => r.stratum === b && vmap[String(r.rid)] === c).length;
+        const pHc = nHc / nH;
+        const fpc = NH > 1 ? 1 - nH / NH : 0;
+        varOf[c] += Wh * Wh * ((fpc * (pHc * (1 - pHc))) / Math.max(1, nH - 1));
+      }
+    }
+    return { count, unjudged, varOf };
+  };
+
+  const { count, unjudged, varOf } = tally(verdicts);
 
   // ── 报告 ──
   const L = [];
@@ -283,6 +288,28 @@ function main() {
     const allMarkers = Object.values(facets).flatMap((d) => d.markers || []);
     const none = censusRows.filter((r) => !allMarkers.some((m) => (r.text || '').includes(m))).length;
     L.push(`| （未命中任何关键词） | ${none} | ${pct(none / N)} |`);
+    L.push('');
+  }
+
+  // 敏感性：主判读 vs 校正判读（--alt）
+  if (opts.alt) {
+    const altVerdicts = parseVerdicts(readFileSync(resolve(opts.alt), 'utf-8'));
+    const altRes = tally(altVerdicts);
+    L.push('## 敏感性：主判读 vs 校正判读');
+    L.push('');
+    L.push(`校正判读来源: ${opts.alt}（如：把反串/需复核项改判、或把边缘项移入中立后）`);
+    L.push('');
+    L.push('| 阵营 | 主判读 | 校正判读 | 变化 |');
+    L.push('|---|---:|---:|---:|');
+    for (const [c, label] of Object.entries(cats)) {
+      const p1 = count[c].weighted / N;
+      const p2 = altRes.count[c].weighted / N;
+      const d = p2 - p1;
+      const sign = d >= 0 ? '+' : '';
+      L.push(`| ${label} (${c}) | ${pct(p1)} | ${pct(p2)} | ${sign}${(100 * d).toFixed(2)}pp |`);
+    }
+    L.push('');
+    L.push('若两者对结论无实质影响 → 结论稳健；若某阵营占比在被校正后垮塌（或从 0 变为非 0）→ 该结论依赖反串/模糊项，不可靠。');
     L.push('');
   }
 

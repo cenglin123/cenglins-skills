@@ -220,17 +220,33 @@ async function main() {
   const byRid = new Map();
   sorted.forEach((r, i) => byRid.set(i + 1, r));
 
+  // 可选：读 ledger，为每条回答附上 agent 判读与正文节选（使输出成为「评论区复核清单」）
+  const ledgerById = new Map();
+  const ledgerByRid = new Map();
+  if (opts.ledger && existsSync(opts.ledger)) {
+    for (const lr of (readJson(opts.ledger).rows || [])) {
+      if (lr.id) ledgerById.set(lr.id, lr);
+      ledgerByRid.set(lr.rid, lr);
+    }
+  }
+  const annotate = (t) => {
+    const lr = ledgerById.get(t.id) || ledgerByRid.get(t.rid);
+    if (lr) {
+      if (lr.verdict) t.verdict = lr.verdict;
+      if (lr.text) t.answer_text = lr.text;
+    }
+    return t;
+  };
+
   // 目标回答集合
   let targets = [];
   if (opts.onlySampled) {
-    const ledger = readJson(opts.ledger);
-    const rows = ledger.rows || [];
-    for (const lr of rows) {
+    for (const lr of (readJson(opts.ledger).rows || [])) {
       const hit = lr.id ? { id: lr.id, votes: lr.votes, author: lr.author } : byRid.get(lr.rid);
-      if (hit && hit.id) targets.push({ id: hit.id, votes: hit.votes || 0, author: hit.author || null, rid: lr.rid });
+      if (hit && hit.id) targets.push(annotate({ id: hit.id, votes: hit.votes || 0, author: hit.author || null, rid: lr.rid }));
     }
   } else {
-    targets = sorted.map((r, i) => ({ id: r.id, votes: r.votes || 0, author: r.author || null, rid: i + 1 }));
+    targets = sorted.map((r, i) => annotate({ id: r.id, votes: r.votes || 0, author: r.author || null, rid: i + 1, answer_text: r.text || null }));
     if (opts.top > 0) targets = targets.slice(0, opts.top);
   }
   if (opts.maxAnswers > 0) targets = targets.slice(0, opts.maxAnswers);
@@ -264,6 +280,8 @@ async function main() {
       rid: t.rid,
       answer_author: t.author,
       answer_votes: t.votes,
+      verdict: t.verdict || null,
+      answer_text: t.answer_text || null,
       total_comments: got.total,
       comments: got.comments,
     });
@@ -300,6 +318,8 @@ async function main() {
   for (const a of answers) {
     L.push('');
     L.push(`【回答 aid=${a.answer_id} rid=${a.rid}】 ${a.answer_author || '匿名'} | 赞=${a.answer_votes} | 评论总数=${a.total_comments}`);
+    const at = (a.answer_text || '').replace(/\s*\n+\s*/g, ' ').trim();
+    L.push(`  判读: ${a.verdict || '(未判读)'}${at ? '   回答节选: ' + (at.length > 100 ? at.slice(0, 100) + '…' : at) : ''}`);
     if (!a.comments.length) {
       L.push('  (无评论或无权限)');
       continue;
