@@ -33,24 +33,31 @@ node <SKILL_DIR>/scripts/setup.mjs --check   # 只检查环境（非 0 = 有缺�
 
 首次使用前，用 `scripts/get-cookie.mjs` 扫码登录一次，把 Cookie 写到 `~/.zhihu-auto/`（详见 `references/extract-answers.md`）。
 
-## 统一登录态（一次登录，四类任务复用）
+## 统一登录态（file ↔ MCP 双向统一）
 
-**唯一登录源 = `~/.zhihu-auto/www.zhihu.com_cookies.txt`**（由 `scripts/get-cookie.mjs` 写入）。
+**唯一登录源 = `~/.zhihu-auto/www.zhihu.com_cookies.txt`**。两个方向都收敛到它，**不各存一份**：
 
 - **API 通道**：直接读该文件（`scripts/*.mjs` 自动解析）。
-- **浏览器通道**：任务开始时把该文件**注入** playwright MCP，**不必每会话扫码**：
+- **file → MCP**（任务开始时把登录态注入浏览器）：
   ```powershell
-  node <SKILL_DIR>/scripts/cookie-for-browser.mjs      # 把 Cookie 转成注入代码文件
+  node <SKILL_DIR>/scripts/cookie-for-browser.mjs          # 把 Cookie 转成注入代码文件
   ```
   然后在 MCP 里：
   ```
-  browser_run_code_unsafe({ filename: "<SKILL_DIR>/scripts/.browser-login-code.js" })
-  # → 返回 { ok: true, count: N }；随后 browser_navigate 到 zhihu.com 即已登录
+  browser_run_code_unsafe({ filename: "<SKILL_DIR>/scripts/.browser-login-code.js" })   # → {ok:true,count:N}
+  browser_navigate → https://www.zhihu.com
   ```
-  之后 `edit-answer` / `publish-column` 全程复用该登录态。
-- **原理**：playwright MCP 的代码沙箱没有 `fs`/`require`，读不了文件，但能调 `page.context().addCookies(...)`；
-  故由本地脚本把 Cookie 内联成一段函数写文件，再交给 MCP 执行（含 `httpOnly` 的 `z_c0` 也能设）。
-- **过期**：Cookie 纸面约 6 个月；一旦 API 返回 40362 或浏览器掉登录，重跑 `get-cookie.mjs` 刷新文件即可（两边同时恢复）。
+- **MCP → file**（若你是在浏览器里登录的，把它导回文件，让 API 通道也一致）：
+  ```
+  # MCP: browser_run_code_unsafe({ code: "async (page) => (await page.context().cookies()).filter(c => (c.domain||'').includes('zhihu.com'))" })
+  # 把返回的 JSON 存成文件，然后：
+  node <SKILL_DIR>/scripts/cookie-from-browser.mjs --in <该 JSON 文件>
+  ```
+- **过期**：Cookie 纸面约 6 个月；API 返回 40362 或浏览器掉登录时，重跑 `get-cookie.mjs` 刷新文件，再按 file→MCP 注入。
+- **原理/坑**：playwright MCP 的代码沙箱没有 `fs`/`require`/动态 `import`（实测），**读/写不了文件**，但能调
+  `page.context().addCookies()` 与 `.cookies()`；故 file→MCP 由本地脚本把 Cookie 内联成函数文件交给 MCP，
+  MCP→file 由 MCP 返回 JSON、本地脚本落盘（含 `httpOnly` 的 `z_c0` 也能往返）。
+- `scripts/.browser-login-code.js` 含 Cookie，**已 gitignore**。
 
 ## 路由：按任务读对应分手册
 
