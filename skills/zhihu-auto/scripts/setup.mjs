@@ -4,7 +4,7 @@
  *
  * 场景：cc-switch / 其他管理器从 GitHub 重装本 skill 时，会整体替换 skill 目录，
  * 导致被 .gitignore 排除的 node_modules 与 Cookie 丢失。本脚本把这两样放到
- * skill 目录之外（~/.zhihu-answer-extractor），并在 skill 目录被重建后一键恢复：
+ * skill 目录之外（~/.zhihu-auto），并在 skill 目录被重建后一键恢复：
  *
  *   1. Cookie 迁移：若外部家目录无 Cookie 但 skill 内有旧 Cookie，则迁移过去
  *   2. 依赖安装：把 package.json/lock 复制到外部 deps 目录并 npm install（仅缺失时）
@@ -25,7 +25,7 @@ import { join } from 'path';
 import { spawnSync } from 'child_process';
 import { createHash } from 'crypto';
 import {
-  SCRIPTS_DIR, EXTERNAL_HOME, EXTERNAL_COOKIE, LEGACY_COOKIE,
+  SCRIPTS_DIR, EXTERNAL_HOME, EXTERNAL_COOKIE, LEGACY_COOKIE, LEGACY_EXTERNAL_COOKIE,
   EXTERNAL_DEPS, DEPS_NODE_MODULES, LINK_PATH,
 } from './lib/env.mjs';
 
@@ -48,6 +48,7 @@ function isLink(p) {
 
 function cookieStatus() {
   if (existsSync(EXTERNAL_COOKIE)) return 'external';
+  if (existsSync(LEGACY_EXTERNAL_COOKIE)) return 'legacy-external';
   if (existsSync(LEGACY_COOKIE)) return 'legacy';
   return 'missing';
 }
@@ -82,12 +83,12 @@ if (CHECK) {
   log(`Cookie : ${c} (${c === 'external' ? EXTERNAL_COOKIE : c === 'legacy' ? LEGACY_COOKIE : '无'})`);
   log(`Deps   : ${d}`);
   log(`Link   : ${l}${l === 'realdir' ? '（实体目录，可运行；欲跨重装存活请 --force）' : ''}`);
-  const ok = c === 'external' && (l === 'link' || l === 'realdir');
+  const ok = c !== 'missing' && (l === 'link' || l === 'realdir');
   log(ok ? 'OK：环境就绪' : 'NEEDS SETUP：请运行 node setup.mjs');
   process.exit(ok ? 0 : 1);
 }
 
-log('=== zhihu-answer-extractor 环境自愈 ===');
+log('=== zhihu-auto 环境自愈 ===');
 log(`外部家目录: ${EXTERNAL_HOME}`);
 log('');
 
@@ -95,13 +96,13 @@ log('');
 mkdirSync(EXTERNAL_HOME, { recursive: true });
 
 // ── 2. Cookie 迁移 ──
-let cs = cookieStatus();
-if (cs === 'legacy' && !existsSync(EXTERNAL_COOKIE)) {
-  copyFileSync(LEGACY_COOKIE, EXTERNAL_COOKIE);
-  log(`[cookie] 已从 skill 内旧路径迁移到外部: ${EXTERNAL_COOKIE}`);
-  cs = 'external';
-} else if (cs === 'external') {
+const haveExternal = existsSync(EXTERNAL_COOKIE);
+if (haveExternal) {
   log(`[cookie] 外部已存在: ${EXTERNAL_COOKIE}`);
+} else if (existsSync(LEGACY_EXTERNAL_COOKIE) || existsSync(LEGACY_COOKIE)) {
+  const src = existsSync(LEGACY_EXTERNAL_COOKIE) ? LEGACY_EXTERNAL_COOKIE : LEGACY_COOKIE;
+  copyFileSync(src, EXTERNAL_COOKIE);
+  log(`[cookie] 已迁移 Cookie 到外部: ${EXTERNAL_COOKIE}  ←  ${src}`);
 } else {
   log('[cookie] ⚠️ 未找到 Cookie——请运行 `node get-cookie.mjs` 重新登录获取');
   problems.push('cookie');

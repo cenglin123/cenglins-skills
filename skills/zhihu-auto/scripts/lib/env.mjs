@@ -24,8 +24,10 @@ export const SCRIPTS_DIR = resolve(__dirname, '..');       // <skill>/scripts
 export const SKILL_DIR = resolve(SCRIPTS_DIR, '..');       // <skill>
 
 export const EXTERNAL_HOME =
-  process.env.ZHIHU_EXTRACTOR_HOME || join(homedir(), '.zhihu-answer-extractor');
+  process.env.ZHIHU_AUTO_HOME || process.env.ZHIHU_EXTRACTOR_HOME || join(homedir(), '.zhihu-auto');
+export const LEGACY_EXTERNAL_HOME = join(homedir(), '.zhihu-answer-extractor');
 export const EXTERNAL_COOKIE = join(EXTERNAL_HOME, 'www.zhihu.com_cookies.txt');
+export const LEGACY_EXTERNAL_COOKIE = join(LEGACY_EXTERNAL_HOME, 'www.zhihu.com_cookies.txt');
 export const LEGACY_COOKIE = join(SCRIPTS_DIR, 'www.zhihu.com_cookies.txt');
 export const EXTERNAL_DEPS = join(EXTERNAL_HOME, 'deps');
 export const DEPS_NODE_MODULES = join(EXTERNAL_DEPS, 'node_modules');
@@ -43,6 +45,7 @@ export function resolveCookieFile() {
     return process.env.ZHIHU_COOKIE_FILE;
   }
   if (existsSync(EXTERNAL_COOKIE)) return EXTERNAL_COOKIE;
+  if (existsSync(LEGACY_EXTERNAL_COOKIE)) return LEGACY_EXTERNAL_COOKIE;
   return LEGACY_COOKIE;
 }
 
