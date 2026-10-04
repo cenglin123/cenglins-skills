@@ -33,6 +33,7 @@
 
 import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { resolve } from 'path';
+import { stripCtrl } from './lib/env.mjs';
 
 const DEFAULT_CATEGORIES = {
   A: '第一阵营',
@@ -356,7 +357,7 @@ function main() {
     writeFileSync(resolve(opts.output), report, 'utf-8');
     console.log('报告已写入: ' + resolve(opts.output));
   } else {
-    console.log(report);
+    console.log(stripCtrl(report));
   }
 }
 
@@ -376,6 +377,6 @@ function bandFor(votes, ledger) {
 try {
   main();
 } catch (err) {
-  console.error('\n❌ ' + err.message);
+  console.error('\n❌ ' + stripCtrl(err && err.message || err));
   process.exit(1);
 }

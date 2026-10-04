@@ -13,7 +13,7 @@
 import { readFileSync, existsSync } from 'fs';
 import { resolve, dirname, join } from 'path';
 import { fileURLToPath } from 'url';
-import { resolveCookieFile, loadPuppeteer, EXTERNAL_HOME } from './lib/env.mjs';
+import { resolveCookieFile, loadPuppeteer, EXTERNAL_HOME, parseNetscapeCookieText, isZhihuDomain, stripCtrl } from './lib/env.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -50,22 +50,9 @@ function parseCookieFile(path) {
   if (!existsSync(path)) {
     throw new Error(`Cookie 文件不存在: ${path}`);
   }
-  const text = readFileSync(path, 'utf-8');
-  const cookies = [];
-  for (const line of text.split('\n')) {
-    if (line.startsWith('#') || line.trim() === '') continue;
-    const parts = line.split('\t');
-    if (parts.length < 7) continue;
-    const [domain, , path, secure, expires, name, ...valueParts] = parts;
-    cookies.push({
-      name, value: valueParts.join('\t'),
-      domain: domain.startsWith('.') ? domain : '.' + domain,
-      path, secure: secure === 'TRUE', httpOnly: false,
-      expires: expires === '0' ? -1 : parseInt(expires),
-      sameSite: 'Lax',
-    });
-  }
-  return cookies;
+  return parseNetscapeCookieText(readFileSync(path, 'utf-8'))
+    .filter((c) => isZhihuDomain(c.domain))
+    .map((c) => ({ ...c, sameSite: 'Lax' }));
 }
 
 async function main() {
@@ -103,7 +90,7 @@ try {
 } catch (e) {
   title = await page.evaluate(() => document.title);
 }
-console.log(`标题: ${title}`);
+console.log(`标题: ${stripCtrl(title)}`);
 
 const content = await page.content();
 console.log(content.includes('40362') ? '❌ 被拦截（40362）' : '✅ 加载成功');
@@ -113,6 +100,6 @@ console.log('浏览器窗口保持打开，可手动操作');
 }
 
 main().catch((err) => {
-  console.error('❌ ' + (err && err.message ? err.message : err));
+  console.error('❌ ' + stripCtrl(err && err.message ? err.message : err));
   process.exit(1);
 });

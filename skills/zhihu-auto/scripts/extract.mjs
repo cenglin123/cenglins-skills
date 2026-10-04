@@ -19,7 +19,7 @@
 import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { resolveCookieFile, loadPuppeteer } from './lib/env.mjs';
+import { resolveCookieFile, loadPuppeteer, parseNetscapeCookieText, isZhihuDomain, stripCtrl } from './lib/env.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -75,7 +75,7 @@ function parseCliArgs(argv) {
   } catch {
     throw new Error(`无效 URL: ${questionUrl}`);
   }
-  if (!/(^|\.)zhihu\.com$/i.test(parsedUrl.hostname) || !/^\/question\/\d+/.test(parsedUrl.pathname)) {
+  if (!/(^|\.)zhihu\.com$/i.test(parsedUrl.hostname) || !/^\/question\/\d+/.test(parsedUrl.pathname) || parsedUrl.protocol !== 'https:') {
     throw new Error('--url 必须是 https://www.zhihu.com/question/<数字> 格式的问题链接');
   }
 
@@ -110,7 +110,7 @@ let options;
 try {
   options = parseCliArgs(process.argv.slice(2));
 } catch (error) {
-  console.error(`❌ ${error.message}\n`);
+  console.error(`❌ ${stripCtrl(error.message)}\n`);
   printHelp();
   process.exit(2);
 }
@@ -149,22 +149,19 @@ function parseCookieFile(path) {
   if (!existsSync(path)) {
     throw new Error(`Cookie 文件不存在: ${path}\n请先导出知乎 Cookie 到此路径`);
   }
-  const text = readFileSync(path, 'utf-8');
-  const cookies = [];
-  for (const line of text.split('\n')) {
-    if (line.startsWith('#') || line.trim() === '') continue;
-    const parts = line.split('\t');
-    if (parts.length < 7) continue;
-    const [domain, , path, secure, expires, name, ...valueParts] = parts;
-    cookies.push({
-      name, value: valueParts.join('\t'),
-      domain: domain.startsWith('.') ? domain : '.' + domain,
-      path, secure: secure === 'TRUE', httpOnly: false,
-      expires: expires === '0' ? -1 : parseInt(expires),
-      sameSite: 'Lax',
-    });
-  }
-  return cookies;
+  return parseNetscapeCookieText(readFileSync(path, 'utf-8'))
+    .filter((c) => isZhihuDomain(c.domain))
+    .map((c) => ({ ...c, sameSite: 'Lax' }));
+}
+
+// 由远程页面标题生成默认文件名时清洗掉路径分隔符/控制字符，避免标题里的 "/" ".." 造成目录穿越
+function safeFileName(name) {
+  const cleaned = String(name || '')
+    .replace(/[\\/:*?"<>|\u0000-\u001f\u007f-\u009f]/g, '_')
+    .replace(/\.{2,}/g, '_')
+    .replace(/^[.\s]+|[.\s]+$/g, '')
+    .slice(0, 80);
+  return cleaned || 'zhihu';
 }
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -348,7 +345,7 @@ async function main() {
   } catch {
     title = await page.evaluate(() => document.title);
   }
-  console.log(`      状态: ${resp.status()}, 标题: ${title}`);
+  console.log(`      状态: ${resp.status()}, 标题: ${stripCtrl(title)}`);
 
   if (page.url().includes('signin') || title.includes('登录')) {
     console.error('\n❌ 被重定向到登录页，请检查 Cookie 是否有效');
@@ -412,11 +409,11 @@ async function main() {
     return { description, author, topics, followers, views, totalCount };
   });
 
-  console.log(`      提问者: ${questionMeta.author || '(匿名/未显示)'}`);
-  console.log(`      话题: ${questionMeta.topics.length ? questionMeta.topics.join(', ') : '(无)'}`);
-  console.log(`      关注: ${questionMeta.followers || '?'}, 浏览: ${questionMeta.views || '?'}`);
+  console.log(`      提问者: ${stripCtrl(questionMeta.author) || '(匿名/未显示)'}`);
+  console.log(`      话题: ${questionMeta.topics.length ? stripCtrl(questionMeta.topics.join(', ')) : '(无)'}`);
+  console.log(`      关注: ${stripCtrl(questionMeta.followers) || '?'}, 浏览: ${stripCtrl(questionMeta.views) || '?'}`);
   if (questionMeta.description) {
-    console.log(`      题干: ${questionMeta.description.substring(0, 60)}...`);
+    console.log(`      题干: ${stripCtrl(questionMeta.description).substring(0, 60)}...`);
   }
 
   const reportedTotal = parseReportedAnswerCount(questionMeta.totalCount);
@@ -467,7 +464,7 @@ async function main() {
         await loadMoreEl.click();  // 真实 CDP 鼠标事件（isTrusted）
         action = 'click';
       } catch (err) {
-        console.log(`      ⚠️ 点击加载按钮失败: ${err.message.split('\n')[0]}，改用滚动`);
+        console.log(`      ⚠️ 点击加载按钮失败: ${stripCtrl(err.message.split('\n')[0])}，改用滚动`);
       } finally {
         await loadMoreEl.dispose();
       }
@@ -585,14 +582,14 @@ async function main() {
     output += `\n\n${'─'.repeat(80)}\n\n`;
   }
 
-  const outPath = OUTPUT_FILE || resolve(__dirname, `知乎回答_${cleanTitle.slice(0, 20)}.txt`);
+  const outPath = OUTPUT_FILE || resolve(__dirname, `知乎回答_${safeFileName(cleanTitle)}.txt`);
   writeFileSync(outPath, output, 'utf-8');
 
   console.log(`\n✅ 完成！`);
-  console.log(`   问题: ${cleanTitle}`);
+  console.log(`   问题: ${stripCtrl(cleanTitle)}`);
   console.log(`   回答: ${answers.length} 条`);
   console.log(`   大小: ${(Buffer.byteLength(output) / 1024).toFixed(1)} KB`);
-  console.log(`   路径: ${outPath}`);
+  console.log(`   路径: ${stripCtrl(outPath)}`);
   if (answers.length < ANSWERS_NEEDED) {
     console.warn(`   ⚠️ 实际抓取 ${answers.length}/${ANSWERS_NEEDED} 条；${stopReason}`);
   }
@@ -601,6 +598,6 @@ async function main() {
 }
 
 main().catch(err => {
-  console.error('\n❌ 执行出错:', err.message);
+  console.error('\n❌ 执行出错:', stripCtrl(err && err.message || err));
   process.exit(1);
 });

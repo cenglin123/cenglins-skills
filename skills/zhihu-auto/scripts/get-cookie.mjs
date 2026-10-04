@@ -16,10 +16,10 @@
  *   - Cookie 有效期约 6 个月，过期需重新获取
  */
 
-import { writeFileSync, existsSync, mkdirSync } from 'fs';
+import { existsSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { EXTERNAL_HOME, EXTERNAL_COOKIE, loadPuppeteer } from './lib/env.mjs';
+import { EXTERNAL_COOKIE, loadPuppeteer, ensureExternalHome, writeSecretFile, isZhihuDomain, stripCtrl } from './lib/env.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -70,29 +70,40 @@ function toNetscapeFormat(cookies) {
     '',
   ];
 
+  let written = 0;
+  let skipped = 0;
+  let hasZc0 = false;
   for (const c of cookies) {
     // 只保留 zhihu.com 相关的 cookie
-    if (!c.domain.includes('zhihu.com')) continue;
+    if (!isZhihuDomain(c.domain)) continue;
+    // 与 cookie-from-browser 对称：拒绝含控制字符的条目，避免破坏 Netscape 行列结构
+    if (/[\u0000-\u001f\u007f-\u009f;]/.test(String(c.name)) ||
+        /[\u0000-\u001f\u007f-\u009f;]/.test(String(c.value)) ||
+        /[\u0000-\u001f\u007f-\u009f]/.test(String(c.domain)) ||
+        /[\u0000-\u001f\u007f-\u009f]/.test(String(c.path || '/'))) { skipped++; continue; }
 
-    const domain = c.domain.startsWith('.') ? c.domain : '.' + c.domain;
+    const domain = c.domain;                          // 原样保留（带点=域 cookie，不带点=host-only）
     const includeSubdomains = c.domain.startsWith('.') ? 'TRUE' : 'FALSE';
     const path = c.path || '/';
     const secure = c.secure ? 'TRUE' : 'FALSE';
     const expires = c.expires ? Math.floor(c.expires) : 0;
     const name = c.name;
     const value = c.value;
+    const prefix = c.httpOnly ? '#HttpOnly_' : '';
 
-    lines.push(`${domain}\t${includeSubdomains}\t${path}\t${secure}\t${expires}\t${name}\t${value}`);
+    lines.push(`${prefix}${domain}\t${includeSubdomains}\t${path}\t${secure}\t${expires}\t${name}\t${value}`);
+    written++;
+    if (name === 'z_c0' && String(value).trim().length > 0) hasZc0 = true;
   }
 
-  return lines.join('\n');
+  return { content: lines.join('\n'), written, skipped, hasZc0 };
 }
 
 // 检测是否已登录（只检查 cookie，不检查 URL）
 async function isLoggedIn(page) {
   try {
     const cookies = await getCookiesFromCDP(page);
-    const hasZ_c0 = cookies.some(c => c.name === 'z_c0' && c.domain.includes('zhihu.com'));
+    const hasZ_c0 = cookies.some(c => c.name === 'z_c0' && String(c.value || '').trim().length > 0 && isZhihuDomain(c.domain));
     return hasZ_c0;
   } catch {
     return false;
@@ -165,12 +176,12 @@ async function main() {
   }
 
   console.log('\n✅ 检测到登录成功！');
-  console.log(`   当前页面: ${await page.title()}`);
+  console.log(`   当前页面: ${stripCtrl(await page.title())}`);
 
   // 4. 提取 Cookie
   console.log('\n[3/3] 提取 Cookie...');
   const allCookies = await getCookiesFromCDP(page);
-  const zhihuCookies = allCookies.filter(c => c.domain.includes('zhihu.com'));
+  const zhihuCookies = allCookies.filter(c => isZhihuDomain(c.domain));
 
   console.log(`   共 ${allCookies.length} 个 Cookie，其中 ${zhihuCookies.length} 个属于 zhihu.com`);
 
@@ -181,12 +192,18 @@ async function main() {
     console.log(`   ${found ? '✅' : '❌'} ${name}`);
   }
 
-  // 5. 保存
-  const netscapeContent = toNetscapeFormat(allCookies);
-  mkdirSync(EXTERNAL_HOME, { recursive: true });
-  writeFileSync(OUTPUT_FILE, netscapeContent, 'utf-8');
+  // 5. 保存（fail-closed：登录态不完整则拒写，避免用残缺 Cookie 覆盖唯一登录源）
+  const fmt = toNetscapeFormat(allCookies);
+  if (fmt.skipped) console.log(`   ⚠️ 跳过 ${fmt.skipped} 条含控制字符的 cookie`);
+  if (!fmt.hasZc0) {
+    console.error('\n❌ 登录态不完整（未取到 z_c0），拒绝覆盖现有 Cookie 文件；请重试登录。');
+    await browser.close();
+    process.exit(1);
+  }
+  ensureExternalHome();
+  writeSecretFile(OUTPUT_FILE, fmt.content);
 
-  console.log(`\n✅ Cookie 已保存到: ${OUTPUT_FILE}`);
+  console.log(`\n✅ Cookie 已保存到: ${OUTPUT_FILE}（写入 ${fmt.written} 条）`);
   console.log('   有效期约 6 个月，过期后需重新获取');
   console.log('');
   console.log('   现在可以关闭浏览器，使用 extract.mjs 抓取回答了');
@@ -201,6 +218,6 @@ async function main() {
 }
 
 main().catch(err => {
-  console.error('\n❌ 执行出错:', err.message);
+  console.error('\n❌ 执行出错:', stripCtrl(err && err.message || err));
   process.exit(1);
 });

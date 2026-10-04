@@ -9,10 +9,10 @@
 - **复用统一登录态**（见 SKILL.md「统一登录态」）——先注入 API 通道的 Cookie，不必每会话扫码：
   ```
   node <SKILL_DIR>/scripts/cookie-for-browser.mjs
-  browser_run_code_unsafe({ filename: "<SKILL_DIR>/scripts/.browser-login-code.js" })   # → {ok:true,count:N}
+  browser_run_code_unsafe({ filename: "<外部家目录>/browser-login-code.js" })   # → {ok:true,count:N}
   browser_navigate → https://www.zhihu.com
   ```
-  判定已登录：页面标题出现「(N 封私信 / M 条消息)」前缀。若 Cookie 失效，重跑 `get-cookie.mjs`。
+  判定已登录：页面标题出现「(N 封私信 / M 条消息)」前缀。若 Cookie 失效，重跑 `get-cookie.mjs`。**收尾用 `node <SKILL_DIR>/scripts/cookie-for-browser.mjs --rm` 删除注入代码（含凭证）。**
 - **文件访问根**：MCP 只允许读「工作目录下的 `.playwright-mcp/`」（本机 `C:\Users\<user>\.playwright-mcp\`）。
   要导入的 MD 副本必须落到那里；放系统 `%TEMP%` 会被拒。
 

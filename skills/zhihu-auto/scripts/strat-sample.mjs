@@ -22,7 +22,7 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { resolveCookieFile } from './lib/env.mjs';
+import { resolveCookieFile, parseNetscapeCookieText, sanitizeQid, cookiesToHeader, stripCtrl } from './lib/env.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const COOKIE_FILE = resolveCookieFile();
@@ -85,7 +85,7 @@ function parseArgs(argv) {
   if (!qid && !values.has('census')) throw new Error('缺少 --url（或提供 --census）');
   return {
     help: false,
-    qid,
+    qid: sanitizeQid(qid),
     perBand: Number(values.get('per-band') || 15),
     bands: (values.get('bands') || DEFAULT_BANDS).split(',').map((s) => Number(s.trim())),
     seed: Number(values.get('seed') || 42),
@@ -99,19 +99,12 @@ function parseArgs(argv) {
   };
 }
 
-// Netscape Cookie → Cookie 请求头
+// Netscape Cookie → Cookie 请求头（仅挑对 www.zhihu.com 生效的条目）
 function loadCookieHeader(path) {
   if (!existsSync(path)) {
     throw new Error(`Cookie 文件不存在: ${path}\n请先运行 get-cookie.mjs 获取`);
   }
-  const pairs = [];
-  for (const line of readFileSync(path, 'utf-8').split('\n')) {
-    if (line.startsWith('#') || !line.trim()) continue;
-    const p = line.split('\t');
-    if (p.length < 7) continue;
-    pairs.push(`${p[5]}=${p.slice(6).join('\t')}`);
-  }
-  return pairs.join('; ');
+  return cookiesToHeader(parseNetscapeCookieText(readFileSync(path, 'utf-8')), 'www.zhihu.com');
 }
 
 const ENTITIES = [
@@ -152,8 +145,9 @@ function shuffle(arr, rng) {
 async function fetchPage(qid, offset, orderBy, cookieHeader) {
   const url =
     `${API_HOST}/api/v4/questions/${qid}/answers` +
-    `?limit=${API_LIMIT}&offset=${offset}&order_by=${orderBy}&include=${INCLUDE}`;
+    `?limit=${API_LIMIT}&offset=${offset}&order_by=${encodeURIComponent(orderBy)}&include=${INCLUDE}`;
   const res = await fetch(url, {
+    redirect: 'manual',
     headers: {
       'User-Agent': USER_AGENT,
       Referer: `${API_HOST}/question/${qid}`,
@@ -162,6 +156,9 @@ async function fetchPage(qid, offset, orderBy, cookieHeader) {
       'Accept-Language': 'zh-CN,zh;q=0.9',
     },
   });
+  if (res.status >= 300 && res.status < 400) {
+    throw new Error(`HTTP ${res.status} 重定向（带 Cookie 的请求不应跳转，可能被要求登录）`);
+  }
   if (res.status === 403 || res.status === 401) {
     throw new Error('HTTP ' + res.status + '（Cookie 可能失效，请重跑 get-cookie.mjs）');
   }
@@ -185,7 +182,7 @@ async function enumerateAll(opts, cookieHeader) {
       fails = 0;
     } catch (err) {
       fails++;
-      console.log(`  分页 offset=${offset} 失败(${fails}/5): ${err.message}`);
+      console.log(`  分页 offset=${offset} 失败(${fails}/5): ${stripCtrl(err.message)}`);
       if (fails >= 5) throw err;
       await sleep(3000);
       continue;
@@ -257,7 +254,7 @@ async function main() {
       rows = raw.rows;
       totals = raw.totals ?? null;
       truncated = !!raw.truncated;
-      if (raw.qid && !opts.qid) opts.qid = raw.qid;
+      if (raw.qid && !opts.qid) opts.qid = sanitizeQid(raw.qid);
     }
   } else {
     console.log('[1/4] 全量枚举（answers API，limit=20 分页）...');
@@ -401,6 +398,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error('\n❌ ' + err.message);
+  console.error('\n❌ ' + stripCtrl(err && err.message || err));
   process.exit(1);
 });

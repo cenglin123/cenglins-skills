@@ -9,10 +9,10 @@
 - **复用统一登录态**（见 SKILL.md「统一登录态」）——先注入 API 通道的 Cookie，不必每会话扫码：
   ```
   node <SKILL_DIR>/scripts/cookie-for-browser.mjs
-  browser_run_code_unsafe({ filename: "<SKILL_DIR>/scripts/.browser-login-code.js" })
+  browser_run_code_unsafe({ filename: "<外部家目录>/browser-login-code.js" })
   browser_navigate → https://www.zhihu.com
   ```
-  判定已登录：页面标题出现「(N 封私信 / M 条消息)」前缀。若 Cookie 失效，重跑 `get-cookie.mjs`。
+  判定已登录：页面标题出现「(N 封私信 / M 条消息)」前缀。若 Cookie 失效，重跑 `get-cookie.mjs`。**收尾用 `node <SKILL_DIR>/scripts/cookie-for-browser.mjs --rm` 删除注入代码（含凭证）。**
 - **文件访问根**：MCP 只允许读「知识库根 / 工作目录下的 `.playwright-mcp/`」；发布副本落到 `<vault>/.playwright-mcp/`。
 
 ## 步骤链
@@ -22,7 +22,7 @@
 ```bash
 python <SKILL_DIR>/scripts/publish/make_publish_copy.py "<source.md>" --out-dir "<vault>/.playwright-mcp"
 ```
-脚本做三件事并自检：删 frontmatter、删正文首个 H1、`[[wikilink]]`→纯文本。报告 `ok: true` 表示「残留 wikilink 为 0 且首行不是 `---`」。
+脚本做三件事并自检：删 frontmatter、删正文首个 H1、`[[wikilink]]`→纯文本。报告 `ok: true` 表示「残留 wikilink 为 0、首行不是 `---`、且 frontmatter 已成功剥离（若原件以 `---` 起头却未剥掉则 fail）」。脚本会先剥掉 UTF-8 BOM（否则 frontmatter 不会被识别、私有 YAML 会被当正文发布）。**自检失败时脚本退出码 1 且不生成副本（fail-closed）；若输出路径已存在旧副本（报告字段 `stale_output`），先删除再修复源头重跑，切勿上传旧副本。**
 
 ### [2/7] 打开编辑器
 `browser_navigate` → `https://zhuanlan.zhihu.com/write`。
@@ -56,9 +56,9 @@ python <SKILL_DIR>/scripts/publish/make_publish_copy.py "<source.md>" --out-dir 
 
 ## 完工
 ```bash
-python <SKILL_DIR>/scripts/publish/finalize_publish.py "<source.md>" --url "https://zhuanlan.zhihu.com/p/<id>"
+python <SKILL_DIR>/scripts/publish/finalize_publish.py "<source.md>" --url "https://zhuanlan.zhihu.com/p/<id>" --changelog --vault-root "<知识库根>"
 ```
-脚本：① 源文件 frontmatter 写/更新 `published: <链接>`（幂等）；② 向上找到 `.meta/scripts/changelog_append.py` 时自动记入 `docs/CHANGELOG.md`（`--no-changelog` 关闭）。然后删除 `.playwright-mcp/` 下的副本。
+脚本：① 源文件 frontmatter 写/更新 `published: <链接>`（幂等，值经 YAML 引号转义）；② **仅当显式 `--changelog` 且记账脚本位于 `--vault-root` 之下**才执行它写 `docs/CHANGELOG.md`（默认**不执行**，防执行来源未受信的脚本）。省略 `--changelog` 只回写 frontmatter。然后删除 `.playwright-mcp/` 下的副本。
 
 ## 边界
 - 不代用户登录、不读 cookie 库、不处理验证码。

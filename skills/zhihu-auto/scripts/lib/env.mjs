@@ -5,7 +5,7 @@
  * 而 node_modules、Cookie 这类文件被 .gitignore 排除、不入库，于是被一并清空
  * （2026-09 实际发生过一次）。解决办法是把「秘密与依赖」放到 skill 目录之外：
  *
- *   外部家目录（默认 ~/.zhihu-answer-extractor，可用 ZHIHU_EXTRACTOR_HOME 覆盖）：
+ *   外部家目录（默认 ~/.zhihu-auto；优先级 ZHIHU_AUTO_HOME > ZHIHU_EXTRACTOR_HOME）：
  *     www.zhihu.com_cookies.txt   知乎登录 Cookie（跨重装存活）
  *     deps/node_modules           依赖（通过 junction/symlink 链回 scripts/node_modules）
  *
@@ -13,7 +13,7 @@
  * 因此 cc-switch 重装后只需重跑 setup.mjs 重建链接即可（无需重新下载依赖）。
  */
 
-import { existsSync, mkdirSync, symlinkSync } from 'fs';
+import { existsSync, mkdirSync, symlinkSync, writeFileSync, chmodSync } from 'fs';
 import { resolve, dirname, join } from 'path';
 import { homedir } from 'os';
 import { fileURLToPath } from 'url';
@@ -32,6 +32,115 @@ export const LEGACY_COOKIE = join(SCRIPTS_DIR, 'www.zhihu.com_cookies.txt');
 export const EXTERNAL_DEPS = join(EXTERNAL_HOME, 'deps');
 export const DEPS_NODE_MODULES = join(EXTERNAL_DEPS, 'node_modules');
 export const LINK_PATH = join(SCRIPTS_DIR, 'node_modules');
+
+/**
+ * 外部家目录加固：创建并（POSIX 上）设为 0700。
+ * 该目录存放 Cookie 等密钥；Windows 的 chmod 基本无效，仍调用以保持一致。
+ */
+export function ensureExternalHome() {
+  mkdirSync(EXTERNAL_HOME, { recursive: true });
+  try {
+    chmodSync(EXTERNAL_HOME, 0o700);
+  } catch {
+    /* Windows / 无权限：忽略 */
+  }
+}
+
+/** 写入含密钥的文件（Cookie、注入代码等）：父目录 0700、文件 0600（POSIX）。 */
+export function writeSecretFile(filePath, data) {
+  const dir = dirname(filePath);
+  mkdirSync(dir, { recursive: true });
+  try {
+    chmodSync(dir, 0o700);
+  } catch {
+    /* Windows / 无权限：忽略 */
+  }
+  writeFileSync(filePath, data, { encoding: 'utf-8', mode: 0o600 });
+  try {
+    chmodSync(filePath, 0o600);
+  } catch {
+    /* Windows / 无权限：忽略 */
+  }
+}
+
+/**
+ * 解析 Netscape Cookie 文本（get-cookie / Cookie-Editor 导出格式）。
+ * 处理 `#HttpOnly_` 前缀：带该前缀的行是 httpOnly cookie，不能当注释跳过，
+ * 解析时须保留 httpOnly=true（否则往返注入会把 z_c0 降级成页面脚本可读）。
+ * 返回统一的 cookie 对象；调用方按需补 sameSite 等字段。
+ */
+export function parseNetscapeCookieText(text) {
+  const out = [];
+  for (let line of String(text).split(/\r?\n/)) {
+    let httpOnly = false;
+    if (line.startsWith('#HttpOnly_')) {
+      httpOnly = true;
+      line = line.slice('#HttpOnly_'.length);
+    } else if (line.startsWith('#')) {
+      continue;
+    }
+    if (!line.trim()) continue;
+    const parts = line.split('\t');
+    if (parts.length < 7) continue;
+    const [domain, includeSub, path, secure, expires, name, ...valueParts] = parts;
+    const hostOnly = (includeSub || '').toUpperCase() === 'FALSE';
+    // 以 Netscape 第 2 列（host-only 标志）为准，让 domain 与该标志自洽：
+    // host-only → 去前导点；域 cookie → 补前导点。避免「点号与第 2 列不一致」时作用域歧义。
+    const scopedDomain = hostOnly
+      ? domain.replace(/^\./, '')
+      : domain.startsWith('.') ? domain : '.' + domain;
+    out.push({
+      name,
+      value: valueParts.join('\t'),
+      domain: scopedDomain,
+      hostOnly,
+      path: path || '/',
+      secure: secure === 'TRUE',
+      httpOnly,
+      expires: expires === '0' ? -1 : parseInt(expires, 10) || -1,
+    });
+  }
+  return out;
+}
+
+/** 判断域是否属于知乎（严格后缀匹配，避免 `zhihu.com.evil.tld` 之类被误放行）。 */
+export function isZhihuDomain(domain) {
+  const d = String(domain || '').replace(/^\./, '').toLowerCase();
+  return d === 'zhihu.com' || d.endsWith('.zhihu.com');
+}
+
+/**
+ * 只挑「对指定主机真正生效」的 cookie 拼成 Cookie 请求头：遵守域/子域/host-only 与过期时间。
+ * 修复：不再把 Cookie 文件里**其它域**的条目一并发往知乎。
+ * 注意：这是**主机级**匹配，未实现 RFC 6265 的 path 级作用域（对本技能的 /api/v4 请求足够）。
+ */
+export function cookiesToHeader(cookies, host) {
+  const h = String(host || '').toLowerCase();
+  const now = Date.now() / 1000;
+  return cookies
+    .filter((c) => {
+      if (!isZhihuDomain(c.domain)) return false;   // 本技能只与知乎交互，非知乎域一律不发
+      const d = String(c.domain || '').replace(/^\./, '').toLowerCase();
+      if (!d) return false;
+      const domainMatch = c.hostOnly ? d === h : h === d || h.endsWith('.' + d);
+      if (!domainMatch) return false;
+      if (typeof c.expires === 'number' && c.expires > 0 && c.expires < now) return false;
+      return true;
+    })
+    .map((c) => `${c.name}=${c.value}`)
+    .join('; ');
+}
+
+/** 从任意输入里提取合法知乎 qid（连续 6+ 位数字）；防止把 JSON 字段直接当文件名/URL 用而穿越目录。 */
+export function sanitizeQid(raw) {
+  const m = String(raw ?? '').match(/\d{6,}/);
+  return m ? m[0] : '';
+}
+
+/** 剥掉 C0/C1/DEL 控制字符（保留 \t\n\r），供把远程内容回显终端前使用，防 ANSI/OSC 序列注入。 */
+export function stripCtrl(s) {
+  return String(s ?? '').replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g, '');
+}
 
 /**
  * 解析 Cookie 文件路径，优先级：

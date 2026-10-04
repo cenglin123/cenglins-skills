@@ -29,7 +29,7 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { resolveCookieFile } from './lib/env.mjs';
+import { resolveCookieFile, parseNetscapeCookieText, sanitizeQid, cookiesToHeader, stripCtrl } from './lib/env.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const COOKIE_FILE = resolveCookieFile();
@@ -108,14 +108,7 @@ function loadCookieHeader(path) {
   if (!existsSync(path)) {
     throw new Error(`Cookie 文件不存在: ${path}\n请先运行 get-cookie.mjs 获取，或从备份恢复`);
   }
-  const pairs = [];
-  for (const line of readFileSync(path, 'utf-8').split('\n')) {
-    if (line.startsWith('#') || !line.trim()) continue;
-    const p = line.split('\t');
-    if (p.length < 7) continue;
-    pairs.push(`${p[5]}=${p.slice(6).join('\t')}`);
-  }
-  return pairs.join('; ');
+  return cookiesToHeader(parseNetscapeCookieText(readFileSync(path, 'utf-8')), 'www.zhihu.com');
 }
 
 const ENTITIES = [
@@ -137,6 +130,7 @@ function readJson(path) {
 
 async function apiGet(url, cookieHeader) {
   const res = await fetch(url, {
+    redirect: 'manual',
     headers: {
       'User-Agent': USER_AGENT,
       Referer: `${API_HOST}/`,
@@ -145,6 +139,9 @@ async function apiGet(url, cookieHeader) {
       'Accept-Language': 'zh-CN,zh;q=0.9',
     },
   });
+  if (res.status >= 300 && res.status < 400) {
+    throw new Error('HTTP ' + res.status + ' 重定向（带 Cookie 的请求不应跳转）');
+  }
   if (res.status === 403 || res.status === 401) {
     throw new Error('HTTP ' + res.status + '（Cookie 可能失效）');
   }
@@ -159,7 +156,7 @@ async function withRetry(fn, label) {
       return await fn();
     } catch (err) {
       fails++;
-      console.log(`      ${label} 失败(${fails}/4): ${err.message}`);
+      console.log(`      ${label} 失败(${fails}/4): ${stripCtrl(err.message)}`);
       if (fails >= 4) throw err;
       await sleep(2500);
     }
@@ -184,7 +181,7 @@ async function fetchRootComments(aid, want, orderBy, cookieHeader, throttle) {
   while (out.length < want) {
     const url =
       `${API_HOST}/api/v4/answers/${aid}/comments` +
-      `?limit=${API_LIMIT}&offset=${offset}&order_by=${orderBy}&status=open`;
+      `?limit=${API_LIMIT}&offset=${offset}&order_by=${encodeURIComponent(orderBy)}&status=open`;
     const d = await withRetry(() => apiGet(url, cookieHeader), `answer ${aid} 评论`);
     total = d.paging ? d.paging.totals : total;
     const data = d.data || [];
@@ -218,7 +215,9 @@ async function main() {
   const cookieHeader = loadCookieHeader(COOKIE_FILE);
 
   const censusRaw = readJson(opts.census);
-  const qid = censusRaw.qid || (String(opts.census).match(/(\d{6,})/) || [])[1] || 'unknown';
+  // 只信 census 内的 qid；不从文件路径里猜数字（避免把目录名年份等误当 qid）
+  const qid = sanitizeQid(censusRaw.qid) || 'unknown';
+  if (qid === 'unknown') console.log('⚠️ census 未含 qid，输出文件名将用 unknown（不从路径猜测）');
   const censusRows = censusRaw.rows || [];
 
   // 复现 strat-sample 的 rid 编号（按赞同降序），用于 ledger.rid → census 行 的兜底映射
@@ -258,6 +257,10 @@ async function main() {
     if (opts.top > 0) targets = targets.slice(0, opts.top);
   }
   if (opts.maxAnswers > 0) targets = targets.slice(0, opts.maxAnswers);
+  // answer id 必须是纯数字，防止 census/ledger 里的异常 id 改变请求路径
+  const skippedIds = targets.filter((t) => !/^\d+$/.test(String(t.id))).length;
+  targets = targets.filter((t) => /^\d+$/.test(String(t.id)));
+  if (skippedIds) console.log(`⚠️ 跳过 ${skippedIds} 条 id 非纯数字的回答（异常输入）`);
   if (!targets.length) throw new Error('没有可抓取的回答（检查 --census/--ledger 或 --top）');
 
   const outDir = resolve(opts.outDir);
@@ -272,10 +275,14 @@ async function main() {
     try {
       got = await fetchRootComments(t.id, opts.perAnswer, opts.orderBy, cookieHeader, opts.throttle);
     } catch (err) {
-      console.log(`  跳过回答 ${t.id}: ${err.message}`);
+      console.log(`  跳过回答 ${t.id}: ${stripCtrl(err.message)}`);
     }
     if (opts.replies > 0) {
       for (const c of got.comments) {
+        if (!/^\d+$/.test(String(c.id))) {
+          c.replies = [];
+          continue;
+        }
         try {
           c.replies = await fetchReplies(c.id, opts.replies, cookieHeader, opts.throttle);
         } catch {
@@ -356,6 +363,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error('\n❌ ' + err.message);
+  console.error('\n❌ ' + stripCtrl(err && err.message || err));
   process.exit(1);
 });
