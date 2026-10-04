@@ -19,7 +19,7 @@
 import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { resolveCookieFile, requireDepsOrExit } from './lib/env.mjs';
+import { resolveCookieFile, loadPuppeteer } from './lib/env.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -309,11 +309,7 @@ async function scrollToBottom(page) {
 async function main() {
   console.log('=== 知乎回答批量抓取 ===\n');
 
-  requireDepsOrExit();
-  const [{ default: puppeteer }, { default: StealthPlugin }] = await Promise.all([
-    import('puppeteer-extra'),
-    import('puppeteer-extra-plugin-stealth'),
-  ]);
+  const { puppeteer, StealthPlugin } = await loadPuppeteer();
   puppeteer.use(StealthPlugin());
   const chromePath = findChrome();
 

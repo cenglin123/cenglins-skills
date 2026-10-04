@@ -19,7 +19,7 @@
 import { writeFileSync, existsSync, mkdirSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { EXTERNAL_HOME, EXTERNAL_COOKIE, requireDepsOrExit } from './lib/env.mjs';
+import { EXTERNAL_HOME, EXTERNAL_COOKIE, loadPuppeteer } from './lib/env.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -101,9 +101,7 @@ async function isLoggedIn(page) {
 
 // ── 主流程 ───────────────────────────────────────────────────
 async function main() {
-  requireDepsOrExit();
-  const { default: puppeteer } = await import('puppeteer-extra');
-  const { default: StealthPlugin } = await import('puppeteer-extra-plugin-stealth');
+  const { puppeteer, StealthPlugin } = await loadPuppeteer();
   puppeteer.use(StealthPlugin());
 
   console.log('╔══════════════════════════════════════════════╗');

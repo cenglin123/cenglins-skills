@@ -21,7 +21,7 @@ node <SKILL_DIR>/scripts/extract.mjs `
 ```
 
 - `--count` 默认 50；省略 `--output` 存到脚本目录；`--max-wait <秒>` 调最长加载时间（默认 180）。
-- 依赖缺失时先跑 `node <SKILL_DIR>/scripts/setup.mjs`（把依赖装到 `~/.zhihu-auto/` 并软链回来）。
+- 依赖缺失时**脚本会自愈**：自动从外部备份 `~/.zhihu-auto/deps/` 重建软链再继续（cc-switch 重装后无需手动处理）；仅当外部备份也没有时才跑 `node <SKILL_DIR>/scripts/setup.mjs`。
 
 ## 加载机制（2026-09 经验，页面结构可能变）
 
@@ -55,4 +55,4 @@ URL: …
 | 返回 40362 / 重定向登录页 | Cookie 过期或失效 | 重跑 `get-cookie.mjs`（注意 `z_c0` 纸面未过期也可能被吊销） |
 | 停止原因=触发登录墙 | 会话被服务端吊销（问题页匿名可看，但展开更多回答时强制登录） | 看页面右上角是否「登录/注册」；重跑 `get-cookie.mjs` |
 | 数量不够 | 总数不足 / 登录墙 / 折叠 / 超时 / 结构变化 | 看输出「停止原因」；必要时加大 `--max-wait` |
-| `Cannot find package 'puppeteer-extra'` | 依赖被重装清空 | `node <SKILL_DIR>/scripts/setup.mjs` |
+| `Cannot find package 'puppeteer-extra'` | 依赖被重装清空（软链没了） | **脚本会自动自愈**（从 `~/.zhihu-auto/deps/` 重建软链）；若仍失败（外部备份也没了）再跑 `node <SKILL_DIR>/scripts/setup.mjs` |

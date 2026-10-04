@@ -13,7 +13,7 @@
  * 因此 cc-switch 重装后只需重跑 setup.mjs 重建链接即可（无需重新下载依赖）。
  */
 
-import { existsSync } from 'fs';
+import { existsSync, mkdirSync, symlinkSync } from 'fs';
 import { resolve, dirname, join } from 'path';
 import { homedir } from 'os';
 import { fileURLToPath } from 'url';
@@ -52,6 +52,52 @@ export function resolveCookieFile() {
 /** 依赖是否已就位（scripts/node_modules 存在即可——实体目录或指向外部的链接都行）。 */
 export function depsReady() {
   return existsSync(LINK_PATH);
+}
+
+/**
+ * 自愈：把依赖软链从「外部备份」重建回 skill 目录。
+ * 场景：cc-switch 等从 GitHub 重装 skill 会整体替换 skill 目录，清掉 gitignored 的
+ * scripts/node_modules；而依赖本体一直备份在 `~/.zhihu-auto/deps/node_modules`（不受重装影响）。
+ * 本函数在需要时把软链重建回去（不重装、不联网）。
+ * 返回 { ok, action }；ok=false 通常意味着外部备份也没有（需跑 setup.mjs 重装）。
+ */
+export function ensureDeps() {
+  if (existsSync(LINK_PATH)) return { ok: true, action: 'present' };
+  if (existsSync(DEPS_NODE_MODULES)) {
+    try {
+      mkdirSync(dirname(LINK_PATH), { recursive: true });
+      symlinkSync(DEPS_NODE_MODULES, LINK_PATH, process.platform === 'win32' ? 'junction' : 'dir');
+      return { ok: true, action: 'relinked' };
+    } catch (err) {
+      return { ok: false, action: 'link-failed', error: err.message };
+    }
+  }
+  return { ok: false, action: 'no-backup' };
+}
+
+/**
+ * 加载 puppeteer 依赖，带自愈：若 import 因缺依赖失败，先从外部备份重建软链，再重试一次。
+ * 供 extract / open / get-cookie 使用。
+ */
+export async function loadPuppeteer() {
+  const load = () => Promise.all([
+    import('puppeteer-extra'),
+    import('puppeteer-extra-plugin-stealth'),
+  ]);
+  try {
+    const [a, b] = await load();
+    return { puppeteer: a.default, StealthPlugin: b.default };
+  } catch (err) {
+    const r = ensureDeps();
+    if (!r.ok) {
+      throw new Error(
+        `依赖缺失，且外部备份不可用（${r.action}${r.error ? ': ' + r.error : ''}）。\n` +
+          `请运行: node "${join(SCRIPTS_DIR, 'setup.mjs')}"`,
+      );
+    }
+    const [a, b] = await load();
+    return { puppeteer: a.default, StealthPlugin: b.default };
+  }
 }
 
 /** 依赖缺失时的统一提示 + 退出。 */

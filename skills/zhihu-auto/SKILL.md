@@ -22,16 +22,23 @@ description: >-
 > API 通道里 `strat-sample / stance-estimate / fetch-comments` **零依赖**（只用全局 `fetch`），
 > 只要 Cookie 在就能跑；`extract / open / get-cookie` 需要 puppeteer（走外部依赖 + 软链）。
 
-## 前置：环境自愈（仅 API 通道需要）
+## 前置：依赖与 Cookie 外置 + 脚本自愈（API 通道）
 
-依赖与 Cookie 存放在 skill 目录之外（默认 `~/.zhihu-auto/`），以免重装 skill 时被清空。装好后运行一次：
+依赖与 Cookie **备份在 skill 目录之外**（`~/.zhihu-auto/`），**不会**被 cc-switch 等重装 skill 时清掉。
+首次安装（或外部备份缺失时）跑一次：
 
 ```powershell
-node <SKILL_DIR>/scripts/setup.mjs           # 安装外部依赖 + 迁移 Cookie + 建软链
+node <SKILL_DIR>/scripts/setup.mjs           # 装外部依赖 + 迁移 Cookie + 建软链
 node <SKILL_DIR>/scripts/setup.mjs --check   # 只检查环境（非 0 = 有缺失）
 ```
 
-首次使用前，用 `scripts/get-cookie.mjs` 扫码登录一次，把 Cookie 写到 `~/.zhihu-auto/`（详见 `references/extract-answers.md`）。
+**自愈（关键）**：cc-switch 从 GitHub 重装会**整体替换 skill 目录**、清掉 gitignored 的
+`scripts/node_modules` 软链；带 puppeteer 的三个脚本（`extract / open / get-cookie`）**内置自愈**——
+缺依赖时自动从外部备份 `~/.zhihu-auto/deps/` **重建软链再继续**（不联网、不重装），因此**重装后无需手动跑 setup**。
+只有当外部备份也不存在时（首次运行/异常），才需要跑 `setup.mjs`。
+
+- 零依赖脚本（`strat-sample / stance-estimate / fetch-comments`，仅用全局 `fetch`）本就不需要依赖。
+- 首次使用前用 `scripts/get-cookie.mjs` 扫码登录一次，Cookie 写到 `~/.zhihu-auto/`（详见 `references/extract-answers.md`）。
 
 ## 统一登录态（file ↔ MCP 双向统一）
 

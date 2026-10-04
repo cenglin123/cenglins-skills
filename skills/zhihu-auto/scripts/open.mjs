@@ -13,7 +13,7 @@
 import { readFileSync, existsSync } from 'fs';
 import { resolve, dirname, join } from 'path';
 import { fileURLToPath } from 'url';
-import { resolveCookieFile, requireDepsOrExit, EXTERNAL_HOME } from './lib/env.mjs';
+import { resolveCookieFile, loadPuppeteer, EXTERNAL_HOME } from './lib/env.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -69,9 +69,7 @@ function parseCookieFile(path) {
 }
 
 async function main() {
-  requireDepsOrExit();
-  const { default: puppeteer } = await import('puppeteer-extra');
-  const { default: StealthPlugin } = await import('puppeteer-extra-plugin-stealth');
+  const { puppeteer, StealthPlugin } = await loadPuppeteer();
   puppeteer.use(StealthPlugin());
 
   const cookies = parseCookieFile(COOKIE_FILE);
