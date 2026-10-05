@@ -19,7 +19,10 @@
 import { existsSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { EXTERNAL_COOKIE, loadPuppeteer, ensureExternalHome, writeSecretFile, isZhihuDomain, stripCtrl } from './lib/env.mjs';
+import {
+  EXTERNAL_COOKIE, loadPuppeteer, ensureExternalHome, writeSecretFile, isZhihuDomain, stripCtrl,
+  resolveMaxWaitSeconds, waitForEnterOrExit,
+} from './lib/env.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -31,7 +34,52 @@ const OUTPUT_FILE = EXTERNAL_COOKIE;  // 存到 skill 目录之外，避免重�
 const LOGIN_URL = 'https://www.zhihu.com/signin';
 const HOME_URL = 'https://www.zhihu.com';
 const CHECK_INTERVAL = 2000;  // 每 2 秒检查一次登录状态
-const MAX_WAIT = 300000;      // 最长等待 5 分钟
+// ── CLI（此前本文件完全不读 process.argv，连 --help 都没有；与 extract.mjs 风格不一致）──
+const ARGV = process.argv.slice(2);
+const KNOWN_VALUE_FLAGS = ['--max-wait'];
+for (let i = 0; i < ARGV.length; i++) {
+  const t = String(ARGV[i]);
+  if (t === '--help' || t === '-h' || t === '--no-wait') continue;
+  if (KNOWN_VALUE_FLAGS.some((f) => t === f || t.startsWith(f + '='))) {
+    if (!t.includes('=')) {
+      const nxt = ARGV[i + 1];
+      // 缺值 / 值是另一个 flag：显式报错而非静默回退（与 extract.mjs:65 同一判定）
+      if (nxt === undefined || String(nxt).startsWith('-')) {
+        console.error(`❌ 参数 ${t} 缺少取值（例如：${t}=600 或 ${t} 600）`);
+        process.exit(2);
+      }
+      i++;
+    }
+    continue;
+  }
+  console.error(`❌ 未知参数: ${t}（只接受 --no-wait / --max-wait / --help；用法见 --help）`);
+  process.exit(2);
+}
+
+if (ARGV.includes('--help') || ARGV.includes('-h')) {
+  console.log(`用法：node get-cookie.mjs [--no-wait] [--max-wait <秒>]
+
+  打开浏览器让用户手动登录知乎，成功后把 Cookie 写到 ${EXTERNAL_COOKIE}
+
+  --no-wait         保存后立即关闭浏览器退出（不等 Enter）；agent / CI / 无人值守场景必用
+  --max-wait <秒>   最长等待登录的秒数，>= 60，默认 300（等价写法：--max-wait=600）
+                   也可用环境变量 ZHIHU_MAX_WAIT_MS（**毫秒**，如 600000）
+  --help            显示本帮助
+
+  注意：不给 --no-wait 时会等「按 Enter 才关浏览器」，最长 30 秒；
+        stdin 若是管道/被关闭（无人值守）会立即自动关闭，不会挂住。`);
+  process.exit(0);
+}
+
+// 最长等待：--max-wait（秒）> ZHIHU_MAX_WAIT_MS（毫秒）> 默认 300 秒。
+// 无效值**报错退出**而不是静默回退默认 —— 静默回退会让 agent 以为自己设了 10 分钟。
+const __mw = resolveMaxWaitSeconds(ARGV, process.env);
+if (__mw.bad.length) {
+  console.error(`❌ ${__mw.bad.join('、')} 无效：最长等待必须是 >= 60 秒（不回退默认，避免静默忽略你的设置）`);
+  process.exit(2);
+}
+const MAX_WAIT = Math.round(__mw.seconds * 1000);
+const NO_WAIT = ARGV.includes('--no-wait');
 
 // ═══════════════════════════════════════════════════════════════
 // ▲▲▲ 配置区结束 ▲▲▲
@@ -209,10 +257,15 @@ async function main() {
   console.log('   现在可以关闭浏览器，使用 extract.mjs 抓取回答了');
 
   // 保持浏览器打开，让用户确认
-  console.log('\n   按 Enter 关闭浏览器...');
-  await new Promise(resolve => {
-    process.stdin.once('data', resolve);
-  });
+  if (NO_WAIT) {
+    console.log('\n   --no-wait：直接关闭浏览器退出。');
+  } else {
+    console.log('\n   按 Enter 关闭浏览器（--no-wait 可跳过；无人值守时最多等 30 秒后自动关闭）...');
+    // 只监听 data 会在非交互 stdin（管道 / ignore / 被关闭）下**永不 resolve**：
+    // agent 用后台任务跑会永久挂住、Chrome 变孤儿、进程常驻。waitForEnterOrExit 三路兜底。
+    const closed = await waitForEnterOrExit(30000);
+    if (!closed) console.log('   （stdin 无输入，已自动关闭浏览器）');
+  }
 
   await browser.close();
 }

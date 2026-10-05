@@ -143,6 +143,63 @@ export function stripCtrl(s) {
 }
 
 /**
+ * 归一化「最长等待秒数」：--max-wait（**秒**）> ZHIHU_MAX_WAIT_MS（**毫秒**）> 默认。
+ *
+ * 两种写法都收：`--max-wait=120` 与 `--max-wait 120`（与 extract.mjs 的 parseCliArgs 一致）。
+ * 纯函数、不读 process.*，因此可以脱离浏览器离线单测。
+ * 返回 { seconds, bad }：bad 非空表示用户**显式**给了无效值 —— 调用方应报错退出，
+ * 而不是静默回退默认（静默回退会让「我明明设了 10 分钟」变成 5 分钟，且无处可查）。
+ */
+export function resolveMaxWaitSeconds(argv = [], env = {}, opts = {}) {
+  const def = opts.defaultSeconds ?? 300;
+  const min = opts.minSeconds ?? 60;
+  let flagSeconds = null;
+  const eq = argv.find((a) => String(a).startsWith('--max-wait='));
+  if (eq !== undefined) {
+    flagSeconds = Number(String(eq).slice('--max-wait='.length));
+  } else {
+    const i = argv.findIndex((a) => a === '--max-wait');
+    if (i >= 0) {
+      const nxt = argv[i + 1];
+      // 缺值 / 值是另一个 flag —— 与 extract.mjs 的 parseCliArgs 同一判定：
+      // extract.mjs:65 显式 `if (!value || value.startsWith('--')) throw new Error('参数 --x 缺少值')`
+      // R1 内循环发现：若只修「未知参数」不修「缺值」，`--max-wait` 单独出现会被静默回退 300 秒，
+      // 这正是本函数注释里宣称已消灭的那一类。故此处必须置 bad 非空。
+      if (nxt === undefined || String(nxt).startsWith('-')) {
+        return { seconds: def, bad: ['--max-wait (缺少取值)'] };
+      }
+      flagSeconds = Number(nxt);
+    }
+  }
+  if (flagSeconds !== null) {
+    if (Number.isFinite(flagSeconds) && flagSeconds >= min) return { seconds: flagSeconds, bad: [] };
+    return { seconds: def, bad: [`--max-wait=${flagSeconds}`] };
+  }
+  const envMs = Number(env.ZHIHU_MAX_WAIT_MS);
+  if (Number.isFinite(envMs) && envMs > 0) {
+    if (envMs >= min * 1000) return { seconds: envMs / 1000, bad: [] };
+    return { seconds: def, bad: [`ZHIHU_MAX_WAIT_MS=${envMs}`] };
+  }
+  return { seconds: def, bad: [] };
+}
+
+/**
+ * 等待「用户按 Enter 关闭浏览器」，但**保证一定返回**：
+ *   - 收到数据（有人按了 Enter）→ resolve(true)
+ *   - stdin 结束（管道 EOF / 被关闭 / 无人值守）→ resolve(false)
+ *   - 超时（默认 30s）→ resolve(false)
+ * 只监听 `data` 会在非交互 stdin 下**永不 resolve**（agent / CI 跑后台任务必挂）。
+ * 导出为纯函数以便离线单测（可注入 input）。
+ */
+export function waitForEnterOrExit(timeoutMs = 30000, input = process.stdin) {
+  return new Promise((resolve) => {
+    const t = setTimeout(() => resolve(false), timeoutMs);
+    input.once('data', () => { clearTimeout(t); resolve(true); });
+    input.once('end', () => { clearTimeout(t); resolve(false); });
+  });
+}
+
+/**
  * 解析 Cookie 文件路径，优先级：
  *   1) 环境变量 ZHIHU_COOKIE_FILE（存在时）
  *   2) 外部家目录（推荐，跨重装存活）

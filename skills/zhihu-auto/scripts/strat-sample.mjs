@@ -273,10 +273,23 @@ async function main() {
     throw new Error('无法确定 qid：请提供 --url，或使用本脚本生成的（含 qid 的）census 文件');
   }
 
-  // 稳定编号：按赞同降序，rid 从 1 开始
+  // rid：按赞同降序的实时名次（1..N）。只在**本次枚举/census 内**自洽 ——
+  // 每次重跑都按当前 voteup_count 重排，跨时间/跨枚举引用 rid 会静默错位。
+  // 跨轮引用请用回答 id（census.rows[].id / ledger.rows[].id / comments 的 answer_id）。
   rows.sort((a, b) => (b.votes || 0) - (a.votes || 0) || (a.id > b.id ? 1 : -1));
   rows.forEach((r, i) => (r.rid = i + 1));
   const N = rows.length;
+
+  // 静默失效护栏：comment_count 整列缺失时，「评论数」这一维度不可用，
+  // 而本脚本此前**全程无告警** —— 下游按评论数筛选只会得到空集而不报错。
+  // 复用 census（--census 命中）也照样告警：那批数据确实缺这个字段，消息已写明两种来源。
+  const noComments = rows.filter((r) => r.comments === null || r.comments === undefined).length;
+  if (rows.length && noComments === rows.length) {
+    console.log('      ⚠️ 全部回答的 comment_count 均为空——知乎 API 未返回该字段（或该 census 生成时未返回）；' +
+                '「评论数」这一维度不可用（不影响赞数/正文/作者）。');
+  } else if (noComments) {
+    console.log(`      ℹ️ ${noComments}/${rows.length} 条回答缺 comment_count。`);
+  }
 
   if (!opts.census || !existsSync(censusPath)) {
     writeFileSync(

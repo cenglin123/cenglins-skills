@@ -12,11 +12,12 @@ description: >-
 
 # 知乎自动化（zhihu-auto）
 
-一个 skill、四类任务，用 `references/` 分手册**按需加载**。上手先认清**两条截然不同的执行/鉴权通道**，不要混用：
+一个 skill、四类任务，用 `references/` 分手册**按需加载**。上手先认清**三条截然不同的执行/鉴权通道**，不要混用：
 
 | 通道 | 任务 | 执行方式 | 鉴权 |
 |---|---|---|---|
-| **API 通道** | 抓取回答、争议分析、抓评论 | `scripts/*.mjs`（纯 Node `fetch`，**无浏览器**） | 一个 **Cookie 文件**（存在 `~/.zhihu-auto/`，由 setup / get-cookie 管理） |
+| **API 通道** | 争议分析、抓评论 | `strat-sample/stance-estimate/fetch-comments.mjs`（纯 Node `fetch`，**无浏览器**、零依赖） | 一个 **Cookie 文件**（存在 `~/.zhihu-auto/`，由 setup / get-cookie 管理） |
+| **渲染通道** | 抓取问题回答正文 | `extract.mjs`（puppeteer headless，**要浏览器**；`open.mjs` 为可视化手动浏览） | 同上（Cookie 供 API 用；`open.mjs` 另有持久化 profile） |
 | **浏览器通道** | 改回答、发专栏 | **playwright MCP**（`browser_*`，**隔离实例**） | 复用 `~/.zhihu-auto/` 的 Cookie（file→MCP 注入）；无有效 Cookie 时才需用户本人扫码 |
 
 > API 通道里 `strat-sample / stance-estimate / fetch-comments` **零依赖**（只用全局 `fetch`），
@@ -39,6 +40,8 @@ node <SKILL_DIR>/scripts/setup.mjs --check   # 只检查环境（非 0 = 有缺�
 
 - 零依赖脚本（`strat-sample / stance-estimate / fetch-comments`，仅用全局 `fetch`）本就不需要依赖。
 - 首次使用前用 `scripts/get-cookie.mjs` 扫码登录一次，Cookie 写到 `~/.zhihu-auto/`（详见 `references/extract-answers.md`）。
+  **agent / 无人值守跑法**：`node <SKILL_DIR>/scripts/get-cookie.mjs --no-wait` —— 存好即关浏览器退出，不等 Enter；
+  `--max-wait <秒>`（>= 60，默认 300，或 `ZHIHU_MAX_WAIT_MS` 毫秒）调最长等待。`--help` 看用法。
 
 ## 统一登录态（单一来源）
 
@@ -78,7 +81,7 @@ node <SKILL_DIR>/scripts/setup.mjs --check   # 只检查环境（非 0 = 有缺�
 
 ```
 zhihu-auto/
-├── SKILL.md                    # 本文件：入口 + 两条通道 + 路由
+├── SKILL.md                    # 本文件：入口 + 三条通道 + 路由
 ├── references/                 # 分手册（按需读取）
 │   ├── extract-answers.md      #   抓取问题回答（API 枚举 + puppeteer 渲染）
 │   ├── debate-analysis.md      #   争议题：分层抽样 / 立场估计 / 评论层 / 反串识别
@@ -87,6 +90,8 @@ zhihu-auto/
 └── scripts/
     ├── extract.mjs  get-cookie.mjs  open.mjs  setup.mjs
     ├── strat-sample.mjs  stance-estimate.mjs  fetch-comments.mjs
+    ├── cookie-for-browser.mjs   # Cookie → 浏览器注入代码（file→MCP，必需）
+    ├── cookie-from-browser.mjs  # 浏览器 → Cookie（高级用法，不在受支持流程内）
     ├── lib/env.mjs              # 外部家目录 / Cookie / 依赖链接解析（零依赖）
     ├── facets.example.json  package.json
     └── publish/                 # 专栏发布脚本

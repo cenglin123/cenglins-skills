@@ -7,6 +7,11 @@
 两种方式，都写到外部路径 `~/.zhihu-auto/www.zhihu.com_cookies.txt`（跨 skill 重装存活）：
 
 - **一键**：`node <SKILL_DIR>/scripts/get-cookie.mjs` → 打开浏览器 → 用户手动登录 → 自动导出。
+  - `--no-wait`：存好 Cookie 后**立即关闭浏览器退出**，不等 Enter。**agent / 无人值守场景必加**
+    （不加时脚本会等 Enter；stdin 若是管道或被关闭，最多 30 秒后也会自动关闭，不会挂住）。
+  - `--max-wait <秒>`（也接受 `--max-wait=秒`）：最长等待登录时间，>= 60，默认 300。
+    无效值会**报错退出（exit 2）而不静默回退默认**。等价环境变量：`ZHIHU_MAX_WAIT_MS`（毫秒）。
+  - `--help` 打印用法；未知参数同样 exit 2。
 - **手动**：登录 zhihu.com → 用 Cookie-Editor 等导出 Netscape 格式 → 存到上面那个路径（脚本也兼容 skill 内旧路径）。
 
 > ⚠️ Cookie 含 `z_c0` 登录凭证，任何拿到它的人都能以你身份访问知乎；别分享、别入库。有效期约 6 个月。
@@ -41,8 +46,10 @@ URL: …
 本次抓取: 50 条回答
 目标数量: 50 条回答
 停止原因: 达到目标数量 50
+编号说明: #N 是页面渲染顺序，不是 strat-sample 的 rid（rid 是赞数降序名次，每次重跑会重排）；aid 是回答唯一 id，可与 _census.json 的 rows[].id、_ledger.json 的 rows[].id、_comments.json 的 answers[].answer_id 对齐（值相同、字段名不同）。
+aid 覆盖: 50/50（未取到的行标 (aid=?)）
 ================================================================================
-【回答 #1】作者 (签名)
+【回答 #1】作者 (aid=12345678901) (签名)
 赞同: 2520
 
 正文…

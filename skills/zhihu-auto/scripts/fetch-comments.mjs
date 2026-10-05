@@ -143,9 +143,18 @@ async function apiGet(url, cookieHeader) {
     throw new Error('HTTP ' + res.status + ' 重定向（带 Cookie 的请求不应跳转）');
   }
   if (res.status === 403 || res.status === 401) {
-    throw new Error('HTTP ' + res.status + '（Cookie 可能失效）');
+    // 鉴权失败与「这条回答没有评论」是**完全不同**的两件事，必须可区分：
+    // 否则下层 catch 会把它记成 {comments:[], total:0}，产出「N 条回答 × 0 评论 + 零错误信号」
+    // 的干净假数据，凭据失效就伪装成了「这批回答没人评论」。
+    const e = new Error('HTTP ' + res.status + '（Cookie 可能失效）');
+    e.authFailure = true;
+    throw e;
   }
-  if (!res.ok) throw new Error('HTTP ' + res.status);
+  if (!res.ok) {
+    const e = new Error('HTTP ' + res.status);
+    if (res.status >= 500) e.transient = true;
+    throw e;
+  }
   return res.json();
 }
 
@@ -155,6 +164,8 @@ async function withRetry(fn, label) {
     try {
       return await fn();
     } catch (err) {
+      // 鉴权失败重试无意义：4 次 × 每条回答 = 白等几分钟，然后照样产出全 0 评论
+      if (err.authFailure) throw err;
       fails++;
       console.log(`      ${label} 失败(${fails}/4): ${stripCtrl(err.message)}`);
       if (fails >= 4) throw err;
@@ -269,12 +280,23 @@ async function main() {
   console.log(`目标回答: ${targets.length} 条 | 每题热评: ${opts.perAnswer} | 楼中楼: ${opts.replies} | 排序: ${opts.orderBy}`);
 
   const answers = [];
+  const failures = [];   // {answer_id, error}：抓取失败必须落进产物，不能只留一行 stdout
   let done = 0;
   for (const t of targets) {
-    let got = { comments: [], total: 0 };
+    let got = { comments: [], total: 0, failed: false };
     try {
       got = await fetchRootComments(t.id, opts.perAnswer, opts.orderBy, cookieHeader, opts.throttle);
     } catch (err) {
+      // fail-closed：鉴权失败立即中止整轮，并拒绝写出任何 comments 产物。
+      if (err.authFailure) {
+        console.error(`\n❌ 回答 ${t.id} 返回 ${stripCtrl(err.message)}`);
+        console.error('   这是**鉴权失败**，不是「该回答没有评论」。已中止，且不写出 comments 文件。');
+        console.error(`   Cookie 路径: ${COOKIE_FILE}`);
+        console.error('   请重跑 `node get-cookie.mjs --no-wait` 刷新登录态后重试。');
+        process.exit(1);
+      }
+      failures.push({ answer_id: t.id, error: stripCtrl(err.message) });
+      got = { comments: [], total: 0, failed: true };
       console.log(`  跳过回答 ${t.id}: ${stripCtrl(err.message)}`);
     }
     if (opts.replies > 0) {
@@ -285,7 +307,10 @@ async function main() {
         }
         try {
           c.replies = await fetchReplies(c.id, opts.replies, cookieHeader, opts.throttle);
-        } catch {
+        } catch (err) {
+          // 不能吞 authFailure：否则 child_comments 上的 401/403 会被伪装成「这条评论没有楼中楼」，
+          // 与上面根评论路径的 fail-closed 语义不一致。非鉴权失败才降级为空楼中楼。
+          if (err && err.authFailure) throw err;
           c.replies = [];
         }
       }
@@ -298,6 +323,7 @@ async function main() {
       verdict: t.verdict || null,
       answer_text: t.answer_text || null,
       total_comments: got.total,
+      fetch_failed: !!got.failed,   // true = 抓取失败（不是「无评论」）；见顶层 failures 数组
       comments: got.comments,
     });
     done++;
@@ -308,6 +334,19 @@ async function main() {
     await sleep(opts.throttle * (0.6 + Math.random() * 0.8));
   }
 
+  // fail-closed（收口）：全部回答都抓失败时，绝不写出一份「干净的全 0 评论」文件 ——
+  // 那正是「凭据失效伪装成无人评论」的出口。
+  if (answers.length && failures.length === answers.length) {
+    console.error(`\n❌ ${answers.length}/${answers.length} 条回答全部抓取失败，未写出 ${qid}_comments.*`);
+    console.error('   （避免把「抓取失败」伪装成「这批回答都没有评论」）');
+    for (const f of failures.slice(0, 5)) console.error(`   ${f.answer_id}: ${f.error}`);
+    if (failures.length > 5) console.error(`   …另有 ${failures.length - 5} 条`);
+    process.exit(1);
+  }
+  if (failures.length) {
+    console.warn(`⚠️ ${failures.length}/${answers.length} 条回答抓取失败：已记入 _comments.json 的 failures，对应条目 fetch_failed=true`);
+  }
+
   const jsonOut = {
     qid,
     fetched_at: new Date().toISOString(),
@@ -316,6 +355,8 @@ async function main() {
     replies: opts.replies,
     only_sampled: opts.onlySampled,
     answers_fetched: answers.length,
+    answers_failed: failures.length,
+    failures,
     comments_fetched: answers.reduce((s, a) => s + a.comments.length, 0),
     answers,
   };
@@ -336,7 +377,9 @@ async function main() {
     const at = (a.answer_text || '').replace(/\s*\n+\s*/g, ' ').trim();
     L.push(`  判读: ${a.verdict || '(未判读)'}${at ? '   回答节选: ' + (at.length > 100 ? at.slice(0, 100) + '…' : at) : ''}`);
     if (!a.comments.length) {
-      L.push('  (无评论或无权限)');
+      L.push(a.fetch_failed
+        ? '  (抓取失败 —— 不是「无评论」；见 _comments.json 的 failures)'
+        : '  (无评论)');
       continue;
     }
     for (const c of a.comments) {
@@ -363,6 +406,18 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error('\n❌ ' + stripCtrl(err && err.message || err));
-  process.exit(1);
+  // 与 C8-3 同一套 fail-closed 口径：楼中楼（child_comments）路径的 401/403 走到这里时，
+  // 必须明确说是「鉴权失败」，而不是一条裸的 HTTP 错误码。
+  if (err && err.authFailure) {
+    console.error(`\n❌ ${stripCtrl(err.message)}`);
+    console.error('   这是**鉴权失败**（楼中楼 child_comments 路径），不是「该回答没有评论」。已中止，且不写出 comments 文件。');
+    console.error(`   Cookie 路径: ${COOKIE_FILE}`);
+    console.error('   请重跑 `node get-cookie.mjs --no-wait` 刷新登录态后重试。');
+  } else {
+    console.error('\n❌ ' + stripCtrl(err && err.message || err));
+  }
+  // 用 process.exitCode 而非 process.exit()：reject 后已无后续任务，让 Node 排空
+  // 在飞的 keep-alive socket 再退出 —— 避免 Windows 上 libuv 的
+  // `!(handle->flags & UV_HANDLE_CLOSING)` 断言把退出码从 1 改成异常码。
+  process.exitCode = 1;
 });

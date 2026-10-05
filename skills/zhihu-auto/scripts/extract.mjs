@@ -530,9 +530,22 @@ async function main() {
       item.matches('.AnswerItem') ? item :
         item.querySelector('.AnswerItem') || item.closest('.AnswerItem') || item,
     ))];
+    // 回答 id：跨产物对齐的唯一 key。四个产物里字段名各不相同，值是同一个纯数字 ——
+    // census.rows[].id / ledger.rows[].id / comments.answers[].answer_id / 本行的 aid。
+    const aidOf = (el) => {
+      const byId = String(el.id || '').match(/(?:^|[-_])(\d{6,})$/);
+      if (byId) return byId[1];
+      const zop = el.getAttribute('data-zop') || '';
+      const byZop = zop.match(/"(?:answerId|answer_id)"\s*:\s*"?(\d{6,})/);
+      if (byZop) return byZop[1];
+      const link = el.querySelector('a[href*="/answer/"]');
+      const byLink = link && (link.getAttribute('href') || '').match(/\/answer\/(\d{6,})/);
+      return byLink ? byLink[1] : null;
+    };
     const results = [];
     for (let i = 0; i < Math.min(items.length, limit); i++) {
       const item = items[i];
+      const aid = aidOf(item);
       const authorEl = item.querySelector('.AnswerItem-authorInfo .UserLink-link') ||
                        item.querySelector('.AuthorInfo-name') ||
                        item.querySelector('[itemprop="author"] [itemprop="name"]');
@@ -546,7 +559,7 @@ async function main() {
                         item.querySelector('.RichContent-inner') ||
                         item.querySelector('[itemprop="text"]');
       const content = contentEl ? contentEl.innerText.trim() : '[内容提取失败]';
-      results.push({ index: i + 1, author, bio, votes: parseVotes(voteEl), content });
+      results.push({ index: i + 1, aid, author, bio, votes: parseVotes(voteEl), content });
     }
     return results;
   }, ANSWERS_NEEDED, ANSWER_SELECTORS);
@@ -564,6 +577,10 @@ async function main() {
   output += `本次抓取: ${answers.length} 条回答\n`;
   output += `目标数量: ${ANSWERS_NEEDED} 条回答\n`;
   output += `停止原因: ${stopReason}\n`;
+  // 口径说明必须落在**产物里**：C2（references/debate-analysis.md）让用户以 rid 归类，
+  // 而这里输出的是页面序 #N；不说清二者不是一回事，就会拿 #N 去填 verdicts.txt。
+  output += `编号说明: #N 是页面渲染顺序，不是 strat-sample 的 rid（rid 是赞数降序名次，每次重跑会重排）；aid 是回答唯一 id，可与 _census.json 的 rows[].id、_ledger.json 的 rows[].id、_comments.json 的 answers[].answer_id 对齐（值相同、字段名不同）。\n`;
+  output += `aid 覆盖: ${answers.filter((a) => a.aid).length}/${answers.length}（未取到的行标 (aid=?)）\n`;
   output += `${'='.repeat(80)}\n`;
 
   // 题干（问题描述）
@@ -575,7 +592,7 @@ async function main() {
   output += `\n`;
 
   for (const a of answers) {
-    output += `【回答 #${a.index}】${a.author}`;
+    output += `【回答 #${a.index}】${a.author}${a.aid ? ` (aid=${a.aid})` : ' (aid=?)'}`;
     if (a.bio) output += ` (${a.bio})`;
     output += `\n赞同: ${a.votes}\n\n`;
     output += a.content;

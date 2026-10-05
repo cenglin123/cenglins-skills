@@ -34,6 +34,23 @@ node <SKILL_DIR>/scripts/strat-sample.mjs `
    # O
    17 18
    ```
+
+   > **`rid` 是什么 / 不是什么**（用 `rid` 前先读这段）：
+   > - **是什么**：`strat-sample.mjs` 按**赞同数降序**（并列时按回答 id 升序）给全量回答编的序号，范围 `1..N`。
+   > - **不是**「页面上第 N 条」：`extract.mjs` 的 `【回答 #N】` 是**页面渲染顺序**，两套排序互不对应
+   >   （实测页面赞数序列有 8 处相邻降序违例，前 16 条内最大错位 10 位），**不可互相引用**。
+   > - **只在一次枚举内有效**：`strat-sample.mjs` 每次运行都按**实时** `voteup_count` 重新排序，
+   >   `rid` 会被重排。跨时间 / 跨枚举引用 `rid` 会**静默错位**。要跨轮引用，请用回答 id。
+   > - **跨文件对齐用回答 id**（值是同一个纯数字），但**字段名各产物不同**——不要假设都叫 `aid`：
+   >
+   >   | 产物 | 回答 id 字段 | 另有 | 生成脚本 |
+   >   |---|---|---|---|
+   >   | `_census.json` → `rows[]` | `id` | `rid` | `strat-sample.mjs` |
+   >   | `_ledger.json` → `rows[]` | `id` | `rid` | `strat-sample.mjs` |
+   >   | `_comments.json` → `answers[]` | `answer_id` | `rid` | `fetch-comments.mjs` |
+   >   | `extract.mjs` 输出 txt 标题行 | `(aid=…)` | `#N`（页面序） | `extract.mjs` |
+   >
+   >   没有回答 id 可用时，退而用「作者 + 赞同数 + 回答节选」三元组人工对齐。
 2. 运行估计（脚本完成加权、区间、交叉验证）：
    ```powershell
    node <SKILL_DIR>/scripts/stance-estimate.mjs `
@@ -57,6 +74,12 @@ node <SKILL_DIR>/scripts/fetch-comments.mjs `
 - `--per-answer K`（默认 10）、`--replies K`（楼中楼，默认 0，会成倍增加请求）
 - 产出 `_comments.json` + `_comments.txt`；**给了 `--ledger` 时每条回答连同「判读 + 正文节选」输出，即一张「评论区复核清单」**
 - 评论赞数字段是 `vote_count`（不是 answers 的 `voteup_count`），作者在 `author.member.name`
+- **鉴权失败 fail-closed**：某条回答返回 401/403 时脚本**立即中止且不写任何 comments 文件**（退出码 1）。
+  凭据失效不会被伪装成「这批回答没有评论」。**楼中楼（`--replies K`）路径同样 fail-closed** ——
+  `child_comments` 返回 401/403 时同样立即中止，不会被未绑定的 `catch` 吞成「楼中楼凭空消失」。
+- 单条回答抓取失败（非鉴权）会记进 `_comments.json` 的 `failures[]`，对应条目 `fetch_failed: true`，
+  `_comments.txt` 里印 `(抓取失败 —— 不是「无评论」…)`；**全部**回答都失败则同样中止、不写文件。
+  统计评论数时请先排除 `fetch_failed: true` 的条目。
 
 **评论层只做三件事，且必须与回答区分开报告：** ① 争议点定位；② 两区对照（回答区 vs 评论区立场）；
 ③ 信息增量（新事实/反例）。**不要并进回答区统计**——评论是回答的附属、非独立样本，同意靠点赞、反对才留言，
