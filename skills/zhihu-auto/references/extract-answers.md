@@ -55,6 +55,33 @@ aid 覆盖: 50/50（未取到的行标 (aid=?)）
 正文…
 ```
 
+## 专栏文章（zhuanlan.zhihu.com/p/*）
+
+问题页脚本 `extract.mjs` **不支持**专栏文章 —— 解析器是问题页专用的。
+专栏文章用另一个脚本：
+
+```powershell
+node <SKILL_DIR>/scripts/extract-article.mjs --url "https://zhuanlan.zhihu.com/p/<id>" [--out <文件>] [--no-links] [--timeout <秒>]
+```
+
+`--url` 也接受纯数字 id；输出 txt = 元信息头 + 正文 + 外链附录。
+
+**三条实测事实（2026-10，决定了它的实现方式）：**
+
+1. **HTML 层有 `zse-ck` 挑战**：纯 `fetch` / 无签名请求一律 403（挑战页）。因此必须走
+   stealth 浏览器；脚本自动找 Chrome/Edge（含 Edge 兜底），无浏览器时报错退出。
+2. **API 层帮不上忙**：`/api/v4/articles/<id>` 要求 `x-zse-96` 请求签名，未实现绕过
+   （403 code 10003「请求参数异常」）；旧 `zhuanlan.zhihu.com/api/posts/<id>` 已 404。
+3. **匿名即可读公开文章，脚本不注入 Cookie**：登录墙 / 付费 / 仅关注者可见的文章
+   **明确不支持**（报错退出而非把登录态带进浏览器进程）。
+
+**LinkCard 要单独处理**：知乎外链卡片（如「项目仓库已开源：」后面那张卡）的 `<a>`
+**没有 innerText**，只取正文会丢掉最关键的链接。脚本会扫正文里的全部 `<a href>`、
+解码 `link.zhihu.com/?target=<urlencoded>` 还原真实目标，并过滤站内
+`topic/people/pin/question/zhida` 链接，附在输出末尾。
+
+退出码：0 成功；1 被风控拦截 / 需登录 / 未取到正文；2 用法错误（未知参数、缺值同 exit 2）。
+
 ## 常见问题
 
 | 现象 | 原因 | 解决 |

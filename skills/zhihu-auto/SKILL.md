@@ -17,7 +17,7 @@ description: >-
 | 通道 | 任务 | 执行方式 | 鉴权 |
 |---|---|---|---|
 | **API 通道** | 争议分析、抓评论 | `strat-sample/stance-estimate/fetch-comments.mjs`（纯 Node `fetch`，**无浏览器**、零依赖） | 一个 **Cookie 文件**（存在 `~/.zhihu-auto/`，由 setup / get-cookie 管理） |
-| **渲染通道** | 抓取问题回答正文 | `extract.mjs`（puppeteer headless，**要浏览器**；`open.mjs` 为可视化手动浏览） | 同上（Cookie 供 API 用；`open.mjs` 另有持久化 profile） |
+| **渲染通道** | 抓取问题回答正文 / 专栏文章正文 | `extract.mjs`、`extract-article.mjs`（puppeteer headless，**要浏览器**；`open.mjs` 为可视化手动浏览） | 问题页需 Cookie；专栏文章**匿名可读、不注入 Cookie**（登录墙文章不支持） |
 | **浏览器通道** | 改回答、发专栏 | **playwright MCP**（`browser_*`，**隔离实例**） | 复用 `~/.zhihu-auto/` 的 Cookie（file→MCP 注入）；无有效 Cookie 时才需用户本人扫码 |
 
 > API 通道里 `strat-sample / stance-estimate / fetch-comments` **零依赖**（只用全局 `fetch`），
@@ -72,6 +72,7 @@ node <SKILL_DIR>/scripts/setup.mjs --check   # 只检查环境（非 0 = 有缺�
 | 用户要… | 读分手册 | 关键脚本/工具 |
 |---|---|---|
 | 抓取/下载某问题的高赞回答为 txt | [`references/extract-answers.md`](references/extract-answers.md) | `scripts/extract.mjs` |
+| 抓取**专栏文章**（`zhuanlan.zhihu.com/p/*`）正文 | [`references/extract-answers.md`](references/extract-answers.md)「专栏文章」节 | `scripts/extract-article.mjs` |
 | 估计某争议问题的**真实立场分布**（防排序偏置） | [`references/debate-analysis.md`](references/debate-analysis.md) | `strat-sample.mjs` →（agent 判读）→ `stance-estimate.mjs` |
 | 抓某回答下的**热评 / 评论层** | [`references/debate-analysis.md`](references/debate-analysis.md)「评论层」节 | `fetch-comments.mjs` |
 | **修正 / 更新一篇已有知乎回答** | [`references/edit-answer.md`](references/edit-answer.md) | playwright MCP |
@@ -88,7 +89,7 @@ zhihu-auto/
 │   ├── edit-answer.md          #   修正已有回答（浏览器）
 │   └── publish-column.md       #   发布专栏文章（浏览器）
 └── scripts/
-    ├── extract.mjs  get-cookie.mjs  open.mjs  setup.mjs
+    ├── extract.mjs  extract-article.mjs  get-cookie.mjs  open.mjs  setup.mjs
     ├── strat-sample.mjs  stance-estimate.mjs  fetch-comments.mjs
     ├── cookie-for-browser.mjs   # Cookie → 浏览器注入代码（file→MCP，必需）
     ├── cookie-from-browser.mjs  # 浏览器 → Cookie（高级用法，不在受支持流程内）
