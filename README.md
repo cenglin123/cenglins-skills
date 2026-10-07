@@ -21,6 +21,11 @@ cenglins-skills/
 │   │   └── scripts/
 │   ├── powershell-guard/
 │   │   └── SKILL.md
+│   ├── push-to-server/
+│   │   ├── SKILL.md
+│   │   ├── push-config.example.json
+│   │   ├── references/
+│   │   └── scripts/
 │   ├── utf8-guard/
 │   │   └── SKILL.md
 │   ├── video-to-srt/
@@ -108,6 +113,7 @@ git clone https://github.com/cenglin123/cenglins-skills.git "$env:USERPROFILE\.a
 | `crlf-guard` | 防止 Windows Git 项目中的 CRLF/LF 与文本写入事故 |
 | `foxmail-grep` | 免密码检索 Foxmail 本地邮件（7.2 / 7.0-7.1 / 5.x-6.x），支持附件提取与 POP3 拉取 |
 | `powershell-guard` | 规避 Windows PowerShell 5.1 的语法、别名与编码陷阱 |
+| `push-to-server` | 通过 git bundle 安全部署代码到服务器，预检拦截 + 备份回滚，默认保护运行时数据 |
 | `utf8-guard` | 区分并处理 Windows 中文文本的 UTF-8、GBK 与显示层问题 |
 | `video-to-srt` | 下载视频、用 faster-whisper 生成字幕，并由 Agent 安全校对和导出文本 |
 | `winx-wt-takeover` | 诊断 Windows 控制台交接失效，并让 Win+X 的 PowerShell 项打开 Windows Terminal |
