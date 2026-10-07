@@ -36,8 +36,9 @@ cenglins-skills/
 │   │   ├── README.md
 │   │   ├── references/
 │   │   └── scripts/
-│   └── zhihu-answer-extractor/
+│   └── zhihu-auto/
 │       ├── SKILL.md
+│       ├── references/
 │       └── scripts/
 ├── scripts/
 │   └── validate-skills.ps1
@@ -117,6 +118,6 @@ git clone https://github.com/cenglin123/cenglins-skills.git "$env:USERPROFILE\.a
 | `utf8-guard` | 区分并处理 Windows 中文文本的 UTF-8、GBK 与显示层问题 |
 | `video-to-srt` | 下载视频、用 faster-whisper 生成字幕，并由 Agent 安全校对和导出文本 |
 | `winx-wt-takeover` | 诊断 Windows 控制台交接失效，并让 Win+X 的 PowerShell 项打开 Windows Terminal |
-| `zhihu-answer-extractor` | 批量抓取知乎问题回答并保存为结构化文本 |
+| `zhihu-auto` | 知乎自动化合集：抓取回答/评论/想法、争议立场分析、修正已发布回答、发布专栏文章 |
 
 维护者：[cenglin123](https://github.com/cenglin123)
