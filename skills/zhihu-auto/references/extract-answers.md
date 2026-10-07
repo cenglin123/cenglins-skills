@@ -82,6 +82,29 @@ node <SKILL_DIR>/scripts/extract-article.mjs --url "https://zhuanlan.zhihu.com/p
 
 退出码：0 成功；1 被风控拦截 / 需登录 / 未取到正文；2 用法错误（未知参数、缺值同 exit 2）。
 
+## 想法（www.zhihu.com/pin/*）
+
+想法用另一个脚本，**比文章简单得多 —— 纯 fetch、零依赖、无浏览器**：
+
+```powershell
+node <SKILL_DIR>/scripts/extract-pin.mjs --url "https://www.zhihu.com/pin/<id>" [--out <文件>]
+```
+
+`--url` 也接受纯数字 id。**Cookie 可选**：存在则携带，缺失则匿名尝试（公开想法通常可读）。
+
+**与文章的关键差异（2026-10 实测）：`/api/v4/pins/<id>` 不要求 `x-zse-96` 签名**，
+带 Cookie 即 200 —— 和专栏文章 API（必须走 stealth 浏览器）正好相反。
+知乎的签名策略是按端点粒度的，不是全局。
+
+**三条已知边界：**
+
+1. `content` 是**数组**（text / link / image 混排），不是单段 HTML；本脚本按类型拼接。
+2. **图片里的文字不可得**：想法常配截图（恰是作者想强调的部分），输出里只有 `[图]` 占位 ——
+   需要截图内容时得另行 OCR，或让用户直接看图。
+3. 转发类想法带 `source_pin_id`，输出会注明；`is_deleted` 的想法报错退出。
+
+退出码：0 成功；1 已删除 / 需登录 / 被风控 / 未取到内容；2 用法错误。
+
 ## 常见问题
 
 | 现象 | 原因 | 解决 |
