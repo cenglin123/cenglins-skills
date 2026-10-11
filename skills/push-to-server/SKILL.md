@@ -30,6 +30,57 @@ Config schema: `schema_version=1`, `server(host,user,port,remote_repo_dir[,ssh_k
 `expected_branch`. Forbidden field names: `password`, `token`, `secret`,
 `credential`, `private_key` (any nesting, case-insensitive match).
 
+### Shared Server Templates
+
+When registering a new project, check the external store's `README.md` and
+`templates/` directory for user-maintained server information, if present.
+These are optional agent-readable records, not automatic config-discovery
+inputs. Reuse confirmed connection values; copy the template to a temporary
+file, fill project-specific fields, then run `config-save --repo <project>`
+with `--config <temporary-file>`. Do not write project values back into a
+shared template. A template with `remote_repo_dir: null` is intentionally
+incomplete and must not be saved as an active project config.
+
+### Recommended Project Layout
+
+For new deployments without an existing project convention, propose a
+deployment-user-owned layout such as `/home/<deploy-user>/apps/<project>/`:
+
+```text
+apps/
+  README.md                 # Project/service names, owners, ports, URLs
+  <project>/
+    repo/                   # Git code, Compose files, deployment/check scripts
+    config/                 # Server-specific configuration and .env
+    data/                   # Databases, uploads and other persistent data
+    backups/                # Application data backups
+```
+
+- Use a distinct lowercase-hyphen project name and set `remote_repo_dir` to
+  the absolute `repo/` path. Respect existing layouts and deployment accounts;
+  this is a recommendation, not a script-enforced directory default or
+  authorization to create directories or migrate existing services.
+- Keep credentials and persistent data outside tracked code. Reference sibling
+  `config/` and `data/` directories explicitly from Compose or service scripts;
+  account for their paths and permissions. `runtime_paths` accepts only paths
+  relative to the code repository: do not put sibling or absolute paths there.
+  For runtime files kept inside `repo/`, ignore them in Git and declare them.
+- Record each project's directory, service/container name, port, URL, start/
+  stop commands, health check and data-backup procedure in project deployment
+  instructions; check for port conflicts before exposing a new service.
+  Use Compose or systemd as appropriate for restart behavior and bounded logs.
+- First-time repository/service provisioning is separate from this tool's
+  update transaction. It requires its own authorized workflow; the deploy
+  command neither initializes a remote Git repository nor allocates ports.
+  Once provisioned, register the project config, run remote preflight, deploy,
+  and verify the application using tracked health scripts. Connect it to an
+  existing service monitor when appropriate and authorized.
+- Code backup refs and rollback cover tracked code only. Back up databases
+  with their application-specific tools before migrations; choose data
+  retention and an off-server backup destination separately. Never let a
+  post-sync script overwrite configuration, delete data, or remove volumes
+  merely to update code.
+
 ---
 
 ## 2. Tool Entrypoints
