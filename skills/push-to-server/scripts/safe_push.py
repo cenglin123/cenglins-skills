@@ -318,7 +318,8 @@ def save_config(repo_root, source_path, replace=False):
 def _git(args, cwd=None, check=True):
     cmd = ["git"] + args
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd, check=check)
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           cwd=cwd, check=check)
         return r
     except subprocess.CalledProcessError as e:
         raise SafePushError(f"git command failed: {' '.join(args)}\n{e.stderr.strip()}")
@@ -406,14 +407,19 @@ def ssh_run_script(config, script, timeout=120):
     """
     args = _ssh_base_args(config) + [_build_destination(config), "sh"]
     try:
+        # Send bytes, not text: in text mode Windows rewrites LF to CRLF on stdin,
+        # and the remote POSIX sh then fails on "set -e<CR>" ("set: Illegal option -").
         r = subprocess.run(
             args,
-            input=script,
+            input=script.encode("utf-8"),
             capture_output=True,
-            text=True,
             timeout=timeout,
         )
-        return r.stdout, r.stderr, r.returncode
+        return (
+            r.stdout.decode("utf-8", "replace"),
+            r.stderr.decode("utf-8", "replace"),
+            r.returncode,
+        )
     except subprocess.TimeoutExpired:
         raise SafePushError("SSH command timed out")
     except FileNotFoundError:
@@ -432,6 +438,9 @@ def ssh_run_command(config, command, timeout=120):
             args,
             capture_output=True,
             text=True,
+            # remote output is UTF-8; without this Windows decodes with the locale (e.g. GBK) and crashes
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
         )
         return r.stdout, r.stderr, r.returncode
@@ -450,7 +459,8 @@ def scp_upload(config, local_path, remote_path, timeout=120):
     dest = f"{config.user}@{config.host}:{remote_path}"
     args += [local_path, dest]
     try:
-        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           timeout=timeout)
         if r.returncode != 0:
             raise SafePushError(f"SCP upload failed: {r.stderr.strip()}")
     except subprocess.TimeoutExpired:
@@ -623,8 +633,14 @@ def preflight_remote(config):
 
     # Pre-check: remote dir safety (already validated by Config)
 
-    # 1. Basic git repo check via stdin script
-    stdout, stderr, rc = ssh_run_script(config, REMOTE_PREFLIGHT_SCRIPT)
+    # 1. Basic git repo check via stdin script, run inside the configured repo dir
+    #    (the SSH session starts in the login user's home, which is never a valid remote_repo_dir).
+    #    remote_repo_dir is validated by Config and shell-quoted here.
+    script = (
+        "cd " + _quote(config.remote_repo_dir) + " 2>/dev/null || { echo NOT_A_GIT_REPO; exit 1; }\n"
+        + REMOTE_PREFLIGHT_SCRIPT
+    )
+    stdout, stderr, rc = ssh_run_script(config, script)
 
     if rc != 0:
         if "NOT_A_GIT_REPO" in stdout:
@@ -788,7 +804,7 @@ set -e
 remote_dir={remote_dir_q}
 
 # [CRITICAL] Fetch bundle to incoming ref
-git -C "$remote_dir" fetch /tmp/{bundle_name} HEAD:{incoming_ref_q}
+git -C "$remote_dir" fetch {bundle_path_q} HEAD:{incoming_ref_q}
 
 # [CRITICAL] Create backup ref
 backup_ref={backup_ref_q}
@@ -877,7 +893,7 @@ def do_deploy(config):
     # Bundles go to system temp
     bundle_dir = tempfile.mkdtemp(prefix="push-to-server-")
     bundle_path = os.path.join(bundle_dir, f"{deploy_id}.bundle")
-    remote_bundle_path = f"/tmp/{deploy_id}.bundle"
+    remote_bundle_path = f"/tmp/push-to-server-{deploy_id}.bundle"
 
     status = {
         "deployment_id": deploy_id,
@@ -915,7 +931,7 @@ def do_deploy(config):
         # Build deploy script
         deploy_script = DEPLOY_STEPS_SCRIPT_TEMPLATE.format(
             remote_dir_q=_quote(config.remote_repo_dir),
-            bundle_name=deploy_id,
+            bundle_path_q=_quote(remote_bundle_path),
             backup_ref_q=_quote(backup_ref),
             incoming_ref_q=_quote(incoming_ref),
             backups_prefix_q=_quote(BACKUP_REFS_PREFIX),
@@ -933,7 +949,8 @@ def do_deploy(config):
             except DeployError:
                 status["remote_head_after"] = None
 
-            if status["remote_head_after"] == local_head:
+            if (status["remote_head_after"] == local_head
+                    and status["remote_head_before"] != local_head):
                 # HEAD actually switched — code_updated_unverified
                 status["status"] = STATUS_CODE_UPDATED_UNVERIFIED
                 # Check if backup ref was created (search output)
@@ -943,9 +960,11 @@ def do_deploy(config):
                     )
                 else:
                     status["rollback_command"] = None
+                err_detail = stderr.strip() or stdout.strip()[-500:]
                 status["errors"].append(
                     f"Deploy script failed (exit={rc}) but HEAD switched "
-                    f"to expected commit. Status: {STATUS_CODE_UPDATED_UNVERIFIED}."
+                    f"to expected commit. Status: {STATUS_CODE_UPDATED_UNVERIFIED}. "
+                    f"Detail: {err_detail}"
                 )
             else:
                 # HEAD not switched — deploy_failed
