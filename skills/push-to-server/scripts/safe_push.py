@@ -2,11 +2,13 @@
 """safe_push.py — Safe git-bundle deployment with preflight checks.
 
 Usage:
-  python safe_push.py preflight --repo /path/to/repo --config /path/to/config.json [--remote] [--json]
-  python safe_push.py deploy --repo /path/to/repo --config /path/to/config.json [--execute]
+  python safe_push.py preflight --repo /path/to/repo [--config /path/to/config.json] [--remote] [--json]
+  python safe_push.py deploy --repo /path/to/repo [--config /path/to/config.json] [--execute]
+  python safe_push.py config-save --repo /path/to/repo --config /path/to/config.json [--replace]
 """
 
 import argparse
+import hashlib
 import json
 import os
 import random
@@ -206,6 +208,108 @@ def load_config(path, repo_root=None):
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
     return Config(data, repo_root=repo_root)
+
+
+def _resolved_path(path):
+    return Path(path).expanduser().resolve()
+
+
+def _is_within(path, parent):
+    try:
+        _resolved_path(path).relative_to(_resolved_path(parent))
+        return True
+    except ValueError:
+        return False
+
+
+def config_store_home(repo_root):
+    """Return the external store root after rejecting unsafe locations."""
+    repo = _resolved_path(repo_root)
+    skill_dir = Path(__file__).resolve().parents[1]
+    home = _resolved_path(os.environ.get("PUSH_TO_SERVER_HOME", "~/.push-to-server"))
+    if _is_within(home, repo) or _is_within(home, skill_dir):
+        raise ConfigError("PUSH_TO_SERVER_HOME must be outside the repository and skill directory")
+    return home
+
+
+def saved_config_path(repo_root):
+    repo = _resolved_path(repo_root)
+    identity = os.path.normcase(str(repo)).encode("utf-8")
+    path = config_store_home(repo) / "configs" / (hashlib.sha256(identity).hexdigest() + ".json")
+    if _is_within(path, repo) or _is_within(path, Path(__file__).resolve().parents[1]):
+        raise ConfigError("Resolved config storage path must be outside the repository and skill directory")
+    return path
+
+
+def resolve_config_path(repo_root, explicit_path=None):
+    """Resolve explicit, saved, then project config without guessing values."""
+    if explicit_path:
+        path = Path(explicit_path).expanduser()
+        return path if path.is_absolute() else Path.cwd() / path
+    saved = saved_config_path(repo_root)
+    project = _resolved_path(repo_root) / ".agents" / "push-to-server.json"
+    if saved.exists():
+        return saved
+    if project.exists():
+        return project
+    raise ConfigError(
+        "No deployment config found. Use --config <path> or save one with "
+        "config-save --repo <path> --config <path>."
+    )
+
+
+def _atomic_write(path, content):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        try:
+            os.chmod(temp_name, 0o600)
+        except OSError:
+            pass
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_name, path)
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+        raise
+
+
+def save_config(repo_root, source_path, replace=False):
+    repo = _resolved_path(repo_root)
+    source = Path(source_path).expanduser()
+    if not source.is_absolute():
+        source = Path.cwd() / source
+    try:
+        raw = source.read_bytes()
+        data = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ConfigError(f"Cannot read config JSON: {exc}") from exc
+    Config(data, repo_root=repo)
+    destination = saved_config_path(repo)
+    existing = destination.read_bytes() if destination.exists() else None
+    same = False
+    if existing is not None:
+        try:
+            same = json.loads(existing.decode("utf-8")) == data
+        except (UnicodeError, json.JSONDecodeError):
+            same = False
+    if existing is not None and not same and not replace:
+        raise ConfigError("A different saved config already exists; use --replace to replace it")
+    if not same:
+        if existing is not None and replace:
+            _atomic_write(destination.with_suffix(destination.suffix + ".bak"), existing)
+        _atomic_write(destination, raw)
+    return destination
 
 
 # ---------------------------------------------------------------------------
@@ -946,8 +1050,9 @@ def _build_rollback_cmd(config, backup_ref):
 def cmd_preflight(args):
     """Handle 'preflight' subcommand."""
     try:
-        config = load_config(args.config, repo_root=args.repo)
-    except (ConfigError, OSError, json.JSONDecodeError) as e:
+        config_path = resolve_config_path(args.repo, args.config)
+        config = load_config(config_path, repo_root=args.repo)
+    except (ConfigError, OSError, UnicodeError, json.JSONDecodeError) as e:
         result = {"status": STATUS_PREFLIGHT_FAILED, "errors": [str(e)]}
         _output(result, args.json)
         return 1
@@ -997,8 +1102,9 @@ def cmd_preflight(args):
 def cmd_deploy(args):
     """Handle 'deploy' subcommand."""
     try:
-        config = load_config(args.config, repo_root=args.repo)
-    except (ConfigError, OSError, json.JSONDecodeError) as e:
+        config_path = resolve_config_path(args.repo, args.config)
+        config = load_config(config_path, repo_root=args.repo)
+    except (ConfigError, OSError, UnicodeError, json.JSONDecodeError) as e:
         result = {"status": STATUS_PREFLIGHT_FAILED, "errors": [str(e)]}
         _output(result, args.json)
         return 1
@@ -1101,16 +1207,21 @@ def main():
     # preflight
     p_pre = sub.add_parser("preflight", help="Run preflight checks")
     p_pre.add_argument("--repo", required=True, help="Local repository path")
-    p_pre.add_argument("--config", required=True, help="Config JSON path")
+    p_pre.add_argument("--config", help="Config JSON path (defaults to saved or project config)")
     p_pre.add_argument("--remote", action="store_true", help="Also run remote preflight")
     p_pre.add_argument("--json", action="store_true", help="JSON output")
 
     # deploy
     p_dep = sub.add_parser("deploy", help="Execute deployment")
     p_dep.add_argument("--repo", required=True, help="Local repository path")
-    p_dep.add_argument("--config", required=True, help="Config JSON path")
+    p_dep.add_argument("--config", help="Config JSON path (defaults to saved or project config)")
     p_dep.add_argument("--execute", action="store_true", help="Actually write to remote")
     p_dep.add_argument("--json", action="store_true", help="JSON output")
+
+    p_save = sub.add_parser("config-save", help="Validate and save a per-repository config")
+    p_save.add_argument("--repo", required=True, help="Local repository path")
+    p_save.add_argument("--config", required=True, help="Source config JSON path")
+    p_save.add_argument("--replace", action="store_true", help="Replace a different saved config and back it up")
 
     parsed = parser.parse_args()
 
@@ -1119,7 +1230,11 @@ def main():
             sys.exit(cmd_preflight(parsed))
         elif parsed.command == "deploy":
             sys.exit(cmd_deploy(parsed))
-    except SafePushError as e:
+        elif parsed.command == "config-save":
+            path = save_config(parsed.repo, parsed.config, replace=parsed.replace)
+            print(f"Saved config: {path}")
+            sys.exit(0)
+    except (SafePushError, OSError) as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 

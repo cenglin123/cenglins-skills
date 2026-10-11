@@ -20,8 +20,10 @@ checks. **Does not modify `authorized_keys`, `known_hosts`, or accept passwords.
 ## 1. Discovery Order
 
 1. Read project `AGENTS.md` for deployment instructions.
-2. Locate `.agents/push-to-server.json` in project root for structured config.
-3. If missing, ask for server details with **no default values**.
+2. Resolve config in this order: explicit `--config`, saved per-repository config, then `.agents/push-to-server.json`.
+3. If all are missing, ask for server details with **no default values**.
+
+`config-save` validates and stores the original JSON outside the skill and repository at `~/.push-to-server/configs/<repo-hash>.json`. Set `PUSH_TO_SERVER_HOME` to choose another external storage root; a root inside the skill directory or repository is rejected. Saved configs survive replacing the skill directory. A present but invalid saved config blocks fallback, so repair it explicitly. After relocating a repository, import its existing saved file with `config-save --repo <new-repo> --config <saved-file>`. To recover the one previous version, explicitly import its `.json.bak` file with `--replace`.
 
 Config schema: `schema_version=1`, `server(host,user,port,remote_repo_dir[,ssh_key_path])`,
 `runtime_paths`, `health_checks`, `post_sync_script`, `backup_retention(1..5)`,
@@ -32,22 +34,27 @@ Config schema: `schema_version=1`, `server(host,user,port,remote_repo_dir[,ssh_k
 
 ## 2. Tool Entrypoints
 
-Replace template variables with project config values. All commands require a
-repository path and config path.
+Replace template variables with project config values. Every command requires a
+repository path; `preflight` and `deploy` discover config unless `--config` is set.
 
 ```bash
+# Save and validate a config once; prints only its path
+python <SKILL_DIR>/scripts/safe_push.py config-save --repo /path/to/repo --config /path/to/config.json
+
 # Preflight: local checks; add --remote to check remote too
-python <SKILL_DIR>/scripts/safe_push.py preflight --repo /path/to/repo --config .agents/push-to-server.json
+python <SKILL_DIR>/scripts/safe_push.py preflight --repo /path/to/repo
 
 # Preflight with remote checks and JSON output
-python <SKILL_DIR>/scripts/safe_push.py preflight --repo /path/to/repo --config .agents/push-to-server.json --remote --json
+python <SKILL_DIR>/scripts/safe_push.py preflight --repo /path/to/repo --remote --json
 
 # Dry-run deploy (no remote writes)
-python <SKILL_DIR>/scripts/safe_push.py deploy --repo /path/to/repo --config .agents/push-to-server.json
+python <SKILL_DIR>/scripts/safe_push.py deploy --repo /path/to/repo
 
 # Execute deploy (requires --execute flag)
-python <SKILL_DIR>/scripts/safe_push.py deploy --repo /path/to/repo --config .agents/push-to-server.json --execute
+python <SKILL_DIR>/scripts/safe_push.py deploy --repo /path/to/repo --execute
 ```
+
+Use `--config <path>` on `preflight` or `deploy` to override discovery. Explicit relative paths resolve from the current working directory. To replace a different saved config, pass `--replace`; the prior file is atomically preserved as `<hash>.json.bak`, replacing the previous backup.
 
 ---
 
