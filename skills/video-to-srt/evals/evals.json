@@ -18,6 +18,30 @@
       "prompt": "把这个目录下的所有视频批量转成字幕，已有 SRT 的不要重复跑。",
       "expected_output": "检测 Python、ffmpeg 与硬件环境，调用 batch_transcribe.py 并跳过已有结果。",
       "files": []
+    },
+    {
+      "id": 4,
+      "prompt": "这是 B 站移动端复制出来的分享链接 https://b23.tv/xxxx，下载并转写这个视频。",
+      "expected_output": "download.py 自动把短链还原为网页端 BV 链接（或用 --no-resolve 跳过）后再下载转写。",
+      "files": []
+    },
+    {
+      "id": 5,
+      "prompt": "这个视频很重要，用两个不同的 whisper 模型分别转写并对比一致性，指出可疑段落。",
+      "expected_output": "转写多份 SRT（如 turbo + large-v3），用 compare_srt.py 按时间窗对比并汇报低一致窗口，按「至少 2-3 个模型一致才采信」裁决。",
+      "files": []
+    },
+    {
+      "id": 6,
+      "prompt": "给这个英文视频做一份高可信中英双语字幕。",
+      "expected_output": "以 large-v3 时间轴为骨架，优先复用视频自带口译原文，术语按交叉验证统一，用 build_bilingual.py 生成双行 SRT 并校验结构。",
+      "files": []
+    },
+    {
+      "id": 7,
+      "prompt": "本机 ollama 可用且有显卡，用本地多模型集成校对这批字幕。",
+      "expected_output": "先 ollama ps 检查驻留模型与空闲显存，配置 proofread_multimodel.py 的 TARGETS 与简短 SYSTEM_PROMPT 后运行，跑完用关键词扫描验证残留。",
+      "files": []
     }
   ]
 }

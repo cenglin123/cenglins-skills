@@ -19,7 +19,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="批量调用 transcribe.py 生成 SRT")
     parser.add_argument("directory", nargs="?", default="Videos", help="视频目录；默认 Videos")
     parser.add_argument("-l", "--language", default="auto")
-    parser.add_argument("-m", "--model", default="small")
+    parser.add_argument("-m", "--model", default="turbo")
     parser.add_argument("-d", "--device", choices=("cpu", "cuda", "auto"), default="auto")
     parser.add_argument("--compute-type")
     parser.add_argument("--extensions", default=",".join(DEFAULT_EXTENSIONS))

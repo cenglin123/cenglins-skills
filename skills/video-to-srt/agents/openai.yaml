@@ -1,0 +1,57 @@
+interface:
+  display_name: "Video to SRT"
+  short_description: "使用 faster-whisper 将视频转录为 SRT 字幕，支持 GPU 加速、多语言检测、进度显示和长字幕校对"
+  default_prompt: "将视频转换为 SRT 字幕并按需校对"
+
+tools:
+  - type: function
+    function:
+      name: transcribe_video_to_srt
+      description: "将单个本地视频文件通过 faster-whisper 转录为 SRT 字幕文件"
+      parameters:
+        type: object
+        properties:
+          video:
+            type: string
+            description: "输入视频文件的本地路径（必需）"
+          output:
+            type: string
+            description: "输出 SRT 文件路径（可选，默认与视频同名）"
+          language:
+            type: string
+            description: "语言代码（如 zh/en/fr），未指定或传入 auto 时由模型自动检测（可选）"
+          model:
+            type: string
+            description: "faster-whisper 模型名称（可选，默认 turbo）"
+          device:
+            type: string
+            description: "运行设备（可选，默认 auto 自动选择，可填 cuda/cpu）"
+          force:
+            type: boolean
+            description: "是否强制覆盖已存在的输出文件（可选，默认 false）"
+          model_dir:
+            type: string
+            description: "模型下载目录（可选，默认使用 VIDEO_TO_SRT_MODEL_DIR 环境变量或用户缓存目录）"
+        required:
+          - video
+
+invocation:
+  # 使用 --flag=${value} 形式将值与 flag 绑定，避免 agent 框架传入空字符串时
+  # argparse 把下一个 flag 误解析为该参数的值。空字符串会在 transcribe.py
+  # 中被归一化为对应默认值。
+  type: script
+  script: "scripts/transcribe.py"
+  interpreter: "python"
+  args:
+    - "${video}"
+    - "--output=${output}"
+    - "--language=${language}"
+    - "--model=${model}"
+    - "--device=${device}"
+    - "--model-dir=${model_dir}"
+  conditional_args:
+    force:
+      when: true
+      args: ["--force"]
+  env:
+    PYTHONUTF8: "1"
