@@ -31,6 +31,11 @@ cenglins-skills/
 │   ├── video-to-srt/
 │   │   ├── SKILL.md
 │   │   └── scripts/
+│   ├── win-pup-forensics-cleanup/
+│   │   ├── SKILL.md
+│   │   ├── references/
+│   │   ├── scripts/
+│   │   └── tests/
 │   ├── winx-wt-takeover/
 │   │   ├── SKILL.md
 │   │   ├── README.md
@@ -117,6 +122,7 @@ git clone https://github.com/cenglin123/cenglins-skills.git "$env:USERPROFILE\.a
 | `push-to-server` | 通过 git bundle 安全部署代码到服务器，预检拦截 + 备份回滚，默认保护运行时数据 |
 | `utf8-guard` | 区分并处理 Windows 中文文本的 UTF-8、GBK 与显示层问题 |
 | `video-to-srt` | 下载视频、用 faster-whisper 生成字幕，并由 Agent 安全校对和导出文本 |
+| `win-pup-forensics-cleanup` | Windows 流氓软件/PUP 取证、来源复盘、精确清单清理及复核，支持受限资源规模与日志采集 |
 | `winx-wt-takeover` | 诊断 Windows 控制台交接失效，并让 Win+X 的 PowerShell 项打开 Windows Terminal |
 | `zhihu-auto` | 知乎自动化合集：抓取回答/评论/想法、争议立场分析、修正已发布回答、发布专栏文章 |
 
