@@ -46,13 +46,23 @@ python <SKILL_DIR>/scripts/publish/make_publish_copy.py "<source.md>" --out-dir 
 | 加粗 | `bold_spans`（`fontWeight >= 600`） | ✅ 保留；`legacy_bold_tags` 为 0 正常 |
 | 表格 | `tables` | DOM 计数可能少于肉眼所见，**以用户肉眼为准** |
 | 代码块 | `code_blocks` | ✅ 保留 |
-| 标题层级 | `h2`/`h3` | ⚠️ 会被压平（二三级都变 h3） |
+| 标题层级 | `h2`/`h3` + `catalog_first`/`catalog_second`，对照副本的 `##`/`###` 数 | ⚠️ 导入刚完成时可能全被压成 h3，须重载后复核（见下） |
 | 正文完整性 | `char_count` + `head`/`tail` | ✅ 万字级无截断 |
 
 > 坑：知乎是 Draft.js，加粗由**带样式 span** 实现，`querySelectorAll('b,strong')` 会得 0，别据此误判「加粗丢失」。
 
+**标题层级复核（发布/更新前必过）**：Markdown 的 `##` 应对应知乎一级标题（DOM `h2`、目录 `.Catalog-FirstLevelTitle`），`###` 对应二级标题（`h3`、`.Catalog-SecondLevelTitle`，目录里缩进一格）。实测导入**刚完成**时探针读到 `h2=0`、全部为 `h3`，编辑器目录也是平铺的——此时「一、」这类章标题和「1.1」节标题同级。
+
+1. 等编辑器底部显示已存草稿（「刚刚·草稿」）后 `browser_navigate` 重载 `/p/<id>/edit`，再跑探针。
+2. 判据：`h2 == catalog_first == 副本 ## 数`、`h3 == catalog_second == 副本 ### 数`（`make_publish_copy.py` 报告里有各级标题计数）。
+3. 一次实测中，重载后层级是正确的（11 个一级、18 个二级），但这期间正文字数也有变化，不能排除是用户在编辑器里手动调整过，所以**不要假定重载必然恢复**。
+4. 重载后仍不符：把光标放进错级的标题，用工具栏「标题」下拉改级别（下拉项的名称尚未实测，操作前先 `browser_snapshot` 定位），逐个改完再复核；无法自动修好就停下，交给用户在编辑器里改。
+5. 层级不符时不得发布或更新。
+
 ### [7/7] 发布（需明确授权）
 `browser_click` `button.Button--primary:has-text("发布")` → 展开「发布设置」（封面/话题/专栏/声明均可留空）→ 按钮变「发布中…」→ 跳 `?just_published=2` 即成功。**发布公开且不可静默撤销，必须用户明确说「可以发布」才点。**
+
+**更新已发布的文章**：入口改为 `https://zhuanlan.zhihu.com/p/<id>/edit`；导入是插入行为，先聚焦正文 Ctrl+A → Delete，确认「字数：0」后再按 [3/7] 导入；同样要过 [6/7] 的标题层级复核；提交按钮是「更新」，同样须用户明确授权。
 
 ## 完工
 ```bash

@@ -29,6 +29,9 @@
     h1: shadow('h1'),
     h2: shadow('h2'),
     h3: shadow('h3'),
+    // 编辑器侧边目录的层级（与 h2/h3 一起对照副本的 ##/### 数）
+    catalog_first: document.querySelectorAll('.Catalog-FirstLevelTitle').length,
+    catalog_second: document.querySelectorAll('.Catalog-SecondLevelTitle').length,
     char_count: text.length,
     head: text.slice(0, 150),
     tail: text.slice(-150),
@@ -36,7 +39,8 @@
     notes: {
       bold:
         '用 bold_spans 判断加粗；legacy_bold_tags 为 0 属正常，Draft.js 用带样式 span。',
-      headings: '知乎导入会把 h2/h3 压平为同级 h3，层级变化属已知现象。',
+      headings:
+        '## 应为 h2/catalog_first，### 应为 h3/catalog_second；导入刚完成时可能全为 h3，重载 /edit 后复核，仍不符则修复后再发布（见 publish-column.md）。',
       tables: 'DOM 计数可能少于肉眼所见，最终以用户肉眼核对为准。',
     },
   };
