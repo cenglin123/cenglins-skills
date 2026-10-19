@@ -6,7 +6,7 @@
 
 ```
 工具:  foxgrep.py（单文件；语料库为脚本旁的 corpus/ 子目录）
-运行:  fg.cmd <命令>       —— 推荐入口，使用内置 runtime\ 的嵌入式 Python，零环境依赖
+运行:  fg.cmd <命令>       —— 推荐入口：内置 runtime\ → 系统 Python 3.8+ → 自动下载嵌入式 Python
        python foxgrep.py <命令>   —— 或系统 Python 3（等效）
 ```
 
@@ -75,4 +75,4 @@ python foxgrep.py fetch                            # POP3 直连服务器拉取�
 - **附件提取（extract）**：全自动多级兜底——语料库直接提取 → `--v6` BOX 原位读取 → `--live` 匹配语料库副本 → **Foxmail 渲染缓存收割**（邮件被打开/预览过时，附件已被 Foxmail 自行解密到 `Roaming\Foxmail7\Temp-*\Attach\`，无需任何解密）→ POP3 服务器匹配拉取。都未命中时按 `refs/render-harvest-recipe.md` 的渲染收割配方触发一次渲染即可提取。
 - `fetch` 走 POP3，服务器地址与凭据自动从 Foxmail 本地配置提取，无需配置；Foxmail 若设置为"收后即删"，服务器上的邮件只短暂停留。
 - 邮件内容属于用户隐私数据：不要外发、不要提交到任何仓库。
-- `corpus/` 目录包含真实邮件，**不参与工具分发**；分发包含 `foxgrep.py` + `README.md` + `SKILL.md` + `fg.cmd` + `runtime/`（嵌入式 Python）+ `refs/`（版本适配研究方法，供分发机遇到不支持版本时勘察并反馈上游）。
+- `corpus/` 目录包含真实邮件，**不参与工具分发**；分发包含 `foxgrep.py` + `README.md` + `SKILL.md` + `fg.cmd` + `refs/`，`runtime/`（嵌入式 Python）可选——目标机已有 Python 3 时不必带（版本适配研究方法，供分发机遇到不支持版本时勘察并反馈上游）。

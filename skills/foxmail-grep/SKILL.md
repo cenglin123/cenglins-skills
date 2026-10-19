@@ -12,10 +12,10 @@ description: >-
 
 Foxmail 7.2 本地邮件的 grep 式检索工具。免密码、免启动 Foxmail、全程只读。
 
-工具位置：`%USERPROFILE%\.agents\skills\foxmail-grep\`，自包含内置 Python 运行时（`runtime\`），
-统一通过 `fg.cmd` 调用——**无需系统安装 Python**，中文输出无乱码。
-`runtime\` 缺失时 fg.cmd 自动下载安装嵌入式 Python（华为云镜像优先、官方源回退、SHA256 校验），
-离线环境才会失败——此时用分发包 `foxmail-grep-dist.zip`（自含运行时）。
+工具位置：`%USERPROFILE%\.agents\skills\foxmail-grep\`，统一通过 `fg.cmd` 调用，中文输出无乱码。
+`fg.cmd` 按顺序选解释器：内置运行时 `runtime\python.exe` → 系统 Python 3.8+（`py -3`，再 `python`）→
+自动下载嵌入式 Python（华为云镜像优先、官方源回退、SHA256 校验）。`foxgrep.py` 只用标准库，
+已装 Python 3 的离线机器直接可用；既无 Python 又离线时，用分发包 `foxmail-grep-dist.zip`（自含运行时）。
 
 ## 运行环境（重要）
 
