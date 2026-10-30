@@ -43,12 +43,12 @@ incomplete and must not be saved as an active project config.
 
 ### Recommended Project Layout
 
-For new deployments without an existing project convention, propose a
-deployment-user-owned layout such as `/home/<deploy-user>/apps/<project>/`:
+Deploy projects under `/srv/<project>/`. The script rejects every path under
+`/home/` and `~`, so a home-directory layout cannot be deployed:
 
 ```text
-apps/
-  README.md                 # Project/service names, owners, ports, URLs
+/srv/
+  PROJECTS.tsv              # Registry: project, port, contact, created
   <project>/
     repo/                   # Git code, Compose files, deployment/check scripts
     config/                 # Server-specific configuration and .env
@@ -56,10 +56,15 @@ apps/
     backups/                # Application data backups
 ```
 
-- Use a distinct lowercase-hyphen project name and set `remote_repo_dir` to
-  the absolute `repo/` path. Respect existing layouts and deployment accounts;
-  this is a recommendation, not a script-enforced directory default or
-  authorization to create directories or migrate existing services.
+- Name projects with lowercase letters, digits, `-` and `_`, and set
+  `remote_repo_dir` to the absolute `repo/` path. Respect existing layouts and
+  deployment accounts; this is a recommendation, not authorization to create
+  directories or migrate existing services.
+- On a server shared by several people or agents, give each project its own
+  Linux account and SSH key with `scripts/srv_project.sh`, and install the
+  root management panel before creating the first project. See
+  [`references/project-accounts.md`](references/project-accounts.md) and
+  [`references/srv-panel.md`](references/srv-panel.md).
 - Keep credentials and persistent data outside tracked code. Reference sibling
   `config/` and `data/` directories explicitly from Compose or service scripts;
   account for their paths and permissions. `runtime_paths` accepts only paths
@@ -119,7 +124,7 @@ Deploy **will not proceed** if any check fails:
 | Runtime paths | Not tracked by git; covered by `.gitignore` |
 | Post-sync script | Exists, tracked, inside repo |
 | Health scripts | All exist, tracked, inside repo |
-| Remote dir | Absolute POSIX; rejects `/`, `~`, `~/...`, `/home/<user>`, Windows paths |
+| Remote dir | Absolute POSIX; rejects `/`, `~`, `~/...`, any `/home/...` path, Windows paths |
 | Remote git repo | `git rev-parse --git-dir` succeeds |
 | Remote clean | `git status --porcelain` empty |
 | Remote runtime | Not tracked on remote |
@@ -152,7 +157,9 @@ Deploy **will not proceed** if any check fails:
   stops immediately. User handles externally.
 - **No remote init**: If remote directory is not a git repo, block and point to
   `references/fallback-sync.md`.
-- **No `authorized_keys` or `known_hosts` edits**.
+- **No `authorized_keys` or `known_hosts` edits**. Server access for project
+  accounts is granted by the server's root with `srv_project.sh`, outside the
+  deploy tool.
 
 ---
 
