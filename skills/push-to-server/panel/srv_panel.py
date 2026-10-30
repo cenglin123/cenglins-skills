@@ -53,7 +53,7 @@ FROM_RE = re.compile(r"^[0-9A-Za-z.:/*?,!-]+$")
 KEYREF_RE = re.compile(r"^[A-Za-z0-9._@:+/=-]{1,100}$")
 UNIT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@:-]{0,99}\.service$")
 SERVICE_OPS = ("restart", "stop", "start")
-CONFIRM_ACTIONS = ("disable", "revoke", "svc_stop")
+CONFIRM_ACTIONS = ("disable", "revoke", "svc_stop", "delete")
 
 
 # ───────────────────────── 纯函数：校验与比较 ─────────────────────────
@@ -892,6 +892,10 @@ def build_action(form):
         if not KEYREF_RE.fullmatch(key) or key.startswith("-"):
             raise ValueError("标签或指纹格式不对")
         return "revoke", {"project": name, "key": key}, [SRV_PROJECT, "revoke", name, key], None
+    if action == "delete":
+        purge = form.get("purge") == "1"
+        args = [SRV_PROJECT, "delete", name] + (["--purge"] if purge else [])
+        return "delete", {"project": name, "purge": purge}, args, None
     if action in ("disable", "enable"):
         return action, {"project": name}, [SRV_PROJECT, action, name], None
     if action in ("svc_restart", "svc_stop", "svc_start"):
@@ -905,6 +909,13 @@ def build_action(form):
         args = ["systemctl", "--user", "--machine=%s@" % name, op, unit]
         return action, {"project": name, "unit": unit}, args, None
     raise ValueError("未知操作：%s" % action)
+
+
+def project_info(name, lan_ip=""):
+    """srv-project info 的文本，供页面复制转发给申请方。"""
+    args = [SRV_PROJECT, "info", name] + (["--host", lan_ip] if lan_ip else [])
+    rc, out, err = run_cmd(args, timeout=30)
+    return out.strip() if rc == 0 else "（接入信息生成失败，退出码 %s）\n%s" % (rc, err.strip())
 
 
 def service_log(name, unit):
@@ -1019,7 +1030,7 @@ def render_overview(projects, csrf):
     return page("总览", body, csrf)
 
 
-def render_project(p, tools, findings, decl, csrf):
+def render_project(p, tools, findings, decl, csrf, info_text=""):
     e = p["entry"]
     name = e["name"]
     body = '<p><a href="/">← 总览</a></p>' + project_card(p, csrf)
@@ -1029,7 +1040,13 @@ def render_project(p, tools, findings, decl, csrf):
     ops = ""
     ops += btn_form(csrf, "启用", "primary", action="enable", project=name) if p["disabled"] else \
         '<form class="inline" method="post" action="/action">%s<button class="danger">停用项目…</button></form>' % hidden(csrf, action="disable", project=name)
+    if p["disabled"]:
+        ops += (' <form class="inline" method="post" action="/action">%s<label><input type="checkbox" name="purge" value="1"> 连同目录彻底删除（不勾则归档到 /srv/.archived）</label> '
+                '<button class="danger">删除项目…</button></form>' % hidden(csrf, action="delete", project=name))
     body += '<div class="card"><h2>项目操作</h2><p>%s</p></div>' % ops
+    if info_text:
+        body += ('<div class="card"><h2>接入信息</h2><p class="mute">可直接复制转发给申请方；不含密钥内容和密码。</p><pre>%s</pre></div>'
+                 % esc(info_text))
     # 公钥
     rows = "".join(
         "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td><form class='inline' method='post' action='/action'>%s<button class='danger'>吊销…</button></form></td></tr>"
@@ -1079,7 +1096,7 @@ def render_global(projects, lst, csrf):
     warn, extra = [], []
     reg = {p["entry"]["name"] for p in projects}
     try:
-        for n in sorted(os.listdir(SRV_ROOT)):
+        for n in sorted(x for x in os.listdir(SRV_ROOT) if not x.startswith(".")):
             full = os.path.join(SRV_ROOT, n)
             if os.path.isdir(full) and not os.path.islink(full):
                 if os.stat(full).st_mode & stat.S_IROTH:
@@ -1129,7 +1146,9 @@ CONFIRM_TEXT = {
     "disable": "停用会锁定账号（SSH 登录被拒）、停掉该账号全部进程与用户服务，数据不动。",
     "revoke": "吊销后这把公钥不能再登录；已建立的 SSH 会话不受影响。",
     "svc_stop": "停止后服务不再响应，直到再次启动。",
+    "delete": "删除账号、授权公钥和登记表条目，不可恢复。项目目录默认归档到 /srv/.archived（属主 root）。",
 }
+PURGE_TEXT = "已勾选「彻底删除」：项目目录 /srv/<项目> 将被直接删除，数据无法找回。"
 
 
 def render_confirm(form, csrf, post_to="/action", texts=None):
@@ -1137,6 +1156,8 @@ def render_confirm(form, csrf, post_to="/action", texts=None):
     hid = {k: v for k, v in form.items() if k not in ("csrf", "confirmed")}
     detail = "".join("<li>%s：%s</li>" % (esc(k), esc(v)) for k, v in hid.items() if k != "action")
     text = (texts or CONFIRM_TEXT).get(action, "")
+    if action == "delete" and form.get("purge") == "1":
+        text = PURGE_TEXT
     return page("确认操作", '<h1>请确认</h1><div class="card"><p class="warn"><b>操作：%s</b></p><ul>%s</ul><p>%s</p>'
                 '<form method="post" action="%s">%s<button class="danger">确认执行</button></form>'
                 '<p><a href="/">取消</a></p></div>'
@@ -1190,13 +1211,14 @@ USER_CONFIRM_TEXT = {
 
 class State:
     def __init__(self, store, port, extra_hosts=(), log_file=LOG_FILE, allow_nets=(), secure=False,
-                 initial_pw_file=INITIAL_PW_FILE, limiter=None):
+                 initial_pw_file=INITIAL_PW_FILE, limiter=None, lan_ip=""):
         self.store = store
         self.port = port
         self.extra_hosts = tuple(extra_hosts)
         self.log_file = log_file
         self.allow_nets = list(allow_nets)
         self.secure = secure
+        self.lan_ip = lan_ip
         self.initial_pw_file = initial_pw_file
         self.limiter = limiter or RateLimiter()
         self.secret = secrets.token_bytes(32)
@@ -1353,7 +1375,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     return self.send(404, page("未找到", "<h1>项目未登记</h1>", csrf))
                 p = collect_project(entry, listeners())
                 tools, findings, decl = (None, [], []) if p.get("missing") else project_env(name)
-                return self.send(200, render_project(p, tools, findings, decl, csrf))
+                info = project_info(name, self.state.lan_ip) if not p.get("missing") else ""
+                return self.send(200, render_project(p, tools, findings, decl, csrf, info))
             if u.path == "/logs":
                 name, unit = q.get("project", ""), q.get("unit", "")
                 if not valid_name(name) or not valid_unit(unit) or name not in registered_names():
@@ -1591,8 +1614,9 @@ def main(argv=None):
         sys.exit("启动检查失败：%s" % e)
     if not store.names():
         sys.exit("用户库为空或不存在：请先 sudo bash install_panel.sh（或 python3 srv_panel.py --bootstrap）")
+    lan_ip = next((b for b in binds if not is_loopback(b) and ":" not in b), "")
     state = State(store, a.port, a.allowed_host, a.log_file, nets, secure=tls is not None,
-                  initial_pw_file=a.initial_password_file)
+                  initial_pw_file=a.initial_password_file, lan_ip=lan_ip)
     try:
         servers = make_servers(binds, a.port, state, tls)
     except OSError as e:

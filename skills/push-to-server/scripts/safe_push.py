@@ -4,6 +4,7 @@
 Usage:
   python safe_push.py preflight --repo /path/to/repo [--config /path/to/config.json] [--remote] [--json]
   python safe_push.py deploy --repo /path/to/repo [--config /path/to/config.json] [--execute]
+  python safe_push.py bootstrap --repo /path/to/repo [--config /path/to/config.json] [--execute] [--json]
   python safe_push.py config-save --repo /path/to/repo --config /path/to/config.json [--replace]
 """
 
@@ -363,8 +364,8 @@ def git_unignored(paths, repo):
     return unignored
 
 
-def git_create_bundle(repo, output_path):
-    _git(["bundle", "create", output_path, "HEAD"], cwd=repo)
+def git_create_bundle(repo, output_path, ref="HEAD"):
+    _git(["bundle", "create", output_path, ref], cwd=repo)
 
 
 def git_for_each_ref(pattern, repo):
@@ -1064,6 +1065,160 @@ def _build_rollback_cmd(config, backup_ref):
 
 
 # ---------------------------------------------------------------------------
+# Bootstrap (first deployment into an empty remote directory)
+# ---------------------------------------------------------------------------
+BOOTSTRAP_NEXT_STEP = "Bootstrap done. Use 'deploy' for all later updates."
+
+
+def build_bootstrap_preflight_script(remote_dir):
+    """Fixed read-only script; the only dynamic value is the shell-quoted directory."""
+    return (
+        "cd " + _quote(remote_dir) + " 2>/dev/null || { echo REMOTE_DIR_MISSING; exit 1; }\n"
+        "command -v git >/dev/null 2>&1 || { echo GIT_MISSING; exit 1; }\n"
+        "[ -w . ] || { echo NOT_WRITABLE; exit 1; }\n"
+        "if [ -e .git ]; then echo ALREADY_GIT; exit 1; fi\n"
+        'if [ -n "$(ls -A . 2>/dev/null)" ]; then echo NOT_EMPTY; ls -A . | head -n 5; exit 1; fi\n'
+        "echo BOOTSTRAP_OK\n"
+    )
+
+
+def parse_bootstrap_preflight(stdout, stderr, rc, remote_dir):
+    """Turn the preflight script output into a list of error strings (empty = pass)."""
+    lines = [l.strip() for l in stdout.splitlines() if l.strip()]
+    if rc == 0 and "BOOTSTRAP_OK" in lines:
+        return []
+    if "REMOTE_DIR_MISSING" in lines:
+        return [f"Remote directory does not exist or is not accessible: {remote_dir}. "
+                "Ask the server admin to create the project (srv-project create) first."]
+    if "GIT_MISSING" in lines:
+        return ["git is not installed for this account on the remote."]
+    if "NOT_WRITABLE" in lines:
+        return [f"Remote directory is not writable by this account: {remote_dir}"]
+    if "ALREADY_GIT" in lines:
+        return [f"Remote directory is already a git repository: {remote_dir}. Use 'deploy' instead of 'bootstrap'."]
+    if "NOT_EMPTY" in lines:
+        sample = ", ".join(l for l in lines if l != "NOT_EMPTY")
+        return [f"Remote directory is not empty ({sample}{' ...' if len(lines) > 5 else ''}): {remote_dir}. "
+                "bootstrap only clones into an empty directory; it never overwrites existing files."]
+    return [f"Remote bootstrap preflight failed (exit={rc}): {stderr.strip() or stdout.strip()}"]
+
+
+BOOTSTRAP_STEPS_SCRIPT_TEMPLATE = """\
+set -e
+remote_dir={remote_dir_q}
+git clone --branch {branch_q} {bundle_path_q} "$remote_dir"
+git -C "$remote_dir" remote remove origin
+echo "BOOTSTRAP_CLONED"
+"""
+
+
+def build_bootstrap_script(remote_dir, bundle_path, branch):
+    return BOOTSTRAP_STEPS_SCRIPT_TEMPLATE.format(
+        remote_dir_q=_quote(remote_dir),
+        bundle_path_q=_quote(bundle_path),
+        branch_q=_quote(branch),
+    )
+
+
+def bootstrap_local_issues(config, branch):
+    """Extra local checks that only matter for bootstrap."""
+    issues = []
+    if branch == "HEAD":
+        issues.append("Detached HEAD: check out a branch before bootstrap.")
+    if config.expected_branch and branch != config.expected_branch:
+        issues.append(
+            f"Local branch is {branch!r}, but expected_branch is {config.expected_branch!r}."
+        )
+    return issues
+
+
+def preflight_bootstrap_remote(config):
+    stdout, stderr, rc = ssh_run_script(config, build_bootstrap_preflight_script(config.remote_repo_dir))
+    return parse_bootstrap_preflight(stdout, stderr, rc, config.remote_repo_dir)
+
+
+def do_bootstrap(config, branch):
+    """Clone the local branch into the (empty) remote directory. Returns status dict."""
+    repo = config.repo_root
+    deploy_id = _make_deployment_id()
+    local_head = git_head(repo)
+    bundle_dir = tempfile.mkdtemp(prefix="push-to-server-")
+    bundle_path = os.path.join(bundle_dir, f"{deploy_id}.bundle")
+    remote_bundle_path = f"/tmp/push-to-server-{deploy_id}.bundle"
+
+    status = {
+        "deployment_id": deploy_id,
+        "mode": "bootstrap",
+        "local_head": local_head,
+        "status": STATUS_DEPLOY_FAILED,
+        "remote_head_after": None,
+        "errors": [],
+        "warnings": [],
+        "next_step": None,
+    }
+
+    try:
+        git_create_bundle(repo, bundle_path, branch)
+        try:
+            scp_upload(config, bundle_path, remote_bundle_path)
+        except SafePushError as e:
+            status["errors"].append(f"Bundle upload failed: {e}")
+            return status
+
+        script = build_bootstrap_script(config.remote_repo_dir, remote_bundle_path, branch)
+        stdout, stderr, rc = ssh_run_script(config, script)
+        if rc != 0 or "BOOTSTRAP_CLONED" not in stdout:
+            detail = stderr.strip() or stdout.strip()[-500:]
+            status["errors"].append(f"Bootstrap clone failed (exit={rc}): {detail}")
+            status["warnings"].append(
+                "Check the remote directory state before retrying; it must be empty for bootstrap."
+            )
+            return status
+
+        try:
+            status["remote_head_after"] = _read_remote_head(config)
+        except DeployError as e:
+            status["errors"].append(str(e))
+            return status
+        if status["remote_head_after"] != local_head:
+            status["errors"].append(
+                f"Remote HEAD {status['remote_head_after']} does not match local HEAD {local_head}."
+            )
+            return status
+
+        if config.post_sync_script:
+            ok, err = _run_post_sync(config, deploy_id, None, local_head, None)
+            if not ok:
+                status["status"] = STATUS_CODE_UPDATED_UNVERIFIED
+                status["errors"].append(err)
+                status["errors"].append("Code cloned but post-sync failed; fix and rerun the script on the remote.")
+                return status
+
+        if config.health_checks:
+            ok, hc_errors = _run_health_checks(config)
+            if not ok:
+                status["status"] = STATUS_CODE_UPDATED_UNVERIFIED
+                status["errors"].extend(hc_errors)
+                status["errors"].append("Code cloned but health checks failed.")
+                return status
+
+        status["status"] = STATUS_VERIFIED
+        status["next_step"] = BOOTSTRAP_NEXT_STEP
+        return status
+
+    finally:
+        try:
+            ssh_run_command(config, "rm -f " + _quote(remote_bundle_path))
+        except Exception:
+            status["warnings"].append(f"Warning: could not clean up remote bundle ({remote_bundle_path})")
+        try:
+            os.unlink(bundle_path)
+            os.rmdir(bundle_dir)
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 def cmd_preflight(args):
@@ -1196,6 +1351,57 @@ def cmd_deploy(args):
     return 0 if deploy_result["status"] == STATUS_VERIFIED else 1
 
 
+def cmd_bootstrap(args):
+    """Handle 'bootstrap' subcommand."""
+    try:
+        config_path = resolve_config_path(args.repo, args.config)
+        config = load_config(config_path, repo_root=args.repo)
+    except (ConfigError, OSError, UnicodeError, json.JSONDecodeError) as e:
+        _output({"status": STATUS_PREFLIGHT_FAILED, "errors": [str(e)]}, args.json)
+        return 1
+
+    try:
+        local_result = preflight_local(config)
+    except PreflightError as e:
+        _output({"status": STATUS_PREFLIGHT_FAILED, "errors": [str(e)]}, args.json)
+        return 1
+    if isinstance(local_result, tuple):
+        issues, local_head, branch = local_result
+        issues = list(issues) + bootstrap_local_issues(config, branch)
+    else:
+        issues, local_head, branch = local_result, None, None
+    if issues:
+        _output({"status": STATUS_PREFLIGHT_FAILED, "errors": issues}, args.json)
+        return 1
+
+    try:
+        remote_errors = preflight_bootstrap_remote(config)
+    except (SafePushError, OSError) as e:
+        remote_errors = [f"Remote preflight error: {e}"]
+    if remote_errors:
+        _output({"status": STATUS_PREFLIGHT_FAILED, "errors": remote_errors}, args.json)
+        return 1
+
+    if not args.execute:
+        _output({
+            "status": "dry_run",
+            "mode": "bootstrap",
+            "message": "Preflight passed: remote directory is an empty, writable non-git directory. "
+                       "Use --execute to bootstrap.",
+            "local_head": local_head,
+        }, args.json)
+        return 0
+
+    try:
+        result = do_bootstrap(config, branch)
+    except (SafePushError, OSError) as e:
+        result = {"status": STATUS_DEPLOY_FAILED, "errors": [f"Bootstrap error: {e}"]}
+        _output(result, args.json)
+        return 1
+    _output(result, args.json)
+    return 0 if result["status"] == STATUS_VERIFIED else 1
+
+
 def _output(data, use_json):
     if use_json:
         print(json.dumps(data, indent=2, ensure_ascii=False))
@@ -1215,6 +1421,10 @@ def _output(data, use_json):
             print(f"Remote HEAD (before): {data['remote_head_before']}")
         if "remote_head_after" in data:
             print(f"Remote HEAD (after): {data['remote_head_after']}")
+        if data.get("message"):
+            print(data["message"])
+        if data.get("next_step"):
+            print(f"Next: {data['next_step']}")
 
 
 def main():
@@ -1237,6 +1447,12 @@ def main():
     p_dep.add_argument("--execute", action="store_true", help="Actually write to remote")
     p_dep.add_argument("--json", action="store_true", help="JSON output")
 
+    p_boot = sub.add_parser("bootstrap", help="First deployment: clone into an empty remote directory")
+    p_boot.add_argument("--repo", required=True, help="Local repository path")
+    p_boot.add_argument("--config", help="Config JSON path (defaults to saved or project config)")
+    p_boot.add_argument("--execute", action="store_true", help="Actually write to remote")
+    p_boot.add_argument("--json", action="store_true", help="JSON output")
+
     p_save = sub.add_parser("config-save", help="Validate and save a per-repository config")
     p_save.add_argument("--repo", required=True, help="Local repository path")
     p_save.add_argument("--config", required=True, help="Source config JSON path")
@@ -1249,6 +1465,8 @@ def main():
             sys.exit(cmd_preflight(parsed))
         elif parsed.command == "deploy":
             sys.exit(cmd_deploy(parsed))
+        elif parsed.command == "bootstrap":
+            sys.exit(cmd_bootstrap(parsed))
         elif parsed.command == "config-save":
             path = save_config(parsed.repo, parsed.config, replace=parsed.replace)
             print(f"Saved config: {path}")

@@ -7,7 +7,11 @@ description: >-
   Works via SSH (git bundle, rsync, git archive + scp). Preserves runtime data
   (config, uploads, DB) by default unless the user explicitly asks to replace
   them. If the server is unreachable or connection details are missing, stop
-  and request them before continuing.
+  and request them before continuing. Also covers shared /srv servers: an agent
+  requesting deploy access for a project (generate key, write the access
+  request, first deploy from received access info) and the server admin's agent
+  approving it (create project account, grant key, produce access info), plus
+  the root management panel.
 ---
 
 # Push To Server
@@ -60,11 +64,8 @@ Deploy projects under `/srv/<project>/`. The script rejects every path under
   `remote_repo_dir` to the absolute `repo/` path. Respect existing layouts and
   deployment accounts; this is a recommendation, not authorization to create
   directories or migrate existing services.
-- On a server shared by several people or agents, give each project its own
-  Linux account and SSH key with `scripts/srv_project.sh`, and install the
-  root management panel before creating the first project. See
-  [`references/project-accounts.md`](references/project-accounts.md) and
-  [`references/srv-panel.md`](references/srv-panel.md).
+- On a server shared by several people or agents, follow the shared-server
+  onboarding below: one Linux account and SSH key per project.
 - Keep credentials and persistent data outside tracked code. Reference sibling
   `config/` and `data/` directories explicitly from Compose or service scripts;
   account for their paths and permissions. `runtime_paths` accepts only paths
@@ -74,17 +75,33 @@ Deploy projects under `/srv/<project>/`. The script rejects every path under
   stop commands, health check and data-backup procedure in project deployment
   instructions; check for port conflicts before exposing a new service.
   Use Compose or systemd as appropriate for restart behavior and bounded logs.
-- First-time repository/service provisioning is separate from this tool's
-  update transaction. It requires its own authorized workflow; the deploy
-  command neither initializes a remote Git repository nor allocates ports.
-  Once provisioned, register the project config, run remote preflight, deploy,
-  and verify the application using tracked health scripts. Connect it to an
-  existing service monitor when appropriate and authorized.
+- First-time code delivery into an empty, existing `repo/` uses `bootstrap`;
+  `deploy` only updates an existing Git repository. Neither command creates
+  directories, accounts or ports. Once bootstrapped, register the project
+  config, run remote preflight, deploy, and verify the application using
+  tracked health scripts.
 - Code backup refs and rollback cover tracked code only. Back up databases
   with their application-specific tools before migrations; choose data
   retention and an off-server backup destination separately. Never let a
   post-sync script overwrite configuration, delete data, or remove volumes
   merely to update code.
+
+### Shared `/srv` Server Onboarding
+
+Agents run the whole onboarding; humans only forward messages, approve, and
+change the application password. Read
+[`references/project-accounts.md`](references/project-accounts.md) before any
+step and act only in your own role:
+
+| Phase | Who | What |
+|---|---|---|
+| 0. Server setup (once) | Server admin, in their own terminal | Install `srv-project` with `--delegate <admin>`, then the root panel ([`references/srv-panel.md`](references/srv-panel.md)); admin completes the panel's first login. The panel comes before the first project. |
+| 1. Request | Requester's agent | Generate a per-project ed25519 key, build the access request (project, port, runtime, public key, fingerprint) for the user to forward. |
+| 2. Approve | Admin's agent | Restate the request, wait for the admin's explicit approval, then `sudo -n srv-project create`, `grant -` and `info`; hand the `info` output to the admin to forward. |
+| 3. First deploy | Requester's agent | SSH alias, `config-save`, `bootstrap`, runtime, `config/.env` with random secrets, systemd user service, post-sync/health scripts, then deliver URL and initial password to its user. |
+
+Never collect or type sudo passwords, never send private keys, and never
+relay application passwords between the two sides.
 
 ---
 
@@ -108,9 +125,13 @@ python <SKILL_DIR>/scripts/safe_push.py deploy --repo /path/to/repo
 
 # Execute deploy (requires --execute flag)
 python <SKILL_DIR>/scripts/safe_push.py deploy --repo /path/to/repo --execute
+
+# First delivery into an empty remote repo/ directory (dry-run, then --execute)
+python <SKILL_DIR>/scripts/safe_push.py bootstrap --repo /path/to/repo
+python <SKILL_DIR>/scripts/safe_push.py bootstrap --repo /path/to/repo --execute
 ```
 
-Use `--config <path>` on `preflight` or `deploy` to override discovery. Explicit relative paths resolve from the current working directory. To replace a different saved config, pass `--replace`; the prior file is atomically preserved as `<hash>.json.bak`, replacing the previous backup.
+Use `--config <path>` on `preflight`, `deploy` or `bootstrap` to override discovery. Explicit relative paths resolve from the current working directory. To replace a different saved config, pass `--replace`; the prior file is atomically preserved as `<hash>.json.bak`, replacing the previous backup.
 
 ---
 
@@ -155,11 +176,12 @@ Deploy **will not proceed** if any check fails:
 - **No passwords**: Never prompt for, read, or store passwords.
 - **No host key auto-accept**: `Permission denied` or `Host key verification failed`
   stops immediately. User handles externally.
-- **No remote init**: If remote directory is not a git repo, block and point to
-  `references/fallback-sync.md`.
+- **No remote init beyond bootstrap**: `deploy` blocks when the remote directory
+  is not a git repo. `bootstrap` only clones into an existing, empty directory;
+  for anything else point to `references/fallback-sync.md`.
 - **No `authorized_keys` or `known_hosts` edits**. Server access for project
-  accounts is granted by the server's root with `srv_project.sh`, outside the
-  deploy tool.
+  accounts is granted with `srv_project.sh` by the server admin (or the admin's
+  agent after explicit approval), outside the deploy tool.
 
 ---
 

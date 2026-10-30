@@ -1,6 +1,7 @@
 import importlib.util
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 SCRIPT = Path(__file__).resolve().parents[1] / "skills" / "push-to-server" / "panel" / "srv_panel.py"
 SPEC = importlib.util.spec_from_file_location("srv_panel_under_test", SCRIPT)
@@ -386,6 +387,27 @@ class UserStoreTests(unittest.TestCase):
         Path(self.users).write_text('{"users": {"BAD": {"role": "x", "hash": "h"}}}', encoding="utf-8")
         with self.assertRaises(panel.UserError):
             panel.load_users_file(self.users)
+
+
+class DeleteActionTests(unittest.TestCase):
+    def test_delete_args(self):
+        with patch.object(panel, "registered_names", return_value={"demo"}):
+            _, params, args, _ = panel.build_action({"action": "delete", "project": "demo"})
+            self.assertEqual(args[1:], ["delete", "demo"])
+            self.assertFalse(params["purge"])
+            _, params, args, _ = panel.build_action({"action": "delete", "project": "demo", "purge": "1"})
+            self.assertEqual(args[1:], ["delete", "demo", "--purge"])
+            with self.assertRaises(ValueError):
+                panel.build_action({"action": "delete", "project": "other"})
+
+    def test_delete_needs_confirmation(self):
+        self.assertIn("delete", panel.CONFIRM_ACTIONS)
+
+    def test_confirm_page_warns_on_purge(self):
+        html = panel.render_confirm({"action": "delete", "project": "demo", "purge": "1"}, "tok")
+        self.assertIn("彻底删除", html)
+        self.assertIn('name="purge" value="1"', html)
+        self.assertIn("归档", panel.render_confirm({"action": "delete", "project": "demo"}, "tok"))
 
 
 if __name__ == "__main__":

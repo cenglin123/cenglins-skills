@@ -5,12 +5,15 @@
 # 无 sudo、无密码登录、无端口转发；可以用 systemctl --user 管理自己的服务（已开 linger）。
 # 授权公钥集中存放在 root 所有的 /etc/ssh/srv-keys/<账号>，项目账号自己改不了。
 #
-#   install                                   一次性：建组、公钥目录、sshd 规则
+#   install [--delegate <用户>]...            一次性：建组、公钥目录、sshd 规则；--delegate 让该用户免密 sudo 本脚本
+#   undelegate <用户>                         取消委托
 #   create <项目> --port <端口> [--contact <联系人>]
 #   grant  <项目> <公钥文件|-> --label <标签> [--from <来源地址>]
 #   revoke <项目> <标签|SHA256:指纹>
 #   disable <项目>                            停用：禁止登录、停掉该账号全部进程与服务
 #   enable  <项目>                            启用：恢复登录，已 enable 的用户服务随之启动
+#   info    <项目> [--host <服务器地址>]      打印可转发给申请方的接入信息（不含密钥内容与密码）
+#   delete  <项目> [--purge]                  删除已停用的项目：删账号、公钥、登记；目录归档到 /srv/.archived（--purge 直接删除）
 #   list
 set -euo pipefail
 
@@ -19,6 +22,9 @@ SRV_ROOT=/srv
 KEYS_DIR=/etc/ssh/srv-keys
 SSHD_DROPIN=/etc/ssh/sshd_config.d/60-srv-projects.conf
 REGISTRY=$SRV_ROOT/PROJECTS.tsv
+SUDOERS=/etc/sudoers.d/srv-project
+ARCHIVE_DIR=$SRV_ROOT/.archived
+SELF=/usr/local/sbin/srv-project
 
 die() { echo "错误：$*" >&2; exit 1; }
 need_root() { [ "$(id -u)" -eq 0 ] || die "需要 root：sudo $0 $*"; }
@@ -35,7 +41,67 @@ reload_sshd() {
     systemctl try-reload-or-restart ssh 2>/dev/null || systemctl try-reload-or-restart sshd
 }
 
+# ── sudo 委托：让指定的普通账号免密执行本脚本（且仅本脚本）
+delegates_of() {
+    [ -f "$SUDOERS" ] || return 0
+    awk -v self="$SELF" '$2 == "ALL=(root)" && $3 == "NOPASSWD:" && $4 == self {print $1}' "$SUDOERS"
+}
+
+write_sudoers() {   # 参数：委托用户列表（可为空，空则删除文件）
+    if [ $# -eq 0 ]; then rm -f "$SUDOERS"; return; fi
+    command -v visudo >/dev/null || die "没有 visudo，先安装 sudo 包"
+    local tmp u
+    tmp=$(mktemp)
+    {
+        echo "# 由 srv_project.sh 管理：下列账号可免密执行 $SELF"
+        for u in "$@"; do printf '%s ALL=(root) NOPASSWD: %s\n' "$u" "$SELF"; done
+    } >"$tmp"
+    if ! visudo -cf "$tmp" >/dev/null; then rm -f "$tmp"; die "sudoers 校验失败，未改动"; fi
+    install -d -o root -g root -m 755 "$(dirname "$SUDOERS")"
+    install -o root -g root -m 440 "$tmp" "$SUDOERS.new"
+    mv -f "$SUDOERS.new" "$SUDOERS"
+    rm -f "$tmp"
+}
+
+check_delegates() {
+    local u
+    for u in "$@"; do
+        [[ "$u" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || die "用户名格式不对：$u"
+        [ "$u" != root ] || die "root 不需要委托"
+        id "$u" >/dev/null 2>&1 || die "用户 $u 不存在"
+        ! is_project "$u" || die "$u 是 $GROUP 项目账号，不能作为委托用户"
+    done
+}
+
+cmd_delegate() {
+    local u cur=()
+    check_delegates "$@"
+    while IFS= read -r u; do [ -z "$u" ] || cur+=("$u"); done < <(delegates_of)
+    for u in "$@"; do
+        printf '%s\n' ${cur[@]+"${cur[@]}"} | grep -qx "$u" || cur+=("$u")
+    done
+    write_sudoers "${cur[@]}"
+    echo "已委托（sudo 免密执行 $SELF）：${cur[*]}"
+}
+
+cmd_undelegate() {
+    local u=${1:-} cur=() x
+    [ -n "$u" ] || die "用法：undelegate <用户>"
+    delegates_of | grep -qx "$u" || die "$u 不在委托名单里"
+    while IFS= read -r x; do [ -z "$x" ] || [ "$x" = "$u" ] || cur+=("$x"); done < <(delegates_of)
+    write_sudoers ${cur[@]+"${cur[@]}"}
+    echo "已取消委托：$u"
+}
+
 cmd_install() {
+    local delegates=()
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --delegate) [ -n "${2:-}" ] || die "--delegate 需要用户名"; delegates+=("$2"); shift 2 ;;
+            *) die "未知参数：$1" ;;
+        esac
+    done
+    check_delegates ${delegates[@]+"${delegates[@]}"}
     groupadd -f "$GROUP"
     install -d -o root -g root -m 755 "$KEYS_DIR"
     cat >"$SSHD_DROPIN" <<EOF
@@ -56,6 +122,7 @@ EOF
     reload_sshd
     echo "已安装：组 $GROUP、$KEYS_DIR、$SSHD_DROPIN、$REGISTRY"
     check_srv_perms
+    if [ ${#delegates[@]} -gt 0 ]; then cmd_delegate "${delegates[@]}"; fi
 }
 
 check_srv_perms() {
@@ -122,7 +189,14 @@ cmd_grant() {
 
     tmp=$(mktemp)
     trap 'rm -f "$tmp"' EXIT
-    if [ "$src" = - ]; then cat >"$tmp"; else cat -- "$src" >"$tmp"; fi
+    if [ "$src" = - ]; then
+        cat >"$tmp"
+    elif [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
+        # 经 sudo 调用：只能读调用者自己读得到的文件，错误里不带任何文件内容
+        runuser -u "$SUDO_USER" -- cat -- "$src" >"$tmp" 2>/dev/null || die "无法以 $SUDO_USER 身份读取 $src"
+    else
+        cat -- "$src" >"$tmp"
+    fi
     grep -q "PRIVATE KEY" "$tmp" && die "给的是私钥。只接受公钥（.pub），私钥请对方自己保管"
     [ "$(grep -cv '^[[:space:]]*$' "$tmp")" -eq 1 ] || die "公钥文件应当只有一行"
     fp=$(ssh-keygen -lf "$tmp" | awk '{print $2}') || die "不是有效的 SSH 公钥"
@@ -208,6 +282,100 @@ cmd_list() {
         keys_of "$name" | sed 's/^/  公钥 /'
     done <"$REGISTRY"
     check_srv_perms
+    local d
+    d=$(delegates_of | tr '\n' ' ')
+    echo "委托用户（sudo 免密）：${d:-无}"
+}
+
+cmd_info() {
+    local name=${1:-} host="" port ssh_port acct_state f line from fp label
+    [ -n "$name" ] || die "用法：info <项目> [--host <服务器地址>]"
+    shift
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --host) host=${2:-}; shift 2 ;;
+            *) die "未知参数：$1" ;;
+        esac
+    done
+    valid_name "$name"
+    need_installed
+    is_project "$name" || die "$name 不是 $GROUP 项目账号"
+    [[ -z "$host" || "$host" =~ ^[0-9A-Za-z._:-]+$ ]] || die "--host 格式不对：$host"
+    if [ -z "$host" ]; then
+        host=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "src") {print $(i + 1); exit}}') || true
+        host=${host:-"<服务器地址>"}
+    fi
+    ssh_port=$(sshd -T 2>/dev/null | awk '$1 == "port" {print $2; exit}') || true
+    ssh_port=${ssh_port:-22}
+    port=$(awk -F'\t' -v n="$name" '$1 == n {print $2; exit}' "$REGISTRY")
+    if is_disabled "$name"; then acct_state=停用; else acct_state=启用; fi
+    echo "===== 接入信息：$name ====="
+    echo "服务器地址：$host"
+    echo "SSH 端口：$ssh_port"
+    echo "SSH 账号：$name（仅密钥登录，无 sudo）"
+    echo "项目目录：$SRV_ROOT/$name"
+    echo "  repo/     代码目录（push-to-server 配置的 remote_repo_dir 填 $SRV_ROOT/$name/repo）"
+    echo "  config/   配置与密钥，不进 Git"
+    echo "  data/     数据库、上传文件等持久数据"
+    echo "  backups/  数据备份"
+    echo "登记端口：${port:--}"
+    echo "状态：$acct_state"
+    echo "已授权公钥："
+    f=$KEYS_DIR/$name
+    if [ -s "$f" ]; then
+        while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            fp=$(ssh-keygen -lf - <<<"$line" | awk '{print $2}')
+            label=${line##* }
+            from=$(sed -n 's/^.*from="\([^"]*\)".*$/\1/p' <<<"${line%% ssh-*}")
+            echo "  标签 $label  指纹 $fp${from:+  仅限来源 $from}"
+        done <"$f"
+    else
+        echo "  （暂无）"
+    fi
+    echo "请用 push-to-server 技能的 /srv 接入流程完成首次部署；应用初始密码由你的 agent 生成在 config/.env"
+}
+
+cmd_delete() {
+    local name=${1:-} purge=0 uid n dest tmp
+    [ -n "$name" ] || die "用法：delete <项目> [--purge]"
+    shift
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --purge) purge=1; shift ;;
+            *) die "未知参数：$1" ;;
+        esac
+    done
+    valid_name "$name"
+    need_installed
+    is_project "$name" || die "$name 不是 $GROUP 项目账号"
+    is_disabled "$name" || die "项目 $name 尚未停用，请先 disable"
+    n=$(pgrep -c -u "$name" 2>/dev/null || true)
+    [ "${n:-0}" -eq 0 ] || die "账号 $name 仍有 $n 个进程在运行，拒绝删除"
+    [ "$(getent passwd "$name" | cut -d: -f6)" = "$SRV_ROOT/$name" ] || die "$name 的家目录不是 $SRV_ROOT/$name，拒绝删除"
+    uid=$(id -u "$name")
+
+    loginctl disable-linger "$name" 2>/dev/null || true
+    rm -f "/var/lib/systemd/linger/$name"
+    systemctl stop "user@$uid.service" 2>/dev/null || true
+    userdel "$name" 2>/dev/null || die "userdel $name 失败，未做其他改动"
+    if getent group "$name" >/dev/null; then groupdel "$name" 2>/dev/null || true; fi
+    rm -f "$KEYS_DIR/$name"
+    tmp=$(mktemp)
+    awk -F'\t' -v n="$name" '$1 != n' "$REGISTRY" >"$tmp"
+    cat "$tmp" >"$REGISTRY"
+    rm -f "$tmp"
+
+    if [ "$purge" -eq 1 ]; then
+        rm -rf --one-file-system -- "${SRV_ROOT:?}/$name"
+        echo "已删除项目 $name：账号、公钥、登记表条目和目录 $SRV_ROOT/$name 均已清除"
+    else
+        install -d -o root -g root -m 700 "$ARCHIVE_DIR"
+        dest=$ARCHIVE_DIR/$name-$(date +%Y%m%d-%H%M%S)
+        mv -- "$SRV_ROOT/$name" "$dest"
+        chown -R root:root "$dest"
+        echo "已删除项目 $name：账号、公钥、登记表条目已清除；目录已归档到 $dest（属主 root，需要时手动处理）"
+    fi
 }
 
 need_root "$@"
@@ -219,5 +387,8 @@ case ${1:-} in
     disable) shift; cmd_disable "$@" ;;
     enable) shift; cmd_enable "$@" ;;
     list) shift; cmd_list "$@" ;;
-    *) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+    info) shift; cmd_info "$@" ;;
+    delete) shift; cmd_delete "$@" ;;
+    undelegate) shift; cmd_undelegate "$@" ;;
+    *) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac
