@@ -57,6 +57,17 @@ scp /tmp/seed.bundle <项目>@<主机>:/tmp/seed.bundle
 ssh <项目>@<主机> 'git clone /tmp/seed.bundle ~/repo && rm /tmp/seed.bundle'
 ```
 
+运行时由项目账号自己装在家目录，不依赖管理员或其它账号的安装。以 Node 为例（版本按项目要求，`linux-x64` 按服务器架构）：
+
+```bash
+V=v22.23.3
+curl -fL https://npmmirror.com/mirrors/node/$V/node-$V-linux-x64.tar.xz | tar -xJ -C ~/.local
+ln -sfn ~/.local/node-$V-linux-x64 ~/.local/node
+grep -q '.local/node/bin' ~/.profile || echo 'export PATH="$HOME/.local/node/bin:$PATH"' >> ~/.profile
+```
+
+服务器要走代理才能访问 GitHub 时，`npm ci` 前设置 `https_proxy`。像 `better-sqlite3` 这类原生模块，预编译包要从 GitHub 下载，不设代理就会退回到本地编译。
+
 再在本地登记配置（`remote_repo_dir` 填 `/srv/<项目>/repo`，`user` 填项目账号），以后每次用 `preflight --remote`、`deploy --execute` 推送。
 
 服务用 systemd 用户单元，放在 `~/.config/systemd/user/<服务>.service`。配置和数据引用同级的 `config/`、`data/`：

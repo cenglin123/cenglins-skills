@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""srv_panel.py — /srv 项目管理面板（仅 root 使用）。
+"""srv_panel.py — /srv 项目管理面板（仅 root 运行）。
 
 单文件、只用 Python 标准库的服务端渲染网页，管理 srv-project 创建的项目账号。
 所有变更操作都以参数列表调用 /usr/local/sbin/srv-project，不经 shell。
+账号密码登录（scrypt），首个账号 admin 凭安装时生成的初始密码登录并强制改密。
 
-    python3 srv_panel.py [--bind 127.0.0.1] [--port 9300] [--allow-remote]
-                         [--allowed-host 主机名 ...] [--token-file /etc/srv-panel/token]
+    python3 srv_panel.py [--bind 127.0.0.1]... [--port 9300] [--allow-remote]
+                         [--tls-cert 证书 --tls-key 私钥] [--allow-from CIDR]...
+                         [--allowed-host 主机名或IP]... [--users-file /etc/srv-panel/users.json]
                          [--log-file /var/log/srv-panel.log]
+    python3 srv_panel.py --bootstrap | --reset-admin     （安装脚本调用）
 
-纯函数（解析、校验、比较）可直接 import 测试；导入时不检查 root、不启动服务。
+纯函数（解析、校验、密码、限流）可直接 import 测试；导入时不检查 root、不启动服务。
 """
 import argparse
 import hashlib
@@ -20,7 +23,9 @@ import json
 import os
 import re
 import secrets
+import socket
 import socketserver
+import ssl
 import stat
 import subprocess
 import sys
@@ -35,7 +40,8 @@ REGISTRY = "/srv/PROJECTS.tsv"
 KEYS_DIR = "/etc/ssh/srv-keys"
 SSHD_DROPIN = "/etc/ssh/sshd_config.d/60-srv-projects.conf"
 GROUP = "srvproj"
-TOKEN_FILE = "/etc/srv-panel/token"
+USERS_FILE = "/etc/srv-panel/users.json"
+INITIAL_PW_FILE = "/etc/srv-panel/initial-password"
 LOG_FILE = "/var/log/srv-panel.log"
 COOKIE = "srvpanel"
 SESSION_TTL = 8 * 3600
@@ -519,6 +525,315 @@ def project_env(name):
     return tools, env_findings(tools, decl), decl
 
 
+# ───────────────────────── 账号、密码、限流、来源控制 ─────────────────────────
+
+USERNAME_RE = re.compile(r"^[a-z][a-z0-9_.-]{1,31}$")
+MIN_PW_LEN = 12
+SCRYPT_N, SCRYPT_R, SCRYPT_P = 2 ** 14, 8, 1
+PW_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789"
+
+
+class UserError(ValueError):
+    """用户库操作的中文错误。"""
+
+
+def valid_username(name):
+    return isinstance(name, str) and USERNAME_RE.fullmatch(name) is not None
+
+
+def generate_password(length=16):
+    return "".join(secrets.choice(PW_ALPHABET) for _ in range(length))
+
+
+def hash_password(password, salt=None, n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P):
+    """scrypt，每次调用单独加盐。格式 scrypt$N$r$p$盐(hex)$哈希(hex)。"""
+    salt = salt if salt is not None else os.urandom(16)
+    dk = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=n, r=r, p=p, maxmem=128 * 1024 * 1024, dklen=32)
+    return "scrypt$%d$%d$%d$%s$%s" % (n, r, p, salt.hex(), dk.hex())
+
+
+def verify_password(password, stored):
+    """常量时间比较；存储串格式不对一律返回 False。"""
+    try:
+        algo, n, r, p, salt, want = stored.split("$")
+        if algo != "scrypt":
+            return False
+        want_b = bytes.fromhex(want)
+        dk = hashlib.scrypt(password.encode("utf-8"), salt=bytes.fromhex(salt), n=int(n), r=int(r), p=int(p),
+                            maxmem=128 * 1024 * 1024, dklen=len(want_b))
+    except (ValueError, AttributeError, TypeError):
+        return False
+    return hmac.compare_digest(dk, want_b)
+
+
+_dummy_hash = []
+
+
+def dummy_hash():
+    """用户不存在时也做一次同样代价的校验，让「用户不存在」和「密码错」不可区分。"""
+    if not _dummy_hash:
+        _dummy_hash.append(hash_password(secrets.token_hex(8)))
+    return _dummy_hash[0]
+
+
+def password_problem(new, username, current_hash=None):
+    """新密码不合格时返回中文原因，否则 None。current_hash 非空时，新密码不能与当前密码（含初始密码）相同。"""
+    if len(new) < MIN_PW_LEN:
+        return "新密码至少 %d 位" % MIN_PW_LEN
+    if len(new) > 128:
+        return "新密码不超过 128 位"
+    if new == username:
+        return "新密码不能与用户名相同"
+    if current_hash and verify_password(new, current_hash):
+        return "新密码不能与当前密码（或初始密码）相同"
+    return None
+
+
+def delete_problem(users, actor, target):
+    """删除用户的规则：目标须存在，不能删自己，不能删最后一个超级管理员。"""
+    if target not in users:
+        return "用户不存在：%s" % target
+    if target == actor:
+        return "不能删除自己"
+    if users[target].get("role") == "super" and sum(1 for u in users.values() if u.get("role") == "super") <= 1:
+        return "不能删除最后一个超级管理员"
+    return None
+
+
+def write_file_atomic(path, text, mode=0o600):
+    """先写同目录临时文件再 rename；文件从创建起就是 mode 权限。"""
+    tmp = "%s.tmp.%d.%s" % (path, os.getpid(), secrets.token_hex(4))
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def load_users_file(path):
+    """读用户库，返回 {用户名: {hash, role, must_change, created}}；文件不存在返回 {}；损坏抛 UserError。"""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as e:
+        raise UserError("用户库读取失败：%s" % e)
+    users = data.get("users") if isinstance(data, dict) else None
+    if not isinstance(users, dict):
+        raise UserError("用户库格式不对")
+    for name, u in users.items():
+        if not valid_username(name) or not isinstance(u, dict) or u.get("role") not in ("super", "admin") \
+                or not isinstance(u.get("hash"), str):
+            raise UserError("用户库里的条目不合法：%s" % name)
+    return users
+
+
+def dump_users(users):
+    return json.dumps({"version": 1, "users": users}, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+
+
+class UserStore:
+    """用户库。每次访问先检查文件是否被外部改过（如 --reset-admin），改过就重读。"""
+
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.RLock()
+        self.users = {}
+        self._sig = None
+        self._refresh()
+
+    def _signature(self):
+        try:
+            st = os.stat(self.path)
+            return (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return None
+
+    def _refresh(self):
+        sig = self._signature()
+        if sig != self._sig or self._sig is None:
+            self.users = load_users_file(self.path)
+            self._sig = sig
+
+    def _save(self):
+        write_file_atomic(self.path, dump_users(self.users))
+        self._sig = self._signature()
+
+    def get(self, name):
+        with self.lock:
+            self._refresh()
+            u = self.users.get(name)
+            return dict(u) if u else None
+
+    def names(self):
+        with self.lock:
+            self._refresh()
+            return sorted(self.users)
+
+    def snapshot(self):
+        with self.lock:
+            self._refresh()
+            return {k: dict(v) for k, v in self.users.items()}
+
+    def authenticate(self, name, password):
+        u = self.get(name) if valid_username(name) else None
+        ok = verify_password(password, u["hash"] if u else dummy_hash())
+        return bool(u) and ok
+
+    def set_password(self, name, new, must_change=False):
+        with self.lock:
+            self._refresh()
+            if name not in self.users:
+                raise UserError("用户不存在：%s" % name)
+            self.users[name]["hash"] = hash_password(new)
+            self.users[name]["must_change"] = must_change
+            self._save()
+
+    def create(self, name, role="admin"):
+        """新建用户，返回一次性初始密码。"""
+        if not valid_username(name):
+            raise UserError("用户名须以小写字母开头，只含小写字母、数字、. _ -，2–32 位")
+        with self.lock:
+            self._refresh()
+            if name in self.users:
+                raise UserError("用户已存在：%s" % name)
+            pw = generate_password()
+            self.users[name] = {"hash": hash_password(pw), "role": role, "must_change": True,
+                                "created": time.strftime("%Y-%m-%d %H:%M:%S")}
+            self._save()
+            return pw
+
+    def reset(self, name):
+        """重置密码，返回一次性初始密码，并强制下次改密。"""
+        with self.lock:
+            self._refresh()
+            if name not in self.users:
+                raise UserError("用户不存在：%s" % name)
+            pw = generate_password()
+            self.users[name]["hash"] = hash_password(pw)
+            self.users[name]["must_change"] = True
+            self._save()
+            return pw
+
+    def delete(self, actor, name):
+        with self.lock:
+            self._refresh()
+            problem = delete_problem(self.users, actor, name)
+            if problem:
+                raise UserError(problem)
+            del self.users[name]
+            self._save()
+
+
+def bootstrap_store(users_path, pw_path, reset=False):
+    """首次安装：建 admin（超级管理员，须改密）并把初始密码写入 pw_path。
+    reset=True：admin 存在则换新初始密码并设回须改密；admin 不存在则清空用户库后重建。
+    返回中文说明（不含密码）。"""
+    users = load_users_file(users_path)
+    if users and not reset:
+        return "已有用户库，未改动"
+    pw = generate_password()
+    if reset and "admin" in users:
+        users["admin"].update({"hash": hash_password(pw), "must_change": True, "role": "super"})
+        note = "已重置 admin 的密码并要求下次登录改密"
+    else:
+        users = {"admin": {"hash": hash_password(pw), "role": "super", "must_change": True,
+                           "created": time.strftime("%Y-%m-%d %H:%M:%S")}}
+        note = "已创建超级管理员 admin"
+    write_file_atomic(pw_path, pw + "\n")
+    write_file_atomic(users_path, dump_users(users))
+    return note
+
+
+class RateLimiter:
+    """按来源 IP 计数：窗口内连续失败 max_fail 次则锁定 lock_seconds 秒；成功登录清零。"""
+
+    def __init__(self, max_fail=5, lock_seconds=300, window=900, clock=time.time):
+        self.max_fail, self.lock_seconds, self.window, self.clock = max_fail, lock_seconds, window, clock
+        self.state = {}   # ip -> [失败次数, 最近失败时间, 锁定截止时间]
+        self.mutex = threading.Lock()
+
+    def locked_for(self, ip):
+        with self.mutex:
+            s = self.state.get(ip)
+            left = int(s[2] - self.clock() + 0.999) if s else 0
+            return max(left, 0)
+
+    def record_failure(self, ip):
+        """记一次失败；本次触发锁定返回 True。"""
+        with self.mutex:
+            now = self.clock()
+            for k in [k for k, v in self.state.items() if v[2] < now and now - v[1] > self.window]:
+                del self.state[k]
+            s = self.state.setdefault(ip, [0, now, 0])
+            if now - s[1] > self.window:
+                s[0] = 0
+            s[0] += 1
+            s[1] = now
+            if s[0] >= self.max_fail:
+                s[0], s[2] = 0, now + self.lock_seconds
+                return True
+            return False
+
+    def record_success(self, ip):
+        with self.mutex:
+            self.state.pop(ip, None)
+
+
+def parse_allow_from(items):
+    """CIDR 列表 → 网络对象列表；格式不对抛 ValueError。"""
+    return [ipaddress.ip_network(i.strip(), strict=False) for i in items]
+
+
+def normalize_ip(text):
+    try:
+        ip = ipaddress.ip_address(text.split("%")[0])
+    except (ValueError, AttributeError):
+        return None
+    return ip.ipv4_mapped if getattr(ip, "ipv4_mapped", None) else ip
+
+
+def ip_allowed(text, nets):
+    """名单为空不限制；回环来源（服务器本机）始终放行；其余必须落在某个网段内。"""
+    if not nets:
+        return True
+    ip = normalize_ip(text)
+    if ip is None:
+        return False
+    return ip.is_loopback or any(ip in n for n in nets)
+
+
+def valid_lan_ip(text):
+    """证书 SAN / 监听用的局域网 IPv4：必须是普通单播地址。"""
+    try:
+        ip = ipaddress.IPv4Address(text)
+    except ValueError:
+        return False
+    return not (ip.is_loopback or ip.is_unspecified or ip.is_multicast or ip.is_link_local
+                or ip.is_reserved or str(ip) == "255.255.255.255")
+
+
+def build_san(lan_ip):
+    """openssl subjectAltName 值：局域网 IP + 127.0.0.1 + localhost。"""
+    if not valid_lan_ip(lan_ip):
+        raise ValueError("不是有效的局域网 IPv4 地址：%s" % lan_ip)
+    return "IP:%s,IP:127.0.0.1,DNS:localhost" % lan_ip
+
+
+def needs_password_change(user, path):
+    """must_change 的用户，除改密页与退出外的页面都应重定向到 /password。"""
+    return bool(user and user.get("must_change")) and path not in ("/password", "/logout")
+
+
 # ───────────────────────── 审计与变更操作 ─────────────────────────
 
 _log_lock = threading.Lock()
@@ -627,10 +942,18 @@ form.inline{display:inline}.grid{display:grid;grid-template-columns:repeat(auto-
 
 def page(title, body, csrf=None, flash=""):
     nav = ""
+    u = getattr(_ctx, "user", None)
     if csrf is not None:
-        nav = ('<header><b>/srv 项目管理面板</b><a href="/">总览</a><a href="/global">全局检查</a>'
-               '<a href="/new">新建项目</a><form class="inline" method="post" action="/logout" style="margin-left:auto">'
-               '<input type="hidden" name="csrf" value="%s"><button>退出登录</button></form></header>' % esc(csrf))
+        if u and u.get("must_change"):
+            links = ""
+        else:
+            links = ('<a href="/">总览</a><a href="/global">全局检查</a><a href="/new">新建项目</a>'
+                     + ('<a href="/users">用户管理</a>' if u and u.get("role") == "super" else ""))
+        who = ('<span class="mute">%s（%s）</span><a href="/password">修改密码</a>'
+               % (esc(u["name"]), "超级管理员" if u["role"] == "super" else "管理员")) if u else ""
+        nav = ('<header><b>/srv 项目管理面板</b>%s<span style="margin-left:auto"></span>%s'
+               '<form class="inline" method="post" action="/logout">'
+               '<input type="hidden" name="csrf" value="%s"><button>退出登录</button></form></header>' % (links, who, esc(csrf)))
     return ('<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">'
             '<meta name="viewport" content="width=device-width,initial-scale=1"><title>%s</title>'
             '<style>%s</style></head><body>%s<main>%s%s</main></body></html>'
@@ -656,9 +979,10 @@ def btn_form(csrf, label, cls="", **fields):
 def render_login(csrf, error=""):
     err = '<div class="problem">%s</div>' % esc(error) if error else ""
     return page("登录", '<div class="card" style="max-width:420px;margin:60px auto"><h2>/srv 项目管理面板</h2>%s'
-                '<form method="post" action="/login">%s<p>登录令牌（服务器上 <code>/etc/srv-panel/token</code>）</p>'
-                '<p><input type="password" name="token" autocomplete="off" autofocus></p>'
-                '<button class="primary">登录</button></form></div>' % (err, hidden(csrf)))
+                '<form method="post" action="/login">%s<p>用户名<input type="text" name="username" autocomplete="username" autofocus required></p>'
+                '<p>密码<input type="password" name="password" autocomplete="current-password" required></p>'
+                '<button class="primary">登录</button></form>'
+                '<p class="mute">首次使用：用户名 admin，初始密码在服务器的 /etc/srv-panel/initial-password。</p></div>' % (err, hidden(csrf)))
 
 
 def project_card(p, csrf):
@@ -808,51 +1132,107 @@ CONFIRM_TEXT = {
 }
 
 
-def render_confirm(form, csrf):
+def render_confirm(form, csrf, post_to="/action", texts=None):
     action = form.get("action", "")
     hid = {k: v for k, v in form.items() if k not in ("csrf", "confirmed")}
     detail = "".join("<li>%s：%s</li>" % (esc(k), esc(v)) for k, v in hid.items() if k != "action")
+    text = (texts or CONFIRM_TEXT).get(action, "")
     return page("确认操作", '<h1>请确认</h1><div class="card"><p class="warn"><b>操作：%s</b></p><ul>%s</ul><p>%s</p>'
-                '<form method="post" action="/action">%s<button class="danger">确认执行</button></form>'
+                '<form method="post" action="%s">%s<button class="danger">确认执行</button></form>'
                 '<p><a href="/">取消</a></p></div>'
-                % (esc(action), detail, esc(CONFIRM_TEXT.get(action, "")), hidden(csrf, confirmed="1", **hid)), csrf)
+                % (esc(action), detail, esc(text), esc(post_to), hidden(csrf, confirmed="1", **hid)), csrf)
+
+
+# ───────────────────────── 账号相关页面 ─────────────────────────
+
+def render_password(csrf, user, error="", forced=False):
+    err = '<div class="problem">%s</div>' % esc(error) if error else ""
+    note = ('<p class="warn"><b>首次登录（或密码刚被重置）必须先修改密码，改完才能使用面板。</b></p>' if forced else "")
+    return page("修改密码", '<h1>修改密码</h1><div class="card" style="max-width:480px">%s%s'
+                '<form method="post" action="/password">%s'
+                '<p>当前密码<input type="password" name="old" autocomplete="current-password" required></p>'
+                '<p>新密码（至少 %d 位，不能与当前密码相同）<input type="password" name="new" autocomplete="new-password" required></p>'
+                '<p>再输一次新密码<input type="password" name="confirm" autocomplete="new-password" required></p>'
+                '<button class="primary">修改密码</button></form></div>' % (note, err, hidden(csrf), MIN_PW_LEN), csrf)
+
+
+def render_users(users, me, csrf):
+    rows = ""
+    for name in sorted(users):
+        u = users[name]
+        ops = ""
+        if name != me:
+            ops = ('<form class="inline" method="post" action="/users/action">%s<button>重置密码…</button></form> '
+                   '<form class="inline" method="post" action="/users/action">%s<button class="danger">删除…</button></form>'
+                   % (hidden(csrf, action="reset_user", username=name), hidden(csrf, action="delete_user", username=name)))
+        rows += "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
+            esc(name), "超级管理员" if u.get("role") == "super" else "管理员",
+            tag("须改密", "warn") if u.get("must_change") else tag("正常", "ok"), esc(u.get("created", "")), ops or '<span class="mute">（本人）</span>')
+    return page("用户管理", '<h1>用户管理</h1><div class="card"><table><tr><th>用户名</th><th>角色</th><th>状态</th><th>创建时间</th><th>操作</th></tr>%s</table></div>'
+                '<div class="card"><h2>新建管理员</h2><form method="post" action="/users/action">%s'
+                '<p>用户名（小写字母开头，字母数字 . _ -，2–32 位）<input type="text" name="username" required maxlength="32"></p>'
+                '<p class="mute">系统会生成一次性初始密码，只在结果页显示一次；对方首次登录必须改密。</p>'
+                '<button class="primary">新建</button></form></div>' % (rows, hidden(csrf, action="create_user")), csrf)
+
+
+def render_secret_result(title, text, password, csrf):
+    return page(title, '<h1>%s</h1><div class="card"><p>%s</p><p>初始密码（<b>只显示这一次</b>，请当面或经安全渠道交给对方；对方首次登录须改密）：</p>'
+                '<pre>%s</pre></div><p><a href="/users">返回用户管理</a></p>' % (esc(title), esc(text), esc(password)), csrf)
+
+
+USER_CONFIRM_TEXT = {
+    "reset_user": "重置后该用户的旧密码立即失效，其全部登录会话被注销，并生成新的一次性初始密码。",
+    "delete_user": "删除后该用户立即不能登录，其全部登录会话被注销。",
+}
 
 
 # ───────────────────────── HTTP 服务 ─────────────────────────
 
 class State:
-    def __init__(self, token, port, extra_hosts=(), log_file=LOG_FILE):
-        self.token = token
+    def __init__(self, store, port, extra_hosts=(), log_file=LOG_FILE, allow_nets=(), secure=False,
+                 initial_pw_file=INITIAL_PW_FILE, limiter=None):
+        self.store = store
         self.port = port
         self.extra_hosts = tuple(extra_hosts)
         self.log_file = log_file
+        self.allow_nets = list(allow_nets)
+        self.secure = secure
+        self.initial_pw_file = initial_pw_file
+        self.limiter = limiter or RateLimiter()
         self.secret = secrets.token_bytes(32)
-        self.sessions = {}
-        self.fail_times = []
+        self.sessions = {}            # sid -> (用户名, 过期时间)
+        self.sess_lock = threading.Lock()
+        self.deny_logged = {}
         self.lock = threading.Lock()   # 串行化变更操作
 
-    def new_session(self):
+    def new_session(self, user):
         sid = secrets.token_urlsafe(32)
-        self.sessions[sid] = time.time() + SESSION_TTL
+        with self.sess_lock:
+            self.sessions[sid] = (user, time.time() + SESSION_TTL)
         return sid
 
-    def valid_session(self, sid):
-        exp = self.sessions.get(sid or "")
-        if exp and exp > time.time():
-            return True
-        self.sessions.pop(sid or "", None)
-        return False
+    def session_user(self, sid):
+        with self.sess_lock:
+            s = self.sessions.get(sid or "")
+            if s and s[1] > time.time():
+                return s[0]
+            self.sessions.pop(sid or "", None)
+        return None
 
-    def login_throttled(self):
-        now = time.time()
-        self.fail_times = [t for t in self.fail_times if now - t < 60]
-        return len(self.fail_times) >= 10
+    def drop_sessions(self, user, keep=None):
+        with self.sess_lock:
+            for sid in [k for k, v in self.sessions.items() if v[0] == user and k != keep]:
+                del self.sessions[sid]
+
+
+_ctx = threading.local()
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
     server_version = "srv-panel"
     sys_version = ""
-    state = None  # 由 make_server 设置
+    timeout = 30
+    state = None  # 由 make_servers 设置
 
     def log_message(self, fmt, *args):
         pass
@@ -883,14 +1263,39 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return v
         return ""
 
-    def authed(self):
-        return self.state.valid_session(self.sid())
+    def cookie_attrs(self):
+        return "Path=/; HttpOnly; SameSite=Strict" + ("; Secure" if self.state.secure else "")
+
+    def current_user(self):
+        """(用户名, 用户记录)；会话无效或用户已被删除返回 None。"""
+        name = self.state.session_user(self.sid())
+        if not name:
+            return None
+        u = self.state.store.get(name)
+        if not u:
+            self.state.drop_sessions(name)
+            return None
+        return name, u
 
     def csrf(self):
         return make_csrf(self.state.secret, self.sid())
 
-    def host_guard(self):
-        if not host_ok(self.headers.get("Host", ""), self.state.port, self.state.extra_hosts):
+    def who(self):
+        ip = normalize_ip(self.client_address[0])
+        return str(ip) if ip else self.client_address[0]
+
+    def guard(self):
+        """来源 IP 与 Host 头检查。"""
+        st = self.state
+        ip = self.who()
+        if not ip_allowed(ip, st.allow_nets):
+            now = time.time()
+            if now - st.deny_logged.get(ip, 0) > 60:     # 同一来源一分钟只记一条，防日志被刷
+                st.deny_logged[ip] = now
+                audit(st.log_file, "ip_denied", {}, 403, ip)
+            self.send(403, "<h1>403 Forbidden</h1>")
+            return False
+        if not host_ok(self.headers.get("Host", ""), st.port, st.extra_hosts):
             self.send(400, "<h1>Bad Host</h1>")
             return False
         return True
@@ -906,21 +1311,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
         raw = self.rfile.read(n).decode("utf-8", errors="replace")
         return {k: v[0] for k, v in urllib.parse.parse_qs(raw, keep_blank_values=True).items()}
 
-    def who(self):
-        return self.client_address[0]
+    def login_page(self, code=200, error=""):
+        self.send(code, render_login(make_csrf(self.state.secret, "login"), error))
 
     # --- GET ---
     def do_GET(self):
-        if not self.host_guard():
+        _ctx.user = None
+        if not self.guard():
             return
         u = urllib.parse.urlsplit(self.path)
         q = {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
         if u.path == "/login":
-            return self.send(200, render_login(make_csrf(self.state.secret, "login")))
-        if not self.authed():
+            return self.login_page()
+        cu = self.current_user()
+        if not cu:
             return self.redirect("/login")
+        me, user = cu
+        if needs_password_change(user, u.path):
+            return self.redirect("/password")
+        _ctx.user = {"name": me, "role": user["role"], "must_change": user.get("must_change")}
         csrf = self.csrf()
         try:
+            if u.path == "/password":
+                return self.send(200, render_password(csrf, me, forced=bool(user.get("must_change"))))
+            if u.path == "/users":
+                if user["role"] != "super":
+                    return self.send(403, page("无权限", "<h1>只有超级管理员能管理用户</h1>", csrf))
+                return self.send(200, render_users(self.state.store.snapshot(), me, csrf))
             if u.path == "/":
                 projects, _, _ = collect_all()
                 return self.send(200, render_overview(projects, csrf))
@@ -952,7 +1369,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     # --- POST ---
     def do_POST(self):
-        if not self.host_guard():
+        _ctx.user = None
+        if not self.guard():
             return
         path = urllib.parse.urlsplit(self.path).path
         form = self.read_form()
@@ -960,15 +1378,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         if path == "/login":
             return self.do_login(form)
-        if not self.authed():
+        cu = self.current_user()
+        if not cu:
             return self.send(401, page("未登录", '<h1>未登录</h1><p><a href="/login">去登录</a></p>'))
+        me, user = cu
         if not check_csrf(self.state.secret, self.sid(), form.get("csrf", "")):
-            audit(self.state.log_file, "csrf_rejected", {"path": path}, 403, self.who())
+            audit(self.state.log_file, "csrf_rejected", {"path": path, "user": me}, 403, self.who())
             return self.send(403, page("错误", "<h1>CSRF 校验失败</h1>"))
         csrf = self.csrf()
         if path == "/logout":
             self.state.sessions.pop(self.sid(), None)
-            return self.redirect("/login", [("Set-Cookie", "%s=; Max-Age=0; Path=/; HttpOnly; SameSite=Strict" % COOKIE)])
+            return self.redirect("/login", [("Set-Cookie", "%s=; Max-Age=0; %s" % (COOKIE, self.cookie_attrs()))])
+        if needs_password_change(user, path):
+            return self.redirect("/password")
+        _ctx.user = {"name": me, "role": user["role"], "must_change": user.get("must_change")}
+        if path == "/password":
+            return self.do_password(form, me, user, csrf)
+        if path == "/users/action":
+            if user["role"] != "super":
+                return self.send(403, page("无权限", "<h1>只有超级管理员能管理用户</h1>", csrf))
+            return self.do_users_action(form, me, csrf)
         if path != "/action":
             return self.send(404, page("未找到", "<h1>404</h1>", csrf))
         try:
@@ -979,6 +1408,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.send(200, render_confirm(form, csrf))
         with self.state.lock:
             rc, out, err = run_cmd(args, stdin_text=stdin, timeout=120)
+        params["by"] = me
         audit(self.state.log_file, action, params, rc, self.who())
         self.send(200, render_result("操作结果：" + action, args, rc, out, err, csrf))
 
@@ -986,21 +1416,98 @@ class Handler(http.server.BaseHTTPRequestHandler):
         st = self.state
         if not token_equal(make_csrf(st.secret, "login"), form.get("csrf", "")):
             return self.send(403, page("错误", "<h1>CSRF 校验失败</h1>"))
-        if st.login_throttled():
-            return self.send(429, render_login(make_csrf(st.secret, "login"), "失败次数过多，请一分钟后再试"))
-        if token_equal(st.token, form.get("token", "")):
-            sid = st.new_session()
-            audit(st.log_file, "login", {}, 0, self.who())
-            return self.redirect("/", [("Set-Cookie", "%s=%s; Path=/; HttpOnly; SameSite=Strict; Max-Age=%d" % (COOKIE, sid, SESSION_TTL))])
-        st.fail_times.append(time.time())
-        audit(st.log_file, "login", {}, 1, self.who())
-        time.sleep(1)
-        self.send(401, render_login(make_csrf(st.secret, "login"), "令牌不对"))
+        ip = self.who()
+        left = st.limiter.locked_for(ip)
+        if left > 0:
+            return self.login_page(429, "失败次数过多，请 %d 分钟后再试" % ((left + 59) // 60))
+        username, password = form.get("username", "").strip()[:64], form.get("password", "")[:256]
+        shown = username if valid_username(username) else "?"
+        if st.store.authenticate(username, password):
+            st.limiter.record_success(ip)
+            sid = st.new_session(username)
+            audit(st.log_file, "login", {"user": shown}, 0, ip)
+            return self.redirect("/", [("Set-Cookie", "%s=%s; %s; Max-Age=%d" % (COOKIE, sid, self.cookie_attrs(), SESSION_TTL))])
+        locked = st.limiter.record_failure(ip)
+        audit(st.log_file, "login", {"user": shown}, 1, ip)
+        if locked:
+            audit(st.log_file, "login_locked", {"minutes": int(st.limiter.lock_seconds // 60)}, 429, ip)
+        self.login_page(401, "用户名或密码不对")
+
+    def do_password(self, form, me, user, csrf):
+        st = self.state
+        old, new, confirm = form.get("old", ""), form.get("new", ""), form.get("confirm", "")
+        forced = bool(user.get("must_change"))
+
+        def fail(msg):
+            audit(st.log_file, "password_change", {"user": me}, 1, self.who())
+            self.send(400, render_password(csrf, me, msg, forced))
+
+        if not verify_password(old, user["hash"]):
+            return fail("当前密码不对")
+        if new != confirm:
+            return fail("两次输入的新密码不一致")
+        problem = password_problem(new, me, user["hash"])
+        if problem:
+            return fail(problem)
+        st.store.set_password(me, new, must_change=False)
+        st.drop_sessions(me, keep=self.sid())
+        if me == "admin":
+            try:
+                os.unlink(st.initial_pw_file)
+            except OSError:
+                pass
+        audit(st.log_file, "password_change", {"user": me}, 0, self.who())
+        self.redirect("/")
+
+    def do_users_action(self, form, me, csrf):
+        st = self.state
+        action, target = form.get("action", ""), form.get("username", "").strip()
+        if action not in ("create_user", "reset_user", "delete_user"):
+            return self.send(400, page("参数错误", "<h1>未知操作</h1>", csrf))
+        if action in ("reset_user", "delete_user") and form.get("confirmed") != "1":
+            if target == me:
+                return self.send(400, page("参数错误", '<h1>不能对自己执行此操作</h1>', csrf))
+            return self.send(200, render_confirm(form, csrf, post_to="/users/action", texts=USER_CONFIRM_TEXT))
+        try:
+            with st.lock:
+                if action == "create_user":
+                    pw = st.store.create(target, "admin")
+                    result = ("新建管理员 %s" % target, "管理员 %s 已创建，角色为普通管理员，可做全部项目操作，不能管理用户。" % target)
+                elif action == "reset_user":
+                    if target == me:
+                        raise UserError("请用「修改密码」改自己的密码")
+                    pw = st.store.reset(target)
+                    st.drop_sessions(target)
+                    result = ("重置 %s 的密码" % target, "用户 %s 的旧密码已失效，已注销其全部会话。" % target)
+                else:
+                    st.store.delete(me, target)
+                    st.drop_sessions(target)
+                    pw = None
+                    result = ("删除用户 %s" % target, "用户 %s 已删除，已注销其全部会话。" % target)
+        except UserError as e:
+            audit(st.log_file, action, {"target": target, "by": me}, 1, self.who())
+            return self.send(400, page("操作失败", '<h1>操作失败</h1><div class="problem">%s</div><p><a href="/users">返回用户管理</a></p>' % esc(e), csrf))
+        audit(st.log_file, action, {"target": target, "by": me}, 0, self.who())
+        if pw is None:
+            return self.send(200, page(result[0], '<h1>%s</h1><div class="card"><p>%s</p></div><p><a href="/users">返回用户管理</a></p>' % (esc(result[0]), esc(result[1])), csrf))
+        self.send(200, render_secret_result(result[0], result[1], pw, csrf))
 
 
 class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    ssl_ctx = None
+
+    def process_request_thread(self, request, client_address):
+        # TLS 握手放在工作线程里并带超时，慢速连接不会堵住 accept 循环
+        if self.ssl_ctx is not None:
+            try:
+                request.settimeout(15)
+                request = self.ssl_ctx.wrap_socket(request, server_side=True)
+            except (ssl.SSLError, OSError):
+                self.shutdown_request(request)
+                return
+        super().process_request_thread(request, client_address)
 
 
 def is_loopback(bind):
@@ -1012,40 +1519,89 @@ def is_loopback(bind):
         return False
 
 
-def read_token(path):
-    st = os.stat(path)
-    if st.st_uid != 0 or st.st_mode & 0o077:
-        raise SystemExit("令牌文件 %s 必须属 root 且权限为 600" % path)
-    token = read_text(path).strip()
-    if len(token) < 16:
-        raise SystemExit("令牌过短（至少 16 个字符）：%s" % path)
-    return token
+def make_tls_context(cert, key):
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.load_cert_chain(cert, key)
+    return ctx
 
 
-def make_server(bind, port, token, extra_hosts=(), log_file=LOG_FILE):
-    state = State(token, port, extra_hosts, log_file)
+def make_servers(binds, port, state, tls_ctx=None):
+    """每个监听地址一个 Server，共用同一份状态。"""
     handler = type("BoundHandler", (Handler,), {"state": state})
-    return Server((bind, port), handler)
+    servers = []
+    for b in binds:
+        cls = Server if ":" not in b else type("Server6", (Server,), {"address_family": socket.AF_INET6})
+        srv = cls((b, port), handler)
+        srv.ssl_ctx = tls_ctx
+        servers.append(srv)
+    return servers
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="/srv 项目管理面板")
-    ap.add_argument("--bind", default="127.0.0.1")
+    ap.add_argument("--bind", action="append", help="监听地址，可重复，默认 127.0.0.1")
     ap.add_argument("--port", type=int, default=9300)
-    ap.add_argument("--allow-remote", action="store_true", help="允许绑定非回环地址（默认拒绝）")
-    ap.add_argument("--allowed-host", action="append", default=[], help="额外允许的 Host 头主机名（远程访问时使用）")
-    ap.add_argument("--token-file", default=TOKEN_FILE)
+    ap.add_argument("--allow-remote", action="store_true", help="允许绑定非回环地址（还必须同时提供 TLS 证书）")
+    ap.add_argument("--allowed-host", action="append", default=[], help="额外允许的 Host 头主机名/IP（局域网访问时填服务器 IP）")
+    ap.add_argument("--allow-from", action="append", default=[], metavar="CIDR", help="只允许这些来源网段访问，可重复；默认不限制")
+    ap.add_argument("--tls-cert")
+    ap.add_argument("--tls-key")
+    ap.add_argument("--users-file", default=USERS_FILE)
+    ap.add_argument("--initial-password-file", default=INITIAL_PW_FILE)
     ap.add_argument("--log-file", default=LOG_FILE)
+    ap.add_argument("--bootstrap", action="store_true", help="用户库不存在时创建 admin 并写初始密码文件")
+    ap.add_argument("--reset-admin", action="store_true", help="重置 admin 的初始密码；admin 不存在则清空用户库重建")
+    ap.add_argument("--print-san", metavar="IP", help="校验局域网 IP 并打印证书 SAN，供安装脚本使用")
+    ap.add_argument("--check-cidr", metavar="CIDR", help="校验 CIDR 格式，供安装脚本使用")
     a = ap.parse_args(argv)
+    if a.print_san:
+        try:
+            print(build_san(a.print_san))
+        except ValueError as e:
+            sys.exit(str(e))
+        return
+    if a.check_cidr:
+        try:
+            parse_allow_from([a.check_cidr])
+        except ValueError:
+            sys.exit("不是有效的网段（CIDR）：%s" % a.check_cidr)
+        return
     if os.geteuid() != 0:
         sys.exit("需要 root 运行")
-    if not is_loopback(a.bind) and not a.allow_remote:
-        sys.exit("拒绝绑定非回环地址 %s；确需远程访问请显式加 --allow-remote" % a.bind)
-    token = read_token(a.token_file)
-    srv = make_server(a.bind, a.port, token, a.allowed_host, a.log_file)
-    print("srv-panel 监听 %s:%d" % (a.bind, a.port), flush=True)
+    if a.bootstrap or a.reset_admin:
+        try:
+            print(bootstrap_store(a.users_file, a.initial_password_file, reset=a.reset_admin))
+        except UserError as e:
+            sys.exit(str(e))
+        return
+    binds = a.bind or ["127.0.0.1"]
+    remote = [b for b in binds if not is_loopback(b)]
+    if remote and not a.allow_remote:
+        sys.exit("拒绝绑定非回环地址 %s；确需局域网访问请显式加 --allow-remote" % "、".join(remote))
+    if remote and not (a.tls_cert and a.tls_key):
+        sys.exit("绑定非回环地址必须同时提供 --tls-cert 和 --tls-key，不接受明文 HTTP")
+    if bool(a.tls_cert) != bool(a.tls_key):
+        sys.exit("--tls-cert 与 --tls-key 须同时提供")
     try:
-        srv.serve_forever()
+        nets = parse_allow_from(a.allow_from)
+        store = UserStore(a.users_file)
+        tls = make_tls_context(a.tls_cert, a.tls_key) if a.tls_cert else None
+    except (ValueError, UserError, OSError, ssl.SSLError) as e:
+        sys.exit("启动检查失败：%s" % e)
+    if not store.names():
+        sys.exit("用户库为空或不存在：请先 sudo bash install_panel.sh（或 python3 srv_panel.py --bootstrap）")
+    state = State(store, a.port, a.allowed_host, a.log_file, nets, secure=tls is not None,
+                  initial_pw_file=a.initial_password_file)
+    try:
+        servers = make_servers(binds, a.port, state, tls)
+    except OSError as e:
+        sys.exit("无法监听：%s" % e)
+    for s in servers[1:]:
+        threading.Thread(target=s.serve_forever, daemon=True).start()
+    print("srv-panel 监听 %s:%d（%s）" % ("、".join(binds), a.port, "HTTPS" if tls else "HTTP"), flush=True)
+    try:
+        servers[0].serve_forever()
     except KeyboardInterrupt:
         pass
 

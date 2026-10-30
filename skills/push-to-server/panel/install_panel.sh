@@ -1,45 +1,115 @@
 #!/usr/bin/env bash
 # install_panel.sh — 安装 /srv 项目管理面板（以 root 运行，可重复执行）。
-#   sudo bash install_panel.sh
+#   sudo bash install_panel.sh [--lan-ip <IP>] [--allow-from <CIDR>]...
+#   sudo bash install_panel.sh --reset-admin     忘记密码：重置 admin 的初始密码
 # 前提：已安装 srv-project（/usr/local/sbin/srv-project）并执行过 install。
 set -euo pipefail
 
 LIB_DIR=/usr/local/lib/srv-panel
 CONF_DIR=/etc/srv-panel
 TOKEN_FILE=$CONF_DIR/token
+USERS_FILE=$CONF_DIR/users.json
+PW_FILE=$CONF_DIR/initial-password
+CERT=$CONF_DIR/tls.crt
+KEY=$CONF_DIR/tls.key
 UNIT=/etc/systemd/system/srv-panel.service
 PORT=9300
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 die() { echo "错误：$*" >&2; exit 1; }
 
+LAN_IP=""
+RESET=0
+ALLOW_FROM=()
+while [ $# -gt 0 ]; do
+    case $1 in
+        --lan-ip) LAN_IP=${2:-}; [ -n "$LAN_IP" ] || die "--lan-ip 需要一个 IP"; shift 2 ;;
+        --allow-from) [ -n "${2:-}" ] || die "--allow-from 需要一个网段（CIDR）"; ALLOW_FROM+=("$2"); shift 2 ;;
+        --reset-admin) RESET=1; shift ;;
+        *) die "未知参数：$1" ;;
+    esac
+done
+
 [ "$(id -u)" -eq 0 ] || die "需要 root：sudo bash $0"
 command -v python3 >/dev/null || die "没有 python3"
 [ -f "$HERE/srv_panel.py" ] || die "找不到 $HERE/srv_panel.py"
+
+# ── 忘记密码：重置 admin（不存在则清空用户库重建），不动其他安装内容
+if [ "$RESET" -eq 1 ]; then
+    [ -f "$LIB_DIR/srv_panel.py" ] || die "面板尚未安装，请先不带 --reset-admin 运行本脚本"
+    python3 "$LIB_DIR/srv_panel.py" --reset-admin
+    systemctl restart srv-panel.service 2>/dev/null || true   # 重启即注销所有已登录会话
+    echo "新的初始密码已写入 $PW_FILE（root 可读），请用用户名 admin 登录，登录后必须改密。"
+    exit 0
+fi
+
+command -v openssl >/dev/null || die "没有 openssl（apt install openssl）"
 [ -x /usr/local/sbin/srv-project ] || echo "提示：尚未安装 /usr/local/sbin/srv-project，面板可以启动，但变更操作会失败" >&2
+
+# ── 局域网 IP：参数优先，否则取默认路由出口的 IPv4
+if [ -z "$LAN_IP" ]; then
+    LAN_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "src") {print $(i + 1); exit}}')
+    [ -n "$LAN_IP" ] || die "取不到默认路由网卡的 IPv4，请用 --lan-ip <IP> 指定"
+    echo "自动取默认路由网卡的 IPv4：$LAN_IP（不对请重跑并加 --lan-ip <IP>）"
+fi
+SAN=$(python3 "$HERE/srv_panel.py" --print-san "$LAN_IP") || die "--lan-ip 无效：$LAN_IP"
+for c in ${ALLOW_FROM[@]+"${ALLOW_FROM[@]}"}; do
+    python3 "$HERE/srv_panel.py" --check-cidr "$c" || exit 1
+done
 
 install -d -o root -g root -m 755 "$LIB_DIR"
 install -o root -g root -m 755 "$HERE/srv_panel.py" "$LIB_DIR/srv_panel.py"
-
 install -d -o root -g root -m 700 "$CONF_DIR"
-if [ ! -s "$TOKEN_FILE" ]; then
-    (umask 077; python3 -c 'import secrets; print(secrets.token_hex(24))' >"$TOKEN_FILE")
-    echo "已生成登录令牌：$TOKEN_FILE"
-else
-    echo "沿用已有登录令牌：$TOKEN_FILE"
+
+# ── 旧版令牌登录已取消
+if [ -e "$TOKEN_FILE" ]; then
+    rm -f "$TOKEN_FILE"
+    echo "已删除旧的令牌文件 $TOKEN_FILE（现在用账号密码登录）"
 fi
-chown root:root "$TOKEN_FILE"
-chmod 600 "$TOKEN_FILE"
+
+# ── 自签证书：缺失、SAN 不含当前 IP、或 30 天内到期时重新生成
+need_cert=0
+if [ ! -s "$CERT" ] || [ ! -s "$KEY" ]; then
+    need_cert=1
+elif ! openssl x509 -in "$CERT" -noout -text | grep -A1 'Subject Alternative Name' | grep -q "IP Address:$LAN_IP\b"; then
+    need_cert=1
+elif ! openssl x509 -in "$CERT" -noout -checkend $((30 * 86400)) >/dev/null; then
+    need_cert=1
+fi
+if [ "$need_cert" -eq 1 ]; then
+    (
+        umask 077
+        openssl req -x509 -newkey rsa:2048 -nodes -days 1095 -subj "/CN=srv-panel" \
+            -addext "subjectAltName=$SAN" -addext "keyUsage=digitalSignature,keyEncipherment" \
+            -addext "extendedKeyUsage=serverAuth" -keyout "$KEY" -out "$CERT" 2>/dev/null
+    ) || die "生成证书失败"
+    echo "已生成自签证书（3 年，SAN：$SAN）"
+else
+    echo "沿用已有证书 $CERT"
+fi
+chown root:root "$CERT" "$KEY"
+chmod 644 "$CERT"
+chmod 600 "$KEY"
+
+# ── 用户库：不存在时建 admin 并写初始密码文件（不打印密码）
+if [ ! -s "$USERS_FILE" ]; then
+    python3 "$LIB_DIR/srv_panel.py" --bootstrap
+fi
+chmod 600 "$USERS_FILE"
+
+EXTRA=""
+for c in ${ALLOW_FROM[@]+"${ALLOW_FROM[@]}"}; do EXTRA="$EXTRA --allow-from $c"; done
 
 cat >"$UNIT" <<UNITEOF
 [Unit]
-Description=/srv 项目管理面板（仅监听本机回环）
-After=network.target
+Description=/srv 项目管理面板（HTTPS，局域网 $LAN_IP 与本机回环）
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/bin/python3 $LIB_DIR/srv_panel.py --bind 127.0.0.1 --port $PORT
+ExecStart=/usr/bin/python3 $LIB_DIR/srv_panel.py --bind $LAN_IP --bind 127.0.0.1 --port $PORT --allow-remote --allowed-host $LAN_IP --tls-cert $CERT --tls-key $KEY$EXTRA
 Restart=on-failure
 RestartSec=3
 
@@ -54,11 +124,13 @@ systemctl restart srv-panel.service
 sleep 1
 systemctl is-active --quiet srv-panel.service || die "srv-panel 启动失败：journalctl -u srv-panel -n 30"
 
-cat <<MSG
-面板已启动，只监听 127.0.0.1:$PORT。
-访问方式：
-  1. 管理员在自己电脑上执行：ssh -L $PORT:127.0.0.1:$PORT <服务器>
-  2. 浏览器打开 http://127.0.0.1:$PORT
-  3. 登录令牌在服务器上查看：sudo cat $TOKEN_FILE
-审计日志：/var/log/srv-panel.log
-MSG
+echo "面板已启动：监听 $LAN_IP:$PORT（HTTPS）和 127.0.0.1:$PORT。"
+echo "浏览器打开：https://$LAN_IP:$PORT"
+echo "  首次打开浏览器会警告自签证书，选择「高级 → 继续访问」确认一次即可。"
+if [ -s "$PW_FILE" ]; then
+    echo "  首次登录：用户名 admin，初始密码在 $PW_FILE（sudo cat 查看），登录后必须改密；改密后该文件自动删除。"
+else
+    echo "  已有用户库，用现有账号密码登录。忘记密码：sudo bash $0 --reset-admin"
+fi
+[ ${#ALLOW_FROM[@]} -eq 0 ] || echo "  只允许来源网段：${ALLOW_FROM[*]}（本机回环不受限）"
+echo "审计日志：/var/log/srv-panel.log"

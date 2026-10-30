@@ -1,35 +1,42 @@
 # /srv 项目管理面板
 
-给服务器管理员（root）用的网页面板，管理 `srv-project`（`scripts/srv_project.sh`）创建的 `/srv/<项目>` 项目账号。界面为中文服务端渲染网页，单文件、只用 Python 3.12 标准库，无外部 JS/CSS。
+给服务器管理员用的网页面板，管理 `srv-project`（`scripts/srv_project.sh`）创建的 `/srv/<项目>` 项目账号。局域网内浏览器直接用 HTTPS 打开，账号密码登录。界面为中文服务端渲染网页，单文件、只用 Python 3.12 标准库，无外部 JS/CSS。面板进程以 root 运行。
 
 文件：
 
 - `panel/srv_panel.py`：面板本体
-- `panel/install_panel.sh`：安装脚本（root 运行，可重复执行）
+- `panel/install_panel.sh`：安装、升级、忘记密码重置（root 运行，可重复执行）
 
 ## 安装
 
-前提：服务器已安装 `/usr/local/sbin/srv-project` 并执行过 `srv-project install`。
+前提：服务器已安装 `/usr/local/sbin/srv-project` 并执行过 `srv-project install`，且有 `python3` 和 `openssl`。
 
 ```bash
-sudo bash panel/install_panel.sh
+sudo bash panel/install_panel.sh [--lan-ip <服务器IP>] [--allow-from <网段CIDR>]...
 ```
+
+- `--lan-ip`：局域网 IP，写入证书并作为监听地址。不传则自动取默认路由出口网卡的 IPv4，并在终端打印，不对请加参数重跑。服务器应使用固定 IP，IP 变了要重新运行脚本（会重签证书）
+- `--allow-from`：只允许这些来源网段访问，可重复，例如 `--allow-from 192.168.1.0/24`。默认不限制。服务器本机（回环来源）始终放行，避免把自己锁在外面
 
 脚本会：
 
 1. 把 `srv_panel.py` 装到 `/usr/local/lib/srv-panel/`
-2. 令牌文件 `/etc/srv-panel/token` 不存在时生成（随机 48 位十六进制，权限 600，属 root；已有则沿用，不打印）
-3. 写 `/etc/systemd/system/srv-panel.service`（root 运行，`Restart=on-failure`，只绑 `127.0.0.1:9300`），`enable` 并启动
+2. 用 `openssl` 生成自签证书 `/etc/srv-panel/tls.crt` 和 `tls.key`（key 权限 600，有效期 3 年，SAN 含局域网 IP、`127.0.0.1`、`localhost`）。证书已存在、SAN 含当前 IP 且 30 天内不到期时沿用
+3. 没有用户库时创建超级管理员 `admin`，随机初始密码写入 `/etc/srv-panel/initial-password`（root 600）。终端只提示文件位置，不打印密码
+4. 发现旧版令牌文件 `/etc/srv-panel/token` 就删除并提示（令牌登录已取消）
+5. 写 `/etc/systemd/system/srv-panel.service`（root 运行，`Restart=on-failure`），`enable` 并启动
 
-重复执行即升级面板代码并重启服务，令牌不变。
+重复执行即升级面板代码并重启服务，用户库、证书、初始密码文件（尚未被消费时）都保持不变。
 
-## 访问
+## 首次登录与访问
 
-面板只监听服务器本机回环，用 SSH 端口转发访问：
+1. 浏览器打开 `https://<服务器IP>:9300`（也可在服务器本机打开 `https://127.0.0.1:9300`）
+2. 第一次会警告证书不受信任（自签证书）。点「高级 → 继续访问」确认一次即可，此后该浏览器记住这个证书
+3. 用户名 `admin`，密码用 `sudo cat /etc/srv-panel/initial-password` 查看
+4. 登录后会被强制进入「修改密码」页，改密前其它页面一律重定向回来。新密码至少 12 位，不能与当前（初始）密码或用户名相同
+5. 改密成功后 `initial-password` 文件被删除，`admin` 即正式的超级管理员
 
-1. 管理员在自己电脑上：`ssh -L 9300:127.0.0.1:9300 <服务器>`
-2. 浏览器打开 `http://127.0.0.1:9300`
-3. 令牌在服务器上查看：`sudo cat /etc/srv-panel/token`
+没有人能「谁先访问谁当管理员」：首个账号只能凭服务器上 root 才能读的初始密码登录。
 
 ## 功能
 
@@ -38,50 +45,84 @@ sudo bash panel/install_panel.sh
 - 启用 / 停用状态（`/etc/shadow` 第 8 字段为 1 即停用）
 - 登记端口是否在监听、监听进程属主是否为该项目账号
 - 问题提示：登记端口被其他账号占用；两个项目登记同一端口；账号缺失；账号不在 `srvproj` 组
-- 已授权公钥（标签 + 指纹 + 来源限制）
+- 已授权公钥（标签、指纹、来源限制）
 - 用户服务及状态（`systemctl --user --machine=<账号>@ list-units`；只显示该项目自己的服务，隐藏 `dbus.service` 和无单元文件的 inactive 系统单元）
 - `repo/` 的 git HEAD、`/srv/<项目>` 磁盘占用
 
 **项目详情**（`/project/<项目>`）：在总览基础上提供全部操作，并做环境依赖检测
 
-- 环境依赖：以该账号身份运行 `runuser -l <账号> -c "bash -lic …"`（登录加交互 shell，因此 `~/.profile`、`~/.bashrc` 里加的 PATH，例如 `~/.local/node/bin`，也会生效），报告 git、node、npm、python3、docker 的可用性、版本和路径
-- 声明比对：`package.json` 的 `engines.node`、`.nvmrc`、`requirements.txt`、`pyproject.toml`（含 `requires-python`）与实际版本是否匹配。版本约束支持 `>= > <= < = ^ ~ x` 范围和 `||`，看不懂的约束标为「无法自动判断」而不是误报
+- 环境依赖：以该账号身份运行 `runuser -l <账号> -c "bash -lic …"`（登录加交互 shell，`~/.profile`、`~/.bashrc` 里加的 PATH，例如 `~/.local/node/bin`，也会生效），报告 git、node、npm、python3、docker 的可用性、版本和路径
+- 声明比对：`package.json` 的 `engines.node`、`.nvmrc`、`requirements.txt`、`pyproject.toml`（含 `requires-python`）与实际版本是否匹配。支持 `>= > <= < = ^ ~ x` 和 `||`，看不懂的约束标为「无法自动判断」，不误报
 - 停用的项目账号被锁定，不做环境检测
 
 **全局检查**（`/global`）：`srv-project`、sshd 规则、公钥目录、登记表是否在；`/srv` 下对 other 可读的目录（警告）；`/srv` 下未登记的目录；本机所有监听端口及属主，标出登记的项目端口与未登记端口。
 
-**操作**：新建项目、授权公钥（粘贴单行公钥，经 stdin 走 `grant <项目> -`）、吊销、停用、启用、用户服务 restart / start / stop、查看用户服务最近 100 行日志（`journalctl _UID=<uid> _SYSTEMD_USER_UNIT=<单元> + _UID=<uid> USER_UNIT=<单元>`）。
+**项目操作**：新建项目、授权公钥（粘贴单行公钥，经 stdin 走 `grant <项目> -`）、吊销、停用、启用、用户服务 restart / start / stop、查看用户服务最近 100 行日志。停用、吊销、停止服务先进入确认页，点「确认执行」才真正执行（页面内表单，不用 JS `confirm()`）。`srv-project` / `systemctl` 的命令、退出码、标准输出、标准错误原样回显到结果页。
 
-- 停用、吊销、停止服务先进入确认页，点「确认执行」才真正执行（页面内表单，不用 JS `confirm()`）
-- `srv-project` 或 `systemctl` 的命令、退出码、标准输出、标准错误原样回显到结果页
+## 用户管理
+
+角色有两种：
+
+- **超级管理员**（`super`）：能做全部项目操作，并管理用户。首个账号 `admin` 是超级管理员
+- **管理员**（`admin`）：能做全部项目操作，不能管理用户
+
+超级管理员在「用户管理」页（`/users`）可以：
+
+- **新建管理员**：系统生成一次性初始密码，只在结果页显示一次，请当面或经安全渠道交给对方。对方首次登录必须改密
+- **重置密码**（需确认）：旧密码立即失效，生成新的一次性初始密码，强制改密，并注销该用户的全部登录会话
+- **删除用户**（需确认）：立即注销其全部会话。不能删自己，也不能删最后一个超级管理员
+
+每个用户都能在「修改密码」页改自己的密码（改密后其余会话被注销）。超级管理员要改自己密码也走这里，不能对自己做「重置」。
+
+## 忘记密码
+
+在服务器上以 root 执行：
+
+```bash
+sudo bash panel/install_panel.sh --reset-admin
+```
+
+- `admin` 存在：生成新的初始密码写入 `/etc/srv-panel/initial-password`，把 `admin` 设回「必须改密」，其他用户不动
+- `admin` 不存在（比如被改名或损坏）：清空用户库，重新创建 `admin`，回到首次登录流程（其他用户需要重新创建）
+- 然后重启面板服务，所有已登录会话立即失效
+
+之后按「首次登录」的步骤登录并改密。
 
 ## 安全模型
 
-- 必须 root 启动，否则退出；令牌文件须属 root 且权限 600，否则拒绝启动
-- 默认只绑 `127.0.0.1`。绑非回环地址必须显式 `--allow-remote`，并用 `--allowed-host <主机名>` 补充允许的 Host。不建议开启，没有 TLS
-- 登录：令牌常量时间比较，成功后换 `HttpOnly; SameSite=Strict` 会话 cookie（8 小时，保存在进程内存，重启即失效）；失败后延迟 1 秒，一分钟内失败 10 次即暂时拒绝
-- 所有 POST 带 CSRF 令牌（与会话绑定的 HMAC），缺失或不对返回 403
-- Host 头只接受 `127.0.0.1` / `localhost`（可带本服务端口），防 DNS rebinding
-- 输出全部 `html.escape`；响应带 CSP（无脚本）、`X-Frame-Options: DENY`、`no-store`
-- 项目名用与 `srv_project.sh` 相同的正则校验，并要求已登记；服务名、标签、来源地址、公钥引用均有格式白名单；变更操作只通过参数列表调用 `srv-project` / `systemctl`，不经 shell
-- 项目目录内容由项目账号控制，所以：读 `repo/` 的版本声明文件只读真实路径仍在 `/srv/<项目>/` 内的小普通文件；读 git HEAD 用 `runuser -u <账号>` 降权运行，避免 root 执行项目仓库里可触发命令的 git 配置
-- 审计日志 `/var/log/srv-panel.log`（权限 600）：时间、动作、参数、来源、退出码。授权公钥只记标签、来源限制和指纹；不记令牌，也不记公钥全文
+- 必须 root 启动，否则退出
+- **只走 HTTPS**：非回环地址的监听必须同时给 `--allow-remote` 和 TLS 证书与私钥，缺任一项拒绝启动，不提供明文 HTTP。TLS 最低 1.2；启用 TLS 时会话 cookie 带 `Secure`
+- **监听地址**：服务只绑定两个地址，局域网 IP 和 `127.0.0.1`（同一进程两个监听）。不绑 `0.0.0.0`，所以服务器的其他网卡（docker 网桥、VPN 等）上不开放端口，Host 头校验只是第二层
+- **来源限制**：可选 `--allow-from` 白名单；不在名单内的来源 IP 直接返回 403 并写审计日志（同一来源一分钟最多记一条）。回环来源始终放行
+- **密码**：`hashlib.scrypt`（N=16384, r=8, p=1），每个用户单独 16 字节随机盐，常量时间比较。用户库 `/etc/srv-panel/users.json`（root 600）原子写入（先写同目录临时文件，`fsync` 后 `rename`）。用户不存在时也做一次同等代价的校验，响应不区分「用户不存在」和「密码错」
+- **登录限流按来源 IP 计数**：同一 IP 连续失败 5 次锁定 5 分钟，锁定期内即使密码正确也拒绝；成功登录清零；其他 IP 不受影响。限流状态在内存里，重启清空
+- **会话**：登录后换 `HttpOnly; SameSite=Strict` cookie（8 小时，随机 256 位，保存在进程内存），绑定用户名。删除用户、重置密码、用户改密都会注销相应会话；服务重启全部失效
+- 所有 POST 带与会话绑定的 CSRF 令牌；Host 头只接受 `127.0.0.1` / `localhost` / 安装时指定的局域网 IP（可带本服务端口），防 DNS rebinding
+- 输出全部 `html.escape`；响应带 CSP（无脚本）、`X-Frame-Options: DENY`、`no-store`；请求体限 64KB，连接带 30 秒超时，TLS 握手在工作线程里并带超时
+- 项目名用与 `srv_project.sh` 相同的正则校验并要求已登记；服务名、标签、来源地址、公钥引用均有白名单；变更操作只通过参数列表调用 `srv-project` / `systemctl`，不经 shell
+- 项目目录由项目账号控制，所以：读 `repo/` 的版本声明文件只读真实路径仍在 `/srv/<项目>/` 内的小普通文件；读 git HEAD 用 `runuser -u <账号>` 降权运行，避免 root 执行仓库里可触发命令的 git 配置
+- 审计日志 `/var/log/srv-panel.log`（600）：时间、动作、参数、来源 IP、退出码。覆盖登录成败、锁定、改密、用户新建/重置/删除、IP 拒绝、CSRF 拒绝和全部项目操作。授权公钥只记标签、来源限制和指纹。**任何密码都不记**
 
 ## 参数
 
 ```
-srv_panel.py [--bind 127.0.0.1] [--port 9300] [--allow-remote]
-             [--allowed-host 主机名]... [--token-file /etc/srv-panel/token]
+srv_panel.py [--bind IP]... [--port 9300] [--allow-remote]
+             [--tls-cert 证书 --tls-key 私钥] [--allowed-host 主机名或IP]...
+             [--allow-from CIDR]... [--users-file /etc/srv-panel/users.json]
+             [--initial-password-file /etc/srv-panel/initial-password]
              [--log-file /var/log/srv-panel.log]
+srv_panel.py --bootstrap | --reset-admin        # 安装脚本调用
 ```
 
 ## 已知限制
 
-- 会话保存在内存，面板重启后需要重新登录
+- 自签证书不被浏览器预先信任，每个浏览器第一次要手动确认。证书到期（3 年）或局域网 IP 变化后需重新运行安装脚本
+- 登录限流和会话都在内存里，面板重启后需要重新登录，限流计数清零
+- 限流按来源 IP；经 NAT/代理访问时，同一出口的所有人共用一个计数
 - 总览每次加载会为每个项目执行 `systemctl`、`ssh-keygen`、`runuser git`、`du`，项目很多或目录很大时较慢
-- 用户服务的日志依赖 journal 中带 `_UID` 的记录；服务自身 stdout 是否落入 journal 取决于服务单元配置
+- 用户服务日志依赖 journal 中带 `_UID` 的记录；服务自身 stdout 是否进入 journal 取决于单元配置
 - 面板不删除项目（`srv-project` 没有 delete 子命令）
-- `grant` 的 `--from` 与吊销时的「标签」仍由 `srv-project` 做最终校验，错误原文回显
+- 只有 `super` 和 `admin` 两种角色，不能把普通管理员提升为超级管理员
 
 ## 卸载
 
@@ -90,8 +131,8 @@ sudo systemctl disable --now srv-panel.service
 sudo rm -f /etc/systemd/system/srv-panel.service
 sudo systemctl daemon-reload
 sudo rm -rf /usr/local/lib/srv-panel
-sudo rm -rf /etc/srv-panel        # 删除令牌
-sudo rm -f /var/log/srv-panel.log # 可选：删除审计日志
+sudo rm -rf /etc/srv-panel          # 删除用户库、证书和初始密码文件
+sudo rm -f /var/log/srv-panel.log   # 可选：删除审计日志
 ```
 
 卸载面板不影响任何项目账号、公钥和用户服务。

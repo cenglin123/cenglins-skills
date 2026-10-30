@@ -177,5 +177,216 @@ class BuildActionTests(unittest.TestCase):
         self.assertEqual(args[-2:], ["--contact", "x"])
 
 
+class PasswordTests(unittest.TestCase):
+    def test_hash_verify(self):
+        h = panel.hash_password("correct horse battery")
+        self.assertTrue(h.startswith("scrypt$"))
+        self.assertTrue(panel.verify_password("correct horse battery", h))
+        self.assertFalse(panel.verify_password("correct horse batterz", h))
+        self.assertFalse(panel.verify_password("", h))
+
+    def test_unique_salt(self):
+        self.assertNotEqual(panel.hash_password("same-password-1"), panel.hash_password("same-password-1"))
+
+    def test_malformed_hash(self):
+        for bad in ("", "x", "scrypt$1$2", "md5$1$2$3$aa$bb", "scrypt$a$b$c$zz$yy", None):
+            self.assertFalse(panel.verify_password("x", bad))
+
+    def test_generate(self):
+        a, b = panel.generate_password(), panel.generate_password()
+        self.assertEqual(len(a), 16)
+        self.assertNotEqual(a, b)
+
+    def test_password_problem(self):
+        cur = panel.hash_password("initial-Password-1")
+        self.assertIn("至少", panel.password_problem("short", "bob"))
+        self.assertIn("相同", panel.password_problem("initial-Password-1", "bob", cur))
+        self.assertIsNone(panel.password_problem("a-brand-new-pass", "bob", cur))
+        self.assertIn("用户名", panel.password_problem("bobbobbobbob", "bobbobbobbob"))
+
+    def test_username(self):
+        self.assertTrue(panel.valid_username("admin"))
+        self.assertTrue(panel.valid_username("li.si-2"))
+        for bad in ("A", "a", "Admin", "1ab", "a b", "a/b", "", "x" * 33):
+            self.assertFalse(panel.valid_username(bad), bad)
+
+    def test_must_change_redirect(self):
+        u = {"must_change": True}
+        self.assertTrue(panel.needs_password_change(u, "/"))
+        self.assertTrue(panel.needs_password_change(u, "/action"))
+        self.assertFalse(panel.needs_password_change(u, "/password"))
+        self.assertFalse(panel.needs_password_change(u, "/logout"))
+        self.assertFalse(panel.needs_password_change({"must_change": False}, "/"))
+        self.assertFalse(panel.needs_password_change(None, "/"))
+
+
+class RateLimiterTests(unittest.TestCase):
+    def setUp(self):
+        self.now = [1000.0]
+        self.rl = panel.RateLimiter(5, 300, 900, clock=lambda: self.now[0])
+
+    def test_lock_after_five(self):
+        for _ in range(4):
+            self.assertFalse(self.rl.record_failure("1.1.1.1"))
+            self.assertEqual(self.rl.locked_for("1.1.1.1"), 0)
+        self.assertTrue(self.rl.record_failure("1.1.1.1"))
+        self.assertEqual(self.rl.locked_for("1.1.1.1"), 300)
+        self.now[0] += 299
+        self.assertGreater(self.rl.locked_for("1.1.1.1"), 0)
+        self.now[0] += 2
+        self.assertEqual(self.rl.locked_for("1.1.1.1"), 0)
+
+    def test_other_ip_unaffected(self):
+        for _ in range(5):
+            self.rl.record_failure("1.1.1.1")
+        self.assertEqual(self.rl.locked_for("2.2.2.2"), 0)
+        self.assertFalse(self.rl.record_failure("2.2.2.2"))
+
+    def test_success_resets(self):
+        for _ in range(4):
+            self.rl.record_failure("1.1.1.1")
+        self.rl.record_success("1.1.1.1")
+        self.assertFalse(self.rl.record_failure("1.1.1.1"))
+
+    def test_window_expiry(self):
+        for _ in range(4):
+            self.rl.record_failure("1.1.1.1")
+        self.now[0] += 1000
+        self.assertFalse(self.rl.record_failure("1.1.1.1"))
+
+
+class AllowFromTests(unittest.TestCase):
+    def test_empty_means_open(self):
+        self.assertTrue(panel.ip_allowed("8.8.8.8", []))
+
+    def test_match(self):
+        nets = panel.parse_allow_from(["192.168.1.0/24", "10.0.0.5"])
+        self.assertTrue(panel.ip_allowed("192.168.1.77", nets))
+        self.assertTrue(panel.ip_allowed("10.0.0.5", nets))
+        self.assertFalse(panel.ip_allowed("192.168.2.1", nets))
+        self.assertFalse(panel.ip_allowed("10.0.0.6", nets))
+        self.assertFalse(panel.ip_allowed("garbage", nets))
+
+    def test_loopback_and_mapped(self):
+        nets = panel.parse_allow_from(["192.168.1.0/24"])
+        self.assertTrue(panel.ip_allowed("127.0.0.1", nets))
+        self.assertTrue(panel.ip_allowed("::1", nets))
+        self.assertTrue(panel.ip_allowed("::ffff:192.168.1.9", nets))
+        self.assertFalse(panel.ip_allowed("::ffff:172.16.0.1", nets))
+
+    def test_bad_cidr(self):
+        with self.assertRaises(ValueError):
+            panel.parse_allow_from(["not-a-cidr"])
+        with self.assertRaises(ValueError):
+            panel.parse_allow_from(["1.2.3.4/33"])
+
+
+class SanTests(unittest.TestCase):
+    def test_lan_ip(self):
+        self.assertTrue(panel.valid_lan_ip("192.168.1.10"))
+        self.assertTrue(panel.valid_lan_ip("10.0.0.2"))
+        for bad in ("127.0.0.1", "0.0.0.0", "224.0.0.1", "169.254.1.1", "255.255.255.255", "1.2.3", "a.b.c.d", "", "::1", "192.168.1.10; rm"):
+            self.assertFalse(panel.valid_lan_ip(bad), bad)
+
+    def test_san(self):
+        self.assertEqual(panel.build_san("192.168.1.10"), "IP:192.168.1.10,IP:127.0.0.1,DNS:localhost")
+        with self.assertRaises(ValueError):
+            panel.build_san("127.0.0.1")
+
+
+class UserStoreTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.dir = tempfile.TemporaryDirectory()
+        self.users = str(Path(self.dir.name) / "users.json")
+        self.pw = str(Path(self.dir.name) / "initial-password")
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def test_bootstrap_and_login(self):
+        self.assertIn("admin", panel.bootstrap_store(self.users, self.pw))
+        pw = Path(self.pw).read_text(encoding="utf-8").strip()
+        store = panel.UserStore(self.users)
+        self.assertTrue(store.authenticate("admin", pw))
+        self.assertFalse(store.authenticate("admin", pw + "x"))
+        self.assertFalse(store.authenticate("nobody", pw))
+        u = store.get("admin")
+        self.assertEqual((u["role"], u["must_change"]), ("super", True))
+        self.assertNotIn(pw, Path(self.users).read_text(encoding="utf-8"))
+        self.assertEqual(panel.bootstrap_store(self.users, self.pw), "已有用户库，未改动")
+
+    def test_roundtrip_and_atomic(self):
+        store = panel.UserStore(self.users)
+        pw = store.create("alice")
+        self.assertEqual(len(pw), 16)
+        again = panel.UserStore(self.users)
+        self.assertTrue(again.authenticate("alice", pw))
+        self.assertTrue(again.get("alice")["must_change"])
+        again.set_password("alice", "a-much-longer-pw")
+        self.assertFalse(again.get("alice")["must_change"])
+        import os
+        self.assertEqual([n for n in os.listdir(self.dir.name) if ".tmp." in n], [])
+        with self.assertRaises(panel.UserError):
+            again.create("alice")
+        with self.assertRaises(panel.UserError):
+            again.create("Bad Name")
+
+    def test_reset_forces_change(self):
+        store = panel.UserStore(self.users)
+        old = store.create("bob")
+        store.set_password("bob", "my-own-password-1")
+        new = store.reset("bob")
+        self.assertTrue(store.get("bob")["must_change"])
+        self.assertFalse(store.authenticate("bob", "my-own-password-1"))
+        self.assertTrue(store.authenticate("bob", new))
+        self.assertNotEqual(old, new)
+
+    def test_delete_rules(self):
+        users = {"admin": {"role": "super"}, "bob": {"role": "admin"}}
+        self.assertIn("自己", panel.delete_problem(users, "admin", "admin"))
+        self.assertIsNone(panel.delete_problem(users, "admin", "bob"))
+        self.assertIn("最后一个超级管理员", panel.delete_problem(users, "bob", "admin"))
+        self.assertIn("不存在", panel.delete_problem(users, "admin", "zed"))
+        users["root2"] = {"role": "super"}
+        self.assertIsNone(panel.delete_problem(users, "root2", "admin"))
+
+    def test_store_delete(self):
+        panel.bootstrap_store(self.users, self.pw)
+        store = panel.UserStore(self.users)
+        store.create("carol")
+        with self.assertRaises(panel.UserError):
+            store.delete("admin", "admin")
+        store.delete("admin", "carol")
+        self.assertEqual(store.names(), ["admin"])
+
+    def test_reset_admin(self):
+        import json
+        panel.bootstrap_store(self.users, self.pw)
+        store = panel.UserStore(self.users)
+        pw1 = Path(self.pw).read_text(encoding="utf-8").strip()
+        store.set_password("admin", "changed-password-1")
+        store.create("dave")
+        panel.bootstrap_store(self.users, self.pw, reset=True)
+        pw2 = Path(self.pw).read_text(encoding="utf-8").strip()
+        self.assertNotEqual(pw1, pw2)
+        self.assertTrue(store.authenticate("admin", pw2))      # 运行中的 store 会重读被外部改动的文件
+        self.assertTrue(store.get("admin")["must_change"])
+        self.assertIn("dave", store.names())
+        data = json.loads(Path(self.users).read_text(encoding="utf-8"))
+        data["users"]["eve"] = data["users"].pop("admin")
+        Path(self.users).write_text(json.dumps(data), encoding="utf-8")
+        panel.bootstrap_store(self.users, self.pw, reset=True)   # admin 不存在：清空后重建
+        self.assertEqual(panel.UserStore(self.users).names(), ["admin"])
+
+    def test_corrupt_file(self):
+        Path(self.users).write_text("{not json", encoding="utf-8")
+        with self.assertRaises(panel.UserError):
+            panel.load_users_file(self.users)
+        Path(self.users).write_text('{"users": {"BAD": {"role": "x", "hash": "h"}}}', encoding="utf-8")
+        with self.assertRaises(panel.UserError):
+            panel.load_users_file(self.users)
+
+
 if __name__ == "__main__":
     unittest.main()
