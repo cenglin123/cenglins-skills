@@ -33,9 +33,9 @@ cd /d "%USERPROFILE%\.agents\skills\foxmail-grep"
 
 fg.cmd list                 # 邮件列表
 fg.cmd grep <关键词> [-i]   # 全文检索（主题+正文+收发件人+附件名）
-fg.cmd show <编号>          # 邮件全文
+fg.cmd show <编号>          # 邮件全文（guess 归属的附件标注「归属待确认」）
 fg.cmd attach               # 附件清单
-fg.cmd extract <编号> [--out 目录]   # 提取附件（本地优先，无副本自动从服务器拉取）
+fg.cmd extract <编号> [--out 目录] [--strict]   # 提取附件；--strict 遇「按大小推测」归属拒绝提取
 fg.cmd fetch                # POP3 拉取服务器新邮件进 corpus（只读不删）
 ```
 
@@ -76,11 +76,15 @@ fg.cmd --v6 <Foxmail6根目录> grep <关键词>
 
 ## 版本适配矩阵
 
-| Foxmail 版本 | 数据结构 | 支持方式 |
+**程序版本号 ≠ 数据布局**：安装目录名（如 "Foxmail 7.0"）与 exe 版本号都不能当布局判据
+（7.1.3.52 实测已是 Storage 布局）。以数据目录的 `FMStorage.list` 内容与 `<数据根>\*.ver`
+标记为准；`store_root()` 按注册表 + 路径扫描自动定位，定位不到时设 `FOXGREP_STORE`。
+
+| 数据布局 | 识别标记 | 支持方式 |
 |---|---|---|
-| 7.2 | `Storage\<账号>\Mails\Index` (FXIS) + Indexes/ | `--live` 实时索引 ✓ |
-| 7.0 / 7.1 | 扁平 `Data\Mails\Index`（FMStorage.list 指示，两级桶 `Mails\<mid%32>\<(mid//32)%32>\<mid>`） | `--live` 自动识别 ✓（7.2.25.432 程序 + 扁平数据样本实测，74,805 封） |
-| 5.x / 6.x (5.0、6.5 实测) | `mail\<账号>\*.BOX/.IND` | `--v6` BOX 分隔符扫描 ✓（不依赖 IND；5.x 与 6.x 分隔符相同） |
+| `Storage\<账号>\Mails\Index`（FXIS）+ `Indexes\`（新式；7.1.3.52 实测 4,546 封） | 根目录 `FMStorage.list` 内容为 `Storage\<账号>\`、`Storage\<账号>\7_1.ver` | `--live` 实时索引 ✓ |
+| 扁平 `Data\Mails\Index`（旧式，两级桶 `Mails\<mid%32>\<(mid//32)%32>\<mid>`） | `Data\Mails\Index` 存在 | `--live` 自动识别 ✓（7.2.25.432 程序 + 扁平数据样本实测，74,805 封） |
+| 5.x / 6.x（5.0、6.5 实测） | `mail\<账号>\*.BOX/.IND` | `--v6` BOX 分隔符扫描 ✓（不依赖 IND；5.x 与 6.x 分隔符相同） |
 
 ## 遇到不支持的版本/解析失败时
 
@@ -102,12 +106,19 @@ fg.cmd --v6 <Foxmail6根目录> grep <关键词>
 1. 语料库 .eml（默认模式直接有附件数据）
 2. `--v6` BOX 原位读取
 3. `--live` 按大小匹配语料库副本
-4. **Foxmail 渲染缓存收割**：邮件被打开/预览过时，附件已被 Foxmail 自行解密到
-   `%APPDATA%\Roaming\Foxmail7\Temp-*\Attach\`，extract 自动收割
-5. POP3 服务器按主题+日期匹配拉取（收后即删场景可能为空）
+4. Foxmail 渲染缓存收割（`%APPDATA%\Roaming\Foxmail7\Temp-*`；被动命中才有效——
+   **新版单击/预览只渲染正文 html，附件不落盘**，详见 `refs/render-harvest-recipe.md`）
+5. POP3 服务器按主题+日期匹配拉取（收后即删场景通常为 0 封）
 
-**全链路失败时**（报"提取失败"）：说明该邮件从未被渲染过。按 `refs/render-harvest-recipe.md`
-的「渲染收割」配方操作——用 cua-driver 在 Foxmail 搜索框定位该邮件并**单击**（触发渲染=
-附件自动进缓存），然后重试 `extract`。这是已验证的自动化路径，2~3 个 GUI 动作。
+**附件归属置信度**（`--live` 的 show/attach/--json 输出）：`attachInfo.rec0` 只记
+`name/size/pos`、不含 mailid，归属按三级标注——`name`（附件名主干命中主题/正文）、
+`size`（`pos+size` 与邮件文件严格等长命中）、`guess`（仅按大小最近推测，**可能属于
+其他邮件**）。`show` 对 guess 标注「[归属待确认]」；`extract --strict` 遇 guess
+拒绝提取（防拿错别人的附件）；不加 `--strict` 时提取照常，但结果要人工核对。
 
-**GUI 操作纪律**：只执行渲染收割配方的最小动作集，不做配方外的任何窗口操作。
+**加密存储库**：邮件文件全库加密时（新版常态），附件明文只能由 Foxmail 自身解密，
+四级兜底全空属预期，工具不破解（边界）。出路两条（详见 `refs/render-harvest-recipe.md`）：
+
+- **路径 A（推荐，可批量）**：Foxmail 邮件列表多选 → 右键「导出邮件」(.eml) →
+  .eml 放进技能目录 `corpus\` → 默认模式 `extract`（一次 GUI，之后全 CLI）
+- **路径 B（单封）**：预览区右键附件 → 「保存全部附件」

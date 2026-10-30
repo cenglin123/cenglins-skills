@@ -423,7 +423,7 @@ def _build_stem_index(texts, atts):
 def _assign_cache_file(root):
     import hashlib
     h = hashlib.md5(os.path.normcase(os.path.abspath(root)).encode('utf-8')).hexdigest()[:12]
-    return os.path.join(TOOL_DIR, 'assigncache', f'att-{h}.json')
+    return os.path.join(TOOL_DIR, 'assigncache', f'att-{h}-v2.json')
 
 def _assign_cache_stat(root):
     """缓存失效键: rec0 与 FXIS 的 size+mtime (Foxmail 重写索引时自动失效)"""
@@ -444,7 +444,7 @@ def _assign_cache_load(root, n_mails, n_atts):
         with open(path, encoding='utf-8') as f:
             c = json.load(f)
         if (c.get('stat') == stat and c.get('n_mails') == n_mails
-                and c.get('n_atts') == n_atts):
+                and c.get('n_atts') == n_atts and c.get('ver') == 2):
             return {int(k): v for k, v in c['map'].items()}
     except (OSError, ValueError, KeyError, TypeError):
         pass
@@ -459,7 +459,7 @@ def _assign_cache_save(root, result, n_mails, n_atts):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = path + '.tmp'
         with open(tmp, 'w', encoding='utf-8') as f:
-            json.dump({'stat': stat, 'n_mails': n_mails, 'n_atts': n_atts,
+            json.dump({'ver': 2, 'stat': stat, 'n_mails': n_mails, 'n_atts': n_atts,
                        'map': {str(k): v for k, v in result.items()}}, f)
         os.replace(tmp, path)
     except OSError:
@@ -526,7 +526,8 @@ def _assign_attachments(root, mails, atts):
         for slack, mid in cands_iter:
             if not overlaps(mid, rec['pos'], end):
                 assigned[mid].append((rec['pos'], end))
-                result[mid].append(i)
+                conf = 'name' if ok is not None else ('size' if slack == 0 else 'guess')
+                result[mid].append([i, conf])
                 break
     _assign_cache_save(root, result, len(mails), len(atts))
     return result
@@ -570,7 +571,8 @@ def load_live():
     amap = _assign_attachments(root, mails, atts)
     matched = _match_corpus_by_size(root, mails)
     for mid, m in mails.items():
-        m['attachments'] = [{**atts[i], '_data': None} for i in amap.get(mid, [])]
+        m['attachments'] = [{**atts[e[0]], '_data': None, 'confidence': e[1]}
+                            for e in amap.get(mid, [])]
         m['_src'] = matched.get(mid)
         if m['_src']:
             parsed = parse_eml(m['_src'])
@@ -789,12 +791,18 @@ def _temp_cache_find(m):
     found = {}
     base = os.path.join(os.environ.get('APPDATA', ''), 'Foxmail7')
     roots = glob.glob(os.path.join(glob.escape(base), 'Temp-*', 'Attach'))
+    # 实测: 部分装机版本不建 Attach 子目录，附件可能落在 Temp-<pid>\ 或其一级子目录
+    roots.extend(glob.glob(os.path.join(glob.escape(base), 'Temp-*')))
     for a in m['attachments']:
         name = re.split(r'[\\/]', a['name'])[-1].rstrip(' .')
         for d in roots:
             p = os.path.join(d, name)
             if os.path.isfile(p):
                 found[a['name']] = p
+                break
+            hit = glob.glob(os.path.join(glob.escape(d), '*', glob.escape(name)))
+            if hit and os.path.isfile(hit[0]):
+                found[a['name']] = hit[0]
                 break
     return found
 
@@ -893,18 +901,39 @@ def parse_eml_bytes(raw):
     return {'subject': _dh(msg.get('Subject', '')), 'date': dt}
 # ==================== 输出 ====================
 
+def _att_dict(a):
+    d = {'name': a['name'], 'size': a['size']}
+    if a.get('confidence'):
+        d['confidence'] = a['confidence']
+    return d
+
+
 def mail_dict(m, with_body=False):
     dt = m.get('date')
     d = {'id': m['id'],
          'date': dt.strftime('%Y-%m-%d %H:%M:%S') if dt else None,
          'from': m['from'], 'from_name': m.get('from_name', ''), 'to': m['to'],
          'subject': m['subject'],
-         'attachments': [{'name': a['name'], 'size': a['size']} for a in m['attachments']]}
+         'attachments': [_att_dict(a) for a in m['attachments']]}
     if with_body:
         d['body'] = m.get('body', '')
     if m.get('folder'):
         d['account'], d['folder'] = m['account'], m['folder']
     return d
+
+def _setup_stdout(json_mode):
+    """输出编码兜底: --json 或重定向时用 UTF-8，GBK 控制台下保留本地编码但容错。"""
+    for stream in (sys.stdout, sys.stderr):
+        if not hasattr(stream, 'reconfigure'):
+            continue
+        try:
+            if json_mode or not stream.isatty():
+                stream.reconfigure(encoding='utf-8', errors='replace')
+            else:
+                stream.reconfigure(errors='replace')
+        except (ValueError, OSError):
+            pass
+
 
 def fmt_mail_head(m):
     dt = m.get('date')
@@ -928,7 +957,10 @@ def main():
     sub.add_parser('fetch', help='POP3 拉取服务器邮件进 corpus (只读不删, 按 UIDL 去重)')
     x = sub.add_parser('extract'); x.add_argument('mailid', type=int)
     x.add_argument('--out', help='输出目录 (默认 corpus/att-<编号>/)')
+    x.add_argument('--strict', action='store_true',
+                   help='附件归属仅为按大小推测(guess)时拒绝提取')
     args = ap.parse_args()
+    _setup_stdout(args.json)
 
     if args.cmd == 'fetch':
         sys.exit(fetch_corpus())
@@ -970,7 +1002,8 @@ def main():
         else:
             print(fmt_mail_head(m))
             for a in m['attachments']:
-                print(f"      附件: {a['name']} ({a['size']:,} bytes)")
+                warn = '  [归属待确认]' if a.get('confidence') == 'guess' else ''
+                print(f"      附件: {a['name']} ({a['size']:,} bytes){warn}")
             print('-' * 60)
             print(m.get('body', ''))
     elif args.cmd == 'attach':
@@ -997,6 +1030,9 @@ def main():
             m['attachments'] = full['attachments']
         if not m['attachments']:
             sys.exit('该邮件无附件')
+        if args.strict and any(a.get('confidence') == 'guess' for a in m['attachments']):
+            sys.exit('已中止(--strict): 附件归属仅为按大小推测(可能属于其他邮件)。\n'
+                     '可用 --json / show 查看 confidence 字段; 需要强行提取请去掉 --strict')
         if any(a.get('_data') is None for a in m['attachments']):
             # 本地无副本 → 依次兜底: Foxmail 渲染缓存收割 → POP3 服务器拉取
             cached = _temp_cache_find(m)
@@ -1015,9 +1051,14 @@ def main():
                         a['_data'] = x['_data']
                 print('已从服务器取回邮件原文', file=sys.stderr)
         if all(a.get('_data') is None for a in m['attachments']):
-            sys.exit('提取失败: 本地无副本, 渲染缓存未命中, 服务器上也未找到。\n'
-                     '解决: 按 refs/render-harvest-recipe.md 触发 Foxmail 渲染该邮件\n'
-                     '(附件会随之进入渲染缓存), 然后重试 extract。')
+            sys.exit('提取失败（四级兜底均未命中）:\n'
+                     '  1) 语料库 .eml 副本: 无\n'
+                     '  2) 按大小匹配语料库: 无\n'
+                     '  3) Foxmail 渲染缓存(Temp-*\\Attach): 未命中\n'
+                     '  4) POP3 服务器: 未取到（账号若为收后即删，服务器通常为 0 封）\n'
+                     '说明: 本机邮件文件为加密存储，附件正文只能由 Foxmail 自身解密。\n'
+                     '出路: (a) Foxmail 中右键附件 -> 保存全部附件;\n'
+                     '      (b) 邮件列表多选 -> 右键导出邮件(.eml) -> 语料库模式 extract。')
         for a in m['attachments']:
             if a.get('_data') is None:
                 print(f"警告: 附件未取得: {a['name']}", file=sys.stderr)
