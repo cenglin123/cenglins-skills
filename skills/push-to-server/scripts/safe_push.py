@@ -4,16 +4,23 @@
 Usage:
   python safe_push.py preflight --repo /path/to/repo [--config /path/to/config.json] [--remote] [--json]
   python safe_push.py deploy --repo /path/to/repo [--config /path/to/config.json] [--execute]
+  python safe_push.py enroll '<invite>' [--device-name NAME] [--key PATH] [--alias ALIAS] [--json]
   python safe_push.py bootstrap --repo /path/to/repo [--config /path/to/config.json] [--execute] [--json]
   python safe_push.py config-save --repo /path/to/repo --config /path/to/config.json [--replace]
 """
 
 import argparse
+import base64
+import calendar
 import hashlib
+import hmac
 import json
 import os
 import random
+import re
 import shlex
+import socket
+import ssl
 import string
 import subprocess
 import sys
@@ -1219,6 +1226,369 @@ def do_bootstrap(config, branch):
 
 
 # ---------------------------------------------------------------------------
+# Enroll (invite-based device registration for the shared /srv server)
+# ---------------------------------------------------------------------------
+INVITE_PREFIX = "srvinvite1."
+INVITE_REQUIRED = ("v", "host", "ssh_port", "project", "panel", "panel_cert_sha256", "ssh_host_keys",
+                   "code", "expires", "label")
+PROJECT_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{1,31}$")
+ALIAS_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+
+class EnrollError(SafePushError):
+    """Enrollment failure (message is safe to show; it never contains the invite code)."""
+
+
+def decode_invite(text, now=None):
+    """Parse and validate an invite locally. No network access. Raises EnrollError."""
+    text = (text or "").strip()
+    if not text.startswith(INVITE_PREFIX):
+        raise EnrollError("不是有效的邀请：前缀应为 " + INVITE_PREFIX)
+    body = text[len(INVITE_PREFIX):]
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", body):
+        raise EnrollError("邀请内容含非法字符（应为单行 base64url，不要带引号或换行）")
+    try:
+        data = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)).decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        raise EnrollError("邀请无法解码")
+    if not isinstance(data, dict) or data.get("v") != 1:
+        raise EnrollError("不支持的邀请版本")
+    missing = [k for k in INVITE_REQUIRED if k not in data]
+    if missing:
+        raise EnrollError("邀请缺少字段：" + ", ".join(missing))
+    if not isinstance(data["project"], str) or not PROJECT_NAME_RE.fullmatch(data["project"]):
+        raise EnrollError("邀请里的项目名不合法")
+    if not isinstance(data["host"], str) or not re.fullmatch(r"[A-Za-z0-9.:-]{1,253}", data["host"]):
+        raise EnrollError("邀请里的服务器地址不合法")
+    if not isinstance(data["ssh_port"], int) or not 1 <= data["ssh_port"] <= 65535:
+        raise EnrollError("邀请里的 SSH 端口不合法")
+    panel = data["panel"]
+    m = re.fullmatch(r"https://([A-Za-z0-9.:-]+):(\d{1,5})", panel) if isinstance(panel, str) else None
+    if not m or m.group(1) != data["host"] or not 1 <= int(m.group(2)) <= 65535:
+        raise EnrollError("邀请里的面板地址不合法（应为 https://<服务器地址>:<端口>）")
+    data["panel_port"] = int(m.group(2))
+    if not isinstance(data["panel_cert_sha256"], str) or not re.fullmatch(r"[0-9a-fA-F]{64}", data["panel_cert_sha256"]):
+        raise EnrollError("邀请里的证书指纹不合法")
+    keys = data["ssh_host_keys"]
+    if not isinstance(keys, list) or not keys or not all(
+            isinstance(k, str) and re.fullmatch(r"[A-Za-z0-9@.-]+ [A-Za-z0-9+/=]+", k) for k in keys):
+        raise EnrollError("邀请里的 SSH 主机公钥不合法")
+    if not isinstance(data["code"], str) or len(data["code"]) < 16 or not re.fullmatch(r"[A-Za-z0-9_-]+", data["code"]):
+        raise EnrollError("邀请里的邀请码不合法")
+    if not isinstance(data["label"], str) or not re.fullmatch(r"[A-Za-z0-9._@-]{1,64}", data["label"]):
+        raise EnrollError("邀请里的标签不合法")
+    try:
+        expires = calendar.timegm(datetime.strptime(data["expires"], "%Y-%m-%dT%H:%M:%SZ").timetuple())
+    except (ValueError, TypeError):
+        raise EnrollError("邀请里的过期时间格式不对")
+    if (now if now is not None else datetime.now(timezone.utc).timestamp()) >= expires:
+        raise EnrollError("邀请已过期（%s UTC），请让管理员重新生成" % data["expires"])
+    return data
+
+
+def sanitize_device_name(name):
+    """Keep [A-Za-z0-9._ -], at most 64 chars; fall back to 'device'."""
+    cleaned = re.sub(r"[^A-Za-z0-9._ -]+", "-", name or "").strip(" -.")
+    cleaned = re.sub(r"\s+", " ", cleaned)[:64].strip(" -.")
+    return cleaned or "device"
+
+
+def known_hosts_spec(host, port):
+    return host if port == 22 else f"[{host}]:{port}"
+
+
+def parse_keygen_find(stdout):
+    """`ssh-keygen -F` output -> [(keytype, base64)] for the matching known_hosts entries."""
+    entries = []
+    for line in (stdout or "").splitlines():
+        if not line.strip() or line.startswith("#") or line.startswith("@"):
+            continue
+        parts = line.split()
+        if len(parts) >= 3:
+            entries.append((parts[1], parts[2]))
+    return entries
+
+
+def classify_known_hosts(existing, wanted):
+    """existing/wanted: [(type, b64)]. Returns (to_add, conflicts): same type with other key = conflict."""
+    to_add, conflicts = [], []
+    for kt, b64 in wanted:
+        same_type = [e for e in existing if e[0] == kt]
+        if (kt, b64) in existing:
+            continue
+        if same_type:
+            conflicts.append(kt)
+        else:
+            to_add.append((kt, b64))
+    return to_add, conflicts
+
+
+def _keygen_find(spec, path):
+    try:
+        r = subprocess.run(["ssh-keygen", "-F", spec, "-f", str(path)], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=30)
+    except FileNotFoundError:
+        raise EnrollError("找不到 ssh-keygen，请先安装 OpenSSH 客户端")
+    return r.stdout if r.returncode == 0 else ""
+
+
+def plan_known_hosts(inv, kh_path):
+    """Read-only. Returns (lines_to_append, conflict_types)."""
+    spec = known_hosts_spec(inv["host"], inv["ssh_port"])
+    wanted = [tuple(k.split(" ", 1)) for k in inv["ssh_host_keys"]]
+    existing = parse_keygen_find(_keygen_find(spec, kh_path)) if os.path.exists(kh_path) else []
+    to_add, conflicts = classify_known_hosts(existing, wanted)
+    return [f"{spec} {kt} {b64}" for kt, b64 in to_add], conflicts
+
+
+def write_known_hosts(kh_path, lines):
+    if not lines:
+        return
+    os.makedirs(os.path.dirname(kh_path), exist_ok=True)
+    prefix = ""
+    if os.path.exists(kh_path):
+        with open(kh_path, "rb") as f:
+            data = f.read()
+        if data and not data.endswith(b"\n"):
+            prefix = "\n"
+    with open(kh_path, "a", encoding="utf-8", newline="\n") as f:
+        f.write(prefix + "\n".join(lines) + "\n")
+
+
+def _cfg_path_value(path):
+    return str(path).replace("\\", "/")
+
+
+def build_ssh_config_block(alias, inv, identity):
+    ident = _cfg_path_value(identity)
+    if " " in ident:
+        ident = '"' + ident + '"'
+    return (f"# srv-panel enroll: {inv['project']}\n"
+            f"Host {alias}\n"
+            f"    HostName {inv['host']}\n"
+            f"    Port {inv['ssh_port']}\n"
+            f"    User {inv['project']}\n"
+            f"    IdentityFile {ident}\n"
+            f"    IdentitiesOnly yes\n")
+
+
+def parse_ssh_config_host(text, alias):
+    """Return the lower-cased option dict of the first `Host <alias>` block, or None."""
+    block = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = re.match(r"(?i)^(host|match)\s+(.*)$", line)
+        if m:
+            if block is not None:
+                break
+            if m.group(1).lower() == "host" and alias in m.group(2).split():
+                block = {}
+            continue
+        if block is not None:
+            kv = re.match(r"^(\S+?)\s*[=\s]\s*(.*)$", line)
+            if kv:
+                block.setdefault(kv.group(1).lower(), kv.group(2).strip().strip('"'))
+    return block
+
+
+def plan_ssh_config(text, alias, inv, identity):
+    """Returns 'append', 'same' or raises EnrollError when the alias exists with different content."""
+    existing = parse_ssh_config_host(text, alias)
+    if existing is None:
+        return "append"
+    want = {"hostname": inv["host"], "port": str(inv["ssh_port"]), "user": inv["project"],
+            "identityfile": _cfg_path_value(identity), "identitiesonly": "yes"}
+    got = {k: (v.replace("\\", "/") if k == "identityfile" else v) for k, v in existing.items() if k in want}
+    if {k: v.lower() if k == "identitiesonly" else v for k, v in got.items()} == want:
+        return "same"
+    raise EnrollError(f"~/.ssh/config 里已有别名 {alias} 且内容不同，未做任何改动；请换一个 --alias 或手动处理")
+
+
+def append_ssh_config(cfg_path, block):
+    os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
+    prefix = ""
+    if os.path.exists(cfg_path):
+        with open(cfg_path, "rb") as f:
+            data = f.read()
+        if data:
+            prefix = ("" if data.endswith(b"\n") else "\n") + "\n"
+    with open(cfg_path, "a", encoding="utf-8", newline="\n") as f:
+        f.write(prefix + block)
+
+
+def ensure_enroll_key(key_path, device, project):
+    """Reuse an existing key, else create an ed25519 key without passphrase. Returns the public key line."""
+    key_path = str(key_path)
+    pub_path = key_path + ".pub"
+    if not os.path.exists(key_path):
+        os.makedirs(os.path.dirname(key_path), exist_ok=True)
+        try:
+            r = subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", f"{device}@{project}", "-f", key_path],
+                               capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
+        except FileNotFoundError:
+            raise EnrollError("找不到 ssh-keygen，请先安装 OpenSSH 客户端")
+        if r.returncode != 0:
+            raise EnrollError("生成密钥失败：" + r.stderr.strip())
+    if not os.path.exists(pub_path):
+        r = subprocess.run(["ssh-keygen", "-y", "-f", key_path], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=30)
+        if r.returncode != 0:
+            raise EnrollError("无法从私钥导出公钥（私钥有口令？）：" + key_path)
+        return r.stdout.strip()
+    with open(pub_path, encoding="utf-8") as f:
+        return f.read().strip()
+
+
+def _open_tls(host, port, timeout=30):
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE        # trust comes from the pinned fingerprint, not a CA
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    sock = socket.create_connection((host, port), timeout=timeout)
+    try:
+        return ctx.wrap_socket(sock)
+    except Exception:
+        sock.close()
+        raise
+
+
+def parse_http_response(raw):
+    head, _, body = raw.partition(b"\r\n\r\n")
+    lines = head.decode("iso-8859-1").split("\r\n")
+    m = re.match(r"HTTP/\d\.\d (\d{3})", lines[0]) if lines else None
+    if not m:
+        raise EnrollError("面板返回了无法解析的响应")
+    return int(m.group(1)), body
+
+
+def pinned_post(inv, path, payload, timeout=30):
+    """POST JSON over TLS after checking the certificate fingerprint. The payload (invite code) is only
+    written to the socket once the fingerprint matches."""
+    host, port = inv["host"], inv["panel_port"]
+    try:
+        conn = _open_tls(host, port, timeout)
+    except (OSError, ssl.SSLError) as e:
+        raise EnrollError(f"无法连接面板 {host}:{port}：{e}")
+    try:
+        der = conn.getpeercert(binary_form=True)
+        got = hashlib.sha256(der or b"").hexdigest()
+        if not hmac.compare_digest(got, inv["panel_cert_sha256"].lower()):
+            raise EnrollError("面板证书指纹与邀请不一致，已断开且未发送邀请码（可能是中间人，或面板证书已更换，请让管理员重新生成邀请）")
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        req = (f"POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\n"
+               f"Accept: application/json\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n").encode("ascii") + body
+        conn.sendall(req)
+        raw = b""
+        while True:
+            try:
+                chunk = conn.recv(65536)
+            except ssl.SSLEOFError:
+                break
+            if not chunk:
+                break
+            raw += chunk
+            if len(raw) > 1 << 20:
+                break
+    except (OSError, ssl.SSLError) as e:
+        raise EnrollError(f"与面板通信失败：{e}")
+    finally:
+        try:
+            conn.close()
+        except OSError:
+            pass
+    status, resp_body = parse_http_response(raw)
+    try:
+        return status, json.loads(resp_body.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        raise EnrollError(f"面板返回了非 JSON 响应（HTTP {status}）")
+
+
+def verify_enroll_ssh(alias):
+    try:
+        r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", alias, "true"],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=40)
+    except FileNotFoundError:
+        raise EnrollError("找不到 ssh，请先安装 OpenSSH 客户端")
+    except subprocess.TimeoutExpired:
+        return False, "ssh 登录验证超时"
+    return r.returncode == 0, r.stderr.strip()
+
+
+def build_config_sample(inv, alias):
+    return {
+        "schema_version": 1,
+        "server": {"host": alias, "user": inv["project"], "port": inv["ssh_port"],
+                   "remote_repo_dir": f"/srv/{inv['project']}/repo", "ssh_key_path": None},
+        "runtime_paths": [],
+        "backup_retention": 3,
+    }
+
+
+def cmd_enroll(args):
+    ssh_dir = Path.home() / ".ssh"
+    try:
+        inv = decode_invite(args.invite)                       # local only: nothing is sent if this fails
+        device = sanitize_device_name(args.device_name or socket.gethostname())
+        alias = args.alias or f"srv-{inv['project']}"
+        if not ALIAS_RE.fullmatch(alias):
+            raise EnrollError("--alias 只能用字母、数字、. _ -")
+        key_path = Path(os.path.expanduser(args.key)) if args.key else ssh_dir / f"id_ed25519_srv_{inv['project']}"
+        kh_path = str(ssh_dir / "known_hosts")
+        cfg_path = str(ssh_dir / "config")
+
+        # Read-only conflict checks first, so a conflict never burns the one-time code.
+        kh_lines, conflicts = plan_known_hosts(inv, kh_path)
+        if conflicts:
+            raise EnrollError(
+                f"known_hosts 里已有 {known_hosts_spec(inv['host'], inv['ssh_port'])} 的 {', '.join(conflicts)} 主机公钥，"
+                "且与邀请里的不同（可能是中间人攻击，或服务器重装过）。未做任何改动，也未提交邀请码；请向管理员核实后再处理。")
+        cfg_text = Path(cfg_path).read_text(encoding="utf-8") if os.path.exists(cfg_path) else ""
+        cfg_action = plan_ssh_config(cfg_text, alias, inv, key_path)
+
+        pubkey = ensure_enroll_key(key_path, device, inv["project"])
+        status, resp = pinned_post(inv, "/enroll",
+                                   {"code": inv["code"], "pubkey": pubkey, "device_name": device})
+        if not resp.get("ok"):
+            raise EnrollError("面板拒绝了登记：" + str(resp.get("error", f"HTTP {status}")))
+
+        write_known_hosts(kh_path, kh_lines)
+        if cfg_action == "append":
+            append_ssh_config(cfg_path, build_ssh_config_block(alias, inv, key_path))
+        ok, detail = verify_enroll_ssh(alias)
+    except (EnrollError, SafePushError, OSError) as e:
+        _output({"status": "enroll_failed", "errors": [str(e)]}, args.json)
+        return 1
+
+    result = {
+        "status": "enrolled" if ok else "enrolled_ssh_unverified",
+        "project": inv["project"],
+        "account": resp.get("account", inv["project"]),
+        "alias": alias,
+        "key": str(key_path),
+        "fingerprint": resp.get("fingerprint"),
+        "ssh_verified": ok,
+        "info": resp.get("info", ""),
+        "config_sample": build_config_sample(inv, alias),
+        "next_step": "config-save → bootstrap --execute",
+        "errors": [] if ok else [f"ssh {alias} 登录验证失败：{detail}"],
+    }
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        print(f"登记完成：项目 {inv['project']}，设备 {device}，别名 {alias}，密钥 {key_path}")
+        print(f"SSH 登录验证：{'通过' if ok else '失败 — ' + detail}")
+        if result["info"]:
+            print()
+            print(result["info"])
+        print()
+        print("下一步：把下面的 JSON 存成配置文件，依次执行 config-save → bootstrap --execute（首次部署），之后用 deploy。")
+        print(json.dumps(result["config_sample"], indent=2, ensure_ascii=False))
+    return 0 if ok else 1
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 def cmd_preflight(args):
@@ -1453,6 +1823,13 @@ def main():
     p_boot.add_argument("--execute", action="store_true", help="Actually write to remote")
     p_boot.add_argument("--json", action="store_true", help="JSON output")
 
+    p_enr = sub.add_parser("enroll", help="Register this device with an invite from the server admin")
+    p_enr.add_argument("invite", help="The one-line invite (srvinvite1.…)")
+    p_enr.add_argument("--device-name", help="Device name (default: hostname)")
+    p_enr.add_argument("--key", help="Private key path (default: ~/.ssh/id_ed25519_srv_<project>)")
+    p_enr.add_argument("--alias", help="ssh config Host alias (default: srv-<project>)")
+    p_enr.add_argument("--json", action="store_true", help="JSON output")
+
     p_save = sub.add_parser("config-save", help="Validate and save a per-repository config")
     p_save.add_argument("--repo", required=True, help="Local repository path")
     p_save.add_argument("--config", required=True, help="Source config JSON path")
@@ -1465,6 +1842,8 @@ def main():
             sys.exit(cmd_preflight(parsed))
         elif parsed.command == "deploy":
             sys.exit(cmd_deploy(parsed))
+        elif parsed.command == "enroll":
+            sys.exit(cmd_enroll(parsed))
         elif parsed.command == "bootstrap":
             sys.exit(cmd_bootstrap(parsed))
         elif parsed.command == "config-save":

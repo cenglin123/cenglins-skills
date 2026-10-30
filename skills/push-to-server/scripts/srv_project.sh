@@ -14,6 +14,9 @@
 #   enable  <项目>                            启用：恢复登录，已 enable 的用户服务随之启动
 #   info    <项目> [--host <服务器地址>]      打印可转发给申请方的接入信息（不含密钥内容与密码）
 #   delete  <项目> [--purge]                  删除已停用的项目：删账号、公钥、登记；目录归档到 /srv/.archived（--purge 直接删除）
+#   invite  <项目> --label <标签> [--hours N] [--from X]   生成一次性设备邀请（需先装管理面板）
+#   invites [<项目>]                          列出邀请及状态
+#   invite-revoke <邀请编号>                  作废待使用的邀请
 #   list
 set -euo pipefail
 
@@ -24,6 +27,7 @@ SSHD_DROPIN=/etc/ssh/sshd_config.d/60-srv-projects.conf
 REGISTRY=$SRV_ROOT/PROJECTS.tsv
 SUDOERS=/etc/sudoers.d/srv-project
 ARCHIVE_DIR=$SRV_ROOT/.archived
+PANEL_PY=/usr/local/lib/srv-panel/srv_panel.py
 SELF=/usr/local/sbin/srv-project
 
 die() { echo "错误：$*" >&2; exit 1; }
@@ -378,6 +382,31 @@ cmd_delete() {
     fi
 }
 
+# 邀请由管理面板的代码管理（同一份邀请库），这里只转调
+panel_invite() {
+    [ -f "$PANEL_PY" ] || die "请先安装管理面板（panel/install_panel.sh）"
+    python3 "$PANEL_PY" invite "$@"
+}
+
+cmd_invite() {
+    [ -n "${1:-}" ] || die "用法：invite <项目> --label <标签> [--hours N] [--from X]"
+    local project=$1
+    shift
+    valid_name "$project"
+    need_installed
+    is_project "$project" || die "$project 不是 $GROUP 项目账号"
+    panel_invite create "$project" "$@"
+}
+
+cmd_invites() {
+    if [ -n "${1:-}" ]; then panel_invite list --project "$1"; else panel_invite list; fi
+}
+
+cmd_invite_revoke() {
+    [ -n "${1:-}" ] || die "用法：invite-revoke <邀请编号>"
+    panel_invite revoke "$1"
+}
+
 need_root "$@"
 case ${1:-} in
     install) shift; cmd_install "$@" ;;
@@ -390,5 +419,8 @@ case ${1:-} in
     info) shift; cmd_info "$@" ;;
     delete) shift; cmd_delete "$@" ;;
     undelegate) shift; cmd_undelegate "$@" ;;
-    *) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+    invite) shift; cmd_invite "$@" ;;
+    invites) shift; cmd_invites "$@" ;;
+    invite-revoke) shift; cmd_invite_revoke "$@" ;;
+    *) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

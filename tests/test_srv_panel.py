@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -410,6 +411,377 @@ class DeleteActionTests(unittest.TestCase):
         self.assertIn("彻底删除", html)
         self.assertIn('name="purge" value="1"', html)
         self.assertIn("归档", panel.render_confirm({"action": "delete", "project": "demo"}, "tok"))
+
+
+def _ssh_str(b):
+    return len(b).to_bytes(4, "big") + b
+
+
+def fake_pubkey(kind="ed25519", bits=2048):
+    import base64
+    if kind == "ed25519":
+        blob = _ssh_str(b"ssh-ed25519") + _ssh_str(b"\x01" * 32)
+        return "ssh-ed25519 " + base64.b64encode(blob).decode() + " user@host"
+    n = (1 << (bits - 1)) | 1
+    blob = _ssh_str(b"ssh-rsa") + _ssh_str(b"\x01\x00\x01") + _ssh_str(b"\x00" + n.to_bytes(bits // 8, "big"))
+    return "ssh-rsa " + base64.b64encode(blob).decode() + " user@host"
+
+
+class InviteHelpersTests(unittest.TestCase):
+    def test_code_and_hash(self):
+        a, b = panel.new_code(), panel.new_code()
+        self.assertNotEqual(a, b)
+        self.assertGreaterEqual(len(a), 32)                  # >=192 bit in base64url
+        self.assertEqual(len(panel.code_hash(a)), 64)
+        self.assertNotIn(a, panel.code_hash(a))
+
+    def test_encode_roundtrip_has_no_padding(self):
+        import base64
+        text = panel.encode_invite({"v": 1, "label": "中文 ok", "n": "x" * 7})
+        self.assertTrue(text.startswith("srvinvite1."))
+        body = text[len("srvinvite1."):]
+        self.assertNotIn("=", body)
+        data = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)).decode("utf-8"))
+        self.assertEqual(data["label"], "中文 ok")
+
+    def test_status_transitions(self):
+        rec = {"status": "pending", "expires": "2030-01-01T00:00:00Z"}
+        before = panel.parse_iso_utc("2029-12-31T23:59:59Z")
+        after = panel.parse_iso_utc("2030-01-01T00:00:00Z")
+        self.assertEqual(panel.invite_status(rec, before), "pending")
+        self.assertEqual(panel.invite_status(rec, after), "expired")
+        self.assertEqual(panel.invite_status(dict(rec, status="used"), after), "used")
+        self.assertEqual(panel.invite_status(dict(rec, status="revoked"), before), "revoked")
+        self.assertEqual(panel.invite_status({"status": "pending", "expires": "garbage"}, before), "expired")
+
+    def test_host_keys_and_cert_hash(self):
+        keys = panel.parse_host_keys(["ssh-ed25519 AAAA root@x\n", "ssh-rsa BBBB\n", "ssh-ed25519 AAAA other\n", "junk\n", ""])
+        self.assertEqual(keys, ["ssh-ed25519 AAAA", "ssh-rsa BBBB"])
+        import hashlib
+        import ssl
+        pem = ssl.DER_cert_to_PEM_cert(b"abc-der-bytes")
+        self.assertEqual(panel.cert_sha256_hex(pem), hashlib.sha256(b"abc-der-bytes").hexdigest())
+
+    def test_from_spec(self):
+        self.assertEqual(panel.normalize_from_spec(""), "")
+        self.assertEqual(panel.normalize_from_spec("10.0.0.5, 192.168.1.0/24"), "10.0.0.5,192.168.1.0/24")
+        for bad in ("nonsense", "10.0.0.0/99", "10.0.0.5;ls", "a b"):
+            with self.assertRaises(panel.InviteError):
+                panel.normalize_from_spec(bad)
+        self.assertTrue(panel.invite_from_allows("", "8.8.8.8"))
+        self.assertTrue(panel.invite_from_allows("192.168.1.0/24,10.0.0.5", "10.0.0.5"))
+        self.assertFalse(panel.invite_from_allows("192.168.1.0/24", "192.168.2.9"))
+        self.assertFalse(panel.invite_from_allows("192.168.1.0/24", "127.0.0.1"))   # 回环不豁免
+
+    def test_label_conflict(self):
+        self.assertIsNone(panel.label_conflict("a", {"b"}, {"c"}))
+        self.assertIn("已授权", panel.label_conflict("b", {"b"}, set()))
+        self.assertIn("待使用", panel.label_conflict("c", set(), {"c"}))
+
+
+class PubkeyValidationTests(unittest.TestCase):
+    def test_accepts(self):
+        self.assertEqual(panel.validate_pubkey(fake_pubkey()).split()[0], "ssh-ed25519")
+        self.assertEqual(panel.validate_pubkey(fake_pubkey("rsa", 3072)).split()[0], "ssh-rsa")
+        self.assertEqual(panel.validate_pubkey(fake_pubkey("rsa", 4096)).split()[0], "ssh-rsa")
+
+    def test_normalizes_comment_away(self):
+        self.assertEqual(len(panel.validate_pubkey(fake_pubkey()).split()), 2)
+
+    def test_rejects(self):
+        for bad in (fake_pubkey("rsa", 2048), "", "ssh-dss AAAA", "-----BEGIN OPENSSH PRIVATE KEY-----",
+                    fake_pubkey() + "\n" + fake_pubkey(), "ssh-ed25519 !!!notbase64", "ssh-ed25519",
+                    "sk-ssh-ed25519@openssh.com AAAA", "ssh-ed25519 " + "A" * 5000):
+            with self.assertRaises(ValueError, msg=bad[:30]):
+                panel.validate_pubkey(bad)
+
+    def test_rejects_type_mismatch(self):
+        wrong = fake_pubkey().replace("ssh-ed25519 ", "ecdsa-sha2-nistp256 ", 1)
+        with self.assertRaises(ValueError):
+            panel.validate_pubkey(wrong)
+
+
+class EnrollBodyTests(unittest.TestCase):
+    CODE = "c" * 32
+
+    def body(self, **kw):
+        d = {"code": self.CODE, "pubkey": fake_pubkey(), "device_name": "my laptop-1.local"}
+        d.update(kw)
+        return json.dumps(d).encode()
+
+    def test_ok(self):
+        code, pub, dev = panel.parse_enroll_body(self.body())
+        self.assertEqual((code, dev), (self.CODE, "my laptop-1.local"))
+
+    def test_rejections(self):
+        cases = [(b"x" * 9000, 413), (b"not json", 400), (b"[]", 400), (self.body(device_name="bad;name"), 400),
+                 (self.body(device_name="x" * 65), 400), (self.body(device_name=""), 400), (self.body(pubkey=5), 400),
+                 (self.body(code="short"), 403), (self.body(code="a b" * 12), 403), (self.body(code=None), 403)]
+        for raw, status in cases:
+            with self.assertRaises(panel.EnrollError, msg=raw[:30]) as cm:
+                panel.parse_enroll_body(raw)
+            self.assertEqual(cm.exception.status, status, raw[:30])
+
+    def test_size_limit_is_8kb(self):
+        self.assertEqual(panel.ENROLL_MAX_BODY, 8192)
+
+
+class InviteStoreTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = str(Path(self.dir.name) / "invites.json")
+        self.store = panel.InviteStore(self.path)
+        self.code = panel.new_code()
+        self.rec = {"id": "deadbeef", "code_sha256": panel.code_hash(self.code), "project": "demo", "label": "ap1",
+                    "from": "", "created_by": "cli:root", "created": "2030-01-01T00:00:00Z",
+                    "expires": "2999-01-01T00:00:00Z", "ssh_port": 22, "status": "pending"}
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def test_empty_store_is_created(self):
+        self.assertEqual(json.loads(Path(self.path).read_text())["invites"], {})
+
+    def test_roundtrip_and_no_plaintext_code(self):
+        self.store.add(self.rec)
+        again = panel.InviteStore(self.path)
+        self.assertEqual(again.find_by_code(self.code)["id"], "deadbeef")
+        self.assertIsNone(again.find_by_code(self.code + "x"))
+        self.assertNotIn(self.code, Path(self.path).read_text())
+
+    def test_used_and_revoke_flow(self):
+        self.store.add(self.rec)
+        self.store.mark_used("deadbeef", "10.0.0.5", "laptop", "SHA256:fp")
+        rec = self.store.snapshot()["deadbeef"]
+        self.assertEqual((rec["status"], rec["used_ip"], rec["used_device"], rec["used_fingerprint"]),
+                         ("used", "10.0.0.5", "laptop", "SHA256:fp"))
+        self.assertIn("used_at", rec)
+        with self.assertRaises(panel.InviteError):
+            self.store.mark_used("deadbeef", "10.0.0.5", "laptop", "SHA256:fp")
+        with self.assertRaises(panel.InviteError):
+            self.store.revoke("deadbeef")
+
+    def test_revoke(self):
+        self.store.add(self.rec)
+        self.assertEqual(self.store.revoke("deadbeef")["status"], "revoked")
+        with self.assertRaises(panel.InviteError):
+            self.store.mark_used("deadbeef", "1.1.1.1", "d", "fp")
+        with self.assertRaises(panel.InviteError):
+            self.store.revoke("nosuch")
+
+    def test_expired_cannot_be_used(self):
+        self.store.add(dict(self.rec, expires="2000-01-01T00:00:00Z"))
+        with self.assertRaises(panel.InviteError):
+            self.store.mark_used("deadbeef", "1.1.1.1", "d", "fp")
+
+    def test_external_change_is_picked_up(self):
+        other = panel.InviteStore(self.path)
+        other.add(self.rec)
+        self.assertIsNotNone(self.store.find_by_code(self.code))
+
+
+class ProcessEnrollTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.dir = tempfile.TemporaryDirectory()
+        self.store = panel.InviteStore(str(Path(self.dir.name) / "invites.json"))
+        self.log = str(Path(self.dir.name) / "audit.log")
+        self.state = panel.State(None, 9300, log_file=self.log, lan_ip="192.0.2.10", invites=self.store)
+        self.code = panel.new_code()
+        self.add_invite()
+        self.grants = []
+        self.patches = [
+            patch.object(panel, "registered_names", return_value={"demo"}),
+            patch.object(panel, "account_info", return_value=(1001, True)),
+            patch.object(panel, "is_disabled", return_value=False),
+            patch.object(panel, "key_fingerprint", return_value="SHA256:testfp"),
+        ]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+        self.dir.cleanup()
+
+    def add_invite(self, **kw):
+        rec = {"id": "deadbeef", "code_sha256": panel.code_hash(self.code), "project": "demo", "label": "ap1", "from": "",
+               "created_by": "cli:root", "created": "2030-01-01T00:00:00Z", "expires": "2999-01-01T00:00:00Z",
+               "ssh_port": 22, "status": "pending"}
+        rec.update(kw)
+        self.store.add(rec)
+
+    def grant_ok(self, args, stdin_text=None, timeout=0):
+        self.grants.append((args, stdin_text))
+        return 0, "已授权", ""
+
+    def body(self, code=None, pubkey=None, device="laptop"):
+        return json.dumps({"code": code or self.code, "pubkey": pubkey or fake_pubkey(), "device_name": device}).encode()
+
+    def enroll(self, raw=None, ip="10.0.0.5", grant=None):
+        return panel.process_enroll(self.state, raw or self.body(), ip, grant=grant or self.grant_ok, info_fn=lambda p, h: "INFO " + p)
+
+    def test_success(self):
+        status, resp = self.enroll()
+        self.assertEqual(status, 200)
+        self.assertEqual((resp["ok"], resp["project"], resp["account"], resp["ssh_port"], resp["host"], resp["fingerprint"], resp["info"]),
+                         (True, "demo", "demo", 22, "192.0.2.10", "SHA256:testfp", "INFO demo"))
+        args, stdin = self.grants[0]
+        self.assertEqual(args[1:6], ["grant", "demo", "-", "--label", "ap1"])
+        self.assertTrue(stdin.startswith("ssh-ed25519 ") and stdin.endswith("\n"))
+        rec = self.store.snapshot()["deadbeef"]
+        self.assertEqual((rec["status"], rec["used_ip"], rec["used_device"]), ("used", "10.0.0.5", "laptop"))
+
+    def test_from_is_passed_to_grant(self):
+        code2 = "q" * 32
+        self.add_invite(id="feedface", code_sha256=panel.code_hash(code2), **{"from": "10.0.0.0/24"})
+        status, resp = self.enroll(self.body(code=code2))
+        self.assertEqual(status, 200)
+        self.assertEqual(self.grants[0][0][-2:], ["--from", "10.0.0.0/24"])
+
+    def test_wrong_used_expired_revoked_all_look_the_same(self):
+        msgs = set()
+        status, resp = self.enroll(self.body(code="z" * 32)); msgs.add(resp["error"]); self.assertEqual(status, 403)
+        self.enroll()                                   # 用掉
+        status, resp = self.enroll(); msgs.add(resp["error"]); self.assertEqual(status, 403)
+        self.add_invite(id="aaaa0001", code_sha256=panel.code_hash("e" * 32), expires="2000-01-01T00:00:00Z")
+        status, resp = self.enroll(self.body(code="e" * 32)); msgs.add(resp["error"])
+        self.add_invite(id="aaaa0002", code_sha256=panel.code_hash("r" * 32))
+        self.store.revoke("aaaa0002")
+        status, resp = self.enroll(self.body(code="r" * 32)); msgs.add(resp["error"])
+        self.assertEqual(msgs, {panel.GENERIC_INVALID})
+        self.assertEqual(len(self.grants), 1)
+
+    def test_from_restriction(self):
+        code2 = "q" * 32
+        self.add_invite(id="feedface", code_sha256=panel.code_hash(code2), **{"from": "192.168.1.0/24"})
+        status, resp = self.enroll(self.body(code=code2), ip="10.0.0.9")
+        self.assertEqual(status, 403)
+        self.assertEqual(self.grants, [])
+        self.assertEqual(self.store.snapshot()["feedface"]["status"], "pending")
+        self.assertEqual(self.enroll(self.body(code=code2), ip="192.168.1.7")[0], 200)
+
+    def test_rsa_2048_rejected_and_invite_stays_pending(self):
+        status, resp = self.enroll(self.body(pubkey=fake_pubkey("rsa", 2048)))
+        self.assertEqual(status, 400)
+        self.assertIn("RSA", resp["error"])
+        self.assertEqual(self.store.snapshot()["deadbeef"]["status"], "pending")
+
+    def test_grant_failure_keeps_invite_pending(self):
+        status, resp = self.enroll(grant=lambda args, stdin_text=None, timeout=0: (1, "", "错误：标签 ap1 已被另一把公钥使用"))
+        self.assertEqual(status, 409)
+        self.assertFalse(resp["ok"])
+        self.assertIn("标签 ap1", resp["error"])
+        self.assertEqual(self.store.snapshot()["deadbeef"]["status"], "pending")
+        self.assertEqual(self.enroll()[0], 200)         # 修好后同一个码还能用
+
+    def test_disabled_project(self):
+        with patch.object(panel, "is_disabled", return_value=True):
+            status, resp = self.enroll()
+        self.assertEqual(status, 409)
+        self.assertEqual(self.grants, [])
+
+    def test_lockout_after_five_failures_per_ip(self):
+        for _ in range(5):
+            self.assertEqual(self.enroll(self.body(code="z" * 32), ip="10.9.9.9")[0], 403)
+        status, resp = self.enroll(ip="10.9.9.9")                      # 正确的码也被拒
+        self.assertEqual(status, 429)
+        self.assertEqual(self.grants, [])
+        self.assertEqual(self.enroll(ip="10.9.9.8")[0], 200)           # 别的 IP 不受影响
+        self.assertEqual(self.state.limiter.locked_for("10.9.9.9"), 0)  # 登录限流是另一份计数
+        self.assertEqual(self.state.enroll_limiter.lock_seconds, 900)
+
+    def test_audit_never_contains_code(self):
+        self.enroll(self.body(code="z" * 32))
+        self.enroll()
+        log = Path(self.log).read_text(encoding="utf-8")
+        self.assertIn("enroll", log)
+        self.assertNotIn(self.code, log)
+        self.assertNotIn("z" * 32, log)
+        self.assertIn("invalid_code", log)
+        self.assertIn("SHA256:testfp", log)
+
+    def test_concurrent_same_code_succeeds_once(self):
+        import threading
+        import time as _t
+        results = []
+
+        def slow_grant(args, stdin_text=None, timeout=0):
+            _t.sleep(0.2)
+            self.grants.append(args)
+            return 0, "ok", ""
+
+        def worker(ip):
+            results.append(self.enroll(ip=ip, grant=slow_grant)[0])
+
+        threads = [threading.Thread(target=worker, args=("10.0.0.%d" % i,)) for i in (1, 2, 3)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(sorted(results), [200, 403, 403])
+        self.assertEqual(len(self.grants), 1)
+
+
+class MakeInviteTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.dir = tempfile.TemporaryDirectory()
+        self.store = panel.InviteStore(str(Path(self.dir.name) / "invites.json"))
+        cert = Path(self.dir.name) / "tls.crt"
+        import ssl
+        cert.write_text(ssl.DER_cert_to_PEM_cert(b"cert-der"))
+        self.conf = {"lan_ip": "192.0.2.10", "port": 9300, "tls_cert": str(cert)}
+        self.keys = Path(self.dir.name) / "keys"
+        self.keys.mkdir()
+        (self.keys / "demo").write_text("restrict,pty ssh-ed25519 AAAA existing-key\n")
+        self.patches = [
+            patch.object(panel, "registered_names", return_value={"demo", "off"}),
+            patch.object(panel, "account_info", return_value=(1001, True)),
+            patch.object(panel, "is_disabled", side_effect=lambda n: n == "off"),
+            patch.object(panel, "KEYS_DIR", str(self.keys)),
+            patch.object(panel, "read_text", side_effect=lambda p, limit=0: open(p, encoding="utf-8").read() if p.startswith(self.dir.name) else "ssh-ed25519 HOSTKEY root@x"),
+        ]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+        self.dir.cleanup()
+
+    def make(self, project="demo", label="ap1", hours=24, frm="", now=1_800_000_000.0):
+        return panel.make_invite(self.store, self.conf, project, label, hours, frm, "cli:root", now=now, sshd_port_fn=lambda: 2222)
+
+    def test_payload_contents(self):
+        import base64
+        import hashlib
+        import ssl
+        with patch("glob.glob", return_value=["/etc/ssh/ssh_host_ed25519_key.pub"]):
+            text, rec = self.make()
+        body = text[len("srvinvite1."):]
+        data = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
+        self.assertEqual((data["v"], data["host"], data["ssh_port"], data["project"], data["panel"], data["label"]),
+                         (1, "192.0.2.10", 2222, "demo", "https://192.0.2.10:9300", "ap1"))
+        self.assertEqual(data["panel_cert_sha256"], hashlib.sha256(b"cert-der").hexdigest())
+        self.assertEqual(data["ssh_host_keys"], ["ssh-ed25519 HOSTKEY"])
+        self.assertEqual(data["expires"], "2027-01-16T08:00:00Z")
+        self.assertGreaterEqual(len(data["code"]), 32)
+        self.assertEqual(rec["code_sha256"], panel.code_hash(data["code"]))
+        self.assertNotIn(data["code"], Path(self.store.path).read_text())
+        self.assertNotIn("PRIVATE", text)
+
+    def test_rules(self):
+        with patch("glob.glob", return_value=["x"]):
+            self.make()
+            for kwargs in ({"label": "ap1"}, {"label": "existing-key"}, {"label": "bad label"}, {"hours": 0}, {"hours": 169},
+                           {"hours": "x"}, {"frm": "nonsense"}, {"project": "nosuch"}, {"project": "off"}):
+                with self.assertRaises(panel.InviteError, msg=str(kwargs)):
+                    self.make(**kwargs)
+            self.make(label="ap2", hours=168, frm="10.0.0.0/24")
+
+
 
 
 if __name__ == "__main__":

@@ -97,6 +97,19 @@ if [ ! -s "$USERS_FILE" ]; then
 fi
 chmod 600 "$USERS_FILE"
 
+# ── 面板配置：服务与 srv-project invite（CLI）共用，保证邀请里的地址、端口、证书指纹与服务一致
+printf '{"lan_ip": "%s", "port": %s, "tls_cert": "%s"}\n' "$LAN_IP" "$PORT" "$CERT" >"$CONF_DIR/panel.conf"
+chmod 644 "$CONF_DIR/panel.conf"
+# 邀请库：不存在时建空库；重复安装保留已有邀请
+[ -s "$CONF_DIR/invites.json" ] || python3 - "$CONF_DIR/invites.json" <<'PYEND'
+import os, sys
+p = sys.argv[1]
+fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(fd, "w") as f:
+    f.write('{"invites": {}, "version": 1}\n')
+PYEND
+[ ! -e "$CONF_DIR/invites.json" ] || chmod 600 "$CONF_DIR/invites.json"
+
 EXTRA=""
 for c in ${ALLOW_FROM[@]+"${ALLOW_FROM[@]}"}; do EXTRA="$EXTRA --allow-from $c"; done
 
@@ -133,4 +146,5 @@ else
     echo "  已有用户库，用现有账号密码登录。忘记密码：sudo bash $0 --reset-admin"
 fi
 [ ${#ALLOW_FROM[@]} -eq 0 ] || echo "  只允许来源网段：${ALLOW_FROM[*]}（本机回环不受限）"
+echo "设备邀请：面板「邀请」页，或 sudo srv-project invite <项目> --label <标签>"
 echo "审计日志：/var/log/srv-panel.log"

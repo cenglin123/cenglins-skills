@@ -7,11 +7,10 @@ description: >-
   Works via SSH (git bundle, rsync, git archive + scp). Preserves runtime data
   (config, uploads, DB) by default unless the user explicitly asks to replace
   them. If the server is unreachable or connection details are missing, stop
-  and request them before continuing. Also covers shared /srv servers: an agent
-  requesting deploy access for a project (generate key, write the access
-  request, first deploy from received access info) and the server admin's agent
-  approving it (create project account, grant key, produce access info), plus
-  the root management panel.
+  and request them before continuing. Also covers shared /srv servers: the
+  server admin's agent creating a project and issuing an invite, an agent
+  enrolling with a received `srvinvite1.` invite and doing the first deploy,
+  plus the root management panel.
 ---
 
 # Push To Server
@@ -88,19 +87,23 @@ Deploy projects under `/srv/<project>/`. The script rejects every path under
 
 ### Shared `/srv` Server Onboarding
 
-Agents run the whole onboarding; humans only forward messages, approve, and
-change the application password. Read
+Agents run the whole onboarding by invitation; humans only ask for or issue an
+invite, forward it once, and change the application password. Read
 [`references/project-accounts.md`](references/project-accounts.md) before any
 step and act only in your own role:
 
 | Phase | Who | What |
 |---|---|---|
 | 0. Server setup (once) | Server admin, in their own terminal | Install `srv-project` with `--delegate <admin>`, then the root panel ([`references/srv-panel.md`](references/srv-panel.md)); admin completes the panel's first login. The panel comes before the first project. |
-| 1. Request | Requester's agent | Generate a per-project ed25519 key, build the access request (project, port, runtime, public key, fingerprint) for the user to forward. |
-| 2. Approve | Admin's agent | Restate the request, wait for the admin's explicit approval, then `sudo -n srv-project create`, `grant -` and `info`; hand the `info` output to the admin to forward. |
-| 3. First deploy | Requester's agent | SSH alias, `config-save`, `bootstrap`, runtime, `config/.env` with random secrets, systemd user service, post-sync/health scripts, then deliver URL and initial password to its user. |
+| 1. Invite | Admin, or admin's agent after explicit approval | Create the project if new (`sudo -n srv-project create`), then `sudo -n srv-project invite <project> --label <person-device>`; the admin forwards the one-line `srvinvite1.…` text to the requester. Issuing the invite is the approval. |
+| 2. Enroll | Requester's agent | `safe_push.py enroll '<invite>'`: generates the key, pins the panel certificate, registers the public key, writes known_hosts and the SSH alias from the invite, verifies login. |
+| 3. First deploy | Requester's agent | `config-save`, `bootstrap`, runtime, `config/.env` with random secrets, systemd user service, post-sync/health scripts, then deliver URL and initial password to its user. |
 
-Never collect or type sudo passwords, never send private keys, and never
+The SSH host keys written by `enroll` come from the admin's invite, a trusted
+channel, so this is not automatic host-key acceptance; a conflicting existing
+known_hosts entry still stops. A new device for the same person is a new
+invite; revoke the old key afterwards. Never collect or type sudo passwords,
+never send private keys or invite codes anywhere but the requester, and never
 relay application passwords between the two sides.
 
 ---
@@ -125,6 +128,9 @@ python <SKILL_DIR>/scripts/safe_push.py deploy --repo /path/to/repo
 
 # Execute deploy (requires --execute flag)
 python <SKILL_DIR>/scripts/safe_push.py deploy --repo /path/to/repo --execute
+
+# Enroll this machine on a shared /srv server from an admin's invite (no --repo)
+python <SKILL_DIR>/scripts/safe_push.py enroll 'srvinvite1.…'
 
 # First delivery into an empty remote repo/ directory (dry-run, then --execute)
 python <SKILL_DIR>/scripts/safe_push.py bootstrap --repo /path/to/repo

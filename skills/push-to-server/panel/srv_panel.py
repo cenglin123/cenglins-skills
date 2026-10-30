@@ -10,6 +10,7 @@
                          [--allowed-host 主机名或IP]... [--users-file /etc/srv-panel/users.json]
                          [--log-file /var/log/srv-panel.log]
     python3 srv_panel.py --bootstrap | --reset-admin     （安装脚本调用）
+    python3 srv_panel.py invite create <项目> --label L [--hours N] [--from X] | list | revoke <编号>
 
 纯函数（解析、校验、密码、限流）可直接 import 测试；导入时不检查 root、不启动服务。
 """
@@ -837,6 +838,476 @@ def needs_password_change(user, path):
     return bool(user and user.get("must_change")) and path not in ("/password", "/logout")
 
 
+# ───────────────────────── 设备邀请（邀请码制登记） ─────────────────────────
+
+INVITES_FILE = "/etc/srv-panel/invites.json"
+PANEL_CONF = "/etc/srv-panel/panel.conf"
+INVITE_PREFIX = "srvinvite1."
+DEVICE_RE = re.compile(r"^[A-Za-z0-9._ -]{1,64}$")
+ENROLL_MAX_BODY = 8 * 1024
+GENERIC_INVALID = "邀请码无效或已失效"
+STATUS_TEXT = {"pending": "待使用", "used": "已使用", "revoked": "已作废", "expired": "已过期"}
+ALLOWED_KEY_TYPES = ("ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521", "ssh-rsa")
+MIN_RSA_BITS = 3072
+
+
+class InviteError(ValueError):
+    """生成/管理邀请时的中文错误。"""
+
+
+class EnrollError(Exception):
+    """登记请求被拒：msg 对外可见，status 为 HTTP 状态码，why 只进审计日志。"""
+
+    def __init__(self, msg, status=400, why="bad_request"):
+        super().__init__(msg)
+        self.msg, self.status, self.why = msg, status, why
+
+
+def new_code():
+    return secrets.token_urlsafe(24)       # 192 bit
+
+
+def code_hash(code):
+    return hashlib.sha256(code.encode("utf-8")).hexdigest()
+
+
+def iso_utc(ts):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+
+
+def parse_iso_utc(text):
+    import calendar
+    return calendar.timegm(time.strptime(text, "%Y-%m-%dT%H:%M:%SZ"))
+
+
+def encode_invite(payload):
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    import base64
+    return INVITE_PREFIX + base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def invite_status(rec, now=None):
+    """pending 的邀请过期按时间计算；其余状态原样返回。"""
+    st = rec.get("status", "pending")
+    if st == "pending":
+        try:
+            if (now if now is not None else time.time()) >= parse_iso_utc(rec["expires"]):
+                return "expired"
+        except (KeyError, ValueError):
+            return "expired"
+    return st
+
+
+def parse_host_keys(texts):
+    """ssh_host_*_key.pub 文件内容列表 → ["类型 base64", ...]（去掉注释字段）。"""
+    out = []
+    for t in texts:
+        parts = t.split()
+        if len(parts) >= 2 and re.fullmatch(r"[A-Za-z0-9@.-]+", parts[0]) and re.fullmatch(r"[A-Za-z0-9+/=]+", parts[1]):
+            line = parts[0] + " " + parts[1]
+            if line not in out:
+                out.append(line)
+    return out
+
+
+def cert_sha256_hex(pem_text):
+    """PEM 证书 → DER 的 SHA256（hex）。"""
+    der = ssl.PEM_cert_to_DER_cert(pem_text.strip())
+    return hashlib.sha256(der).hexdigest()
+
+
+def normalize_from_spec(spec):
+    """邀请的来源限制：单个 IP 或 CIDR（可逗号分隔多个）。返回规范化文本，空串表示不限制。"""
+    spec = re.sub(r"\s*,\s*", ",", (spec or "").strip())
+    if not spec:
+        return ""
+    if not FROM_RE.fullmatch(spec) or len(spec) > 200:
+        raise InviteError("来源限制格式不对（用 IP 或 CIDR，多个用逗号分隔）")
+    for part in spec.split(","):
+        try:
+            ipaddress.ip_network(part.strip(), strict=False)
+        except ValueError:
+            raise InviteError("来源限制格式不对：%s" % part)
+    return ",".join(p.strip() for p in spec.split(","))
+
+
+def invite_from_allows(spec, ip_text):
+    """邀请自带的来源限制；与面板 --allow-from 不同，回环地址不享受豁免。"""
+    if not spec:
+        return True
+    ip = normalize_ip(ip_text)
+    if ip is None:
+        return False
+    for part in spec.split(","):
+        try:
+            if ip in ipaddress.ip_network(part.strip(), strict=False):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def label_conflict(label, key_labels, pending_labels):
+    """label 不能与已授权公钥标签或同项目 pending 邀请重复。返回中文原因或 None。"""
+    if label in key_labels:
+        return "标签 %s 已被该项目的一把已授权公钥使用" % label
+    if label in pending_labels:
+        return "标签 %s 已有一条待使用的邀请" % label
+    return None
+
+
+def _ssh_string(buf, pos):
+    n = int.from_bytes(buf[pos:pos + 4], "big")
+    return buf[pos + 4:pos + 4 + n], pos + 4 + n
+
+
+def rsa_bits(blob):
+    """ssh-rsa 公钥 blob → 模数位数。"""
+    t, pos = _ssh_string(blob, 0)
+    if t != b"ssh-rsa":
+        raise ValueError("不是 RSA 公钥")
+    _, pos = _ssh_string(blob, pos)
+    n, _ = _ssh_string(blob, pos)
+    return int.from_bytes(n, "big").bit_length()
+
+
+def validate_pubkey(line):
+    """校验登记用公钥：单行、不是私钥、类型在白名单内、RSA 至少 3072 位。返回「类型 base64」。"""
+    import base64
+    if not isinstance(line, str) or "PRIVATE KEY" in line:
+        raise ValueError("只接受公钥，不接受私钥")
+    text = line.strip()
+    if not text or "\n" in text or "\r" in text or len(text) > 4096:
+        raise ValueError("公钥须为单行")
+    parts = text.split()
+    if len(parts) < 2 or parts[0] not in ALLOWED_KEY_TYPES:
+        raise ValueError("不支持的公钥类型（支持 ed25519、ecdsa、rsa）")
+    try:
+        blob = base64.b64decode(parts[1], validate=True)
+        t, _ = _ssh_string(blob, 0)
+        if t.decode("ascii", "replace") != parts[0]:
+            raise ValueError("公钥内容与类型不符")
+        if parts[0] == "ssh-rsa" and rsa_bits(blob) < MIN_RSA_BITS:
+            raise ValueError("RSA 公钥至少 %d 位" % MIN_RSA_BITS)
+    except (ValueError, TypeError, IndexError) as e:
+        raise ValueError(str(e) if "公钥" in str(e) or "RSA" in str(e) else "公钥格式不对")
+    return parts[0] + " " + parts[1]
+
+
+def parse_enroll_body(raw):
+    """登记请求体（JSON）→ (code, pubkey, device_name)。格式不对抛 EnrollError。"""
+    if len(raw) > ENROLL_MAX_BODY:
+        raise EnrollError("请求体过大", 413, "too_large")
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        raise EnrollError("请求不是合法的 JSON", 400, "bad_json")
+    if not isinstance(data, dict):
+        raise EnrollError("请求格式不对", 400, "bad_shape")
+    code, pubkey, device = data.get("code"), data.get("pubkey"), data.get("device_name")
+    if not isinstance(code, str) or not 16 <= len(code) <= 128 or not re.fullmatch(r"[A-Za-z0-9_-]+", code):
+        raise EnrollError(GENERIC_INVALID, 403, "invalid_code")
+    if not isinstance(pubkey, str):
+        raise EnrollError("缺少公钥", 400, "bad_shape")
+    if not isinstance(device, str) or not DEVICE_RE.fullmatch(device):
+        raise EnrollError("设备名只能用字母、数字、. _ 空格 -，最长 64 个字符", 400, "bad_device")
+    return code, pubkey, device
+
+
+def load_panel_conf(path=PANEL_CONF):
+    """安装时写入的 {lan_ip, port, tls_cert}；面板服务和 CLI 共用，保证两边一致。"""
+    try:
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as e:
+        raise InviteError("读取 %s 失败：%s" % (path, e))
+    if not isinstance(d, dict):
+        raise InviteError("%s 格式不对" % path)
+    return d
+
+
+def sshd_port():
+    rc, out, _ = run_cmd(["sshd", "-T"], timeout=10)
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0] == "port" and parts[1].isdigit():
+            return int(parts[1])
+    return 22
+
+
+def _file_lock(path):
+    """跨进程文件锁（CLI 与面板服务同时改邀请库时用）；没有 fcntl 的平台退化为无锁。"""
+    import contextlib
+
+    @contextlib.contextmanager
+    def cm():
+        try:
+            import fcntl
+        except ImportError:
+            yield
+            return
+        fd = os.open(path + ".lock", os.O_WRONLY | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(fd)
+    return cm()
+
+
+class InviteStore:
+    """邀请库。只存 code 的 SHA256，不存明文；每次访问先检查文件是否被别的进程改过。"""
+
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.RLock()
+        self.invites = {}
+        self._sig = None
+        if not os.path.exists(path):
+            write_file_atomic(path, self._dump({}))
+        self._refresh()
+
+    @staticmethod
+    def _dump(invites):
+        return json.dumps({"version": 1, "invites": invites}, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+
+    def _signature(self):
+        try:
+            st = os.stat(self.path)
+            return (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return None
+
+    def _refresh(self):
+        sig = self._signature()
+        if sig != self._sig or self._sig is None:
+            try:
+                with open(self.path, encoding="utf-8") as f:
+                    data = json.load(f)
+                inv = data.get("invites") if isinstance(data, dict) else None
+                if not isinstance(inv, dict):
+                    raise ValueError("格式不对")
+            except FileNotFoundError:
+                inv = {}
+            except (OSError, ValueError) as e:
+                raise InviteError("邀请库读取失败：%s" % e)
+            self.invites = inv
+            self._sig = sig
+
+    def _save(self):
+        write_file_atomic(self.path, self._dump(self.invites))
+        self._sig = self._signature()
+
+    def _mutate(self, fn):
+        with self.lock, _file_lock(self.path):
+            self._sig = None            # 拿到锁后强制重读，避免覆盖别的进程刚写的内容
+            self._refresh()
+            result = fn()
+            self._save()
+            return result
+
+    def snapshot(self):
+        with self.lock:
+            self._refresh()
+            return {k: dict(v) for k, v in self.invites.items()}
+
+    def find_by_code(self, code):
+        h = code_hash(code)
+        with self.lock:
+            self._refresh()
+            for rec in self.invites.values():
+                if hmac.compare_digest(rec.get("code_sha256", ""), h):
+                    return dict(rec)
+        return None
+
+    def add(self, rec):
+        def go():
+            self.invites[rec["id"]] = rec
+        self._mutate(go)
+
+    def revoke(self, inv_id, now=None):
+        def go():
+            rec = self.invites.get(inv_id)
+            if not rec:
+                raise InviteError("没有这条邀请：%s" % inv_id)
+            st = invite_status(rec, now)
+            if st != "pending":
+                raise InviteError("邀请 %s 当前状态为「%s」，不能作废" % (inv_id, STATUS_TEXT.get(st, st)))
+            rec["status"] = "revoked"
+            rec["revoked_at"] = iso_utc(now if now is not None else time.time())
+            return dict(rec)
+        return self._mutate(go)
+
+    def mark_used(self, inv_id, ip, device, fingerprint, now=None):
+        def go():
+            rec = self.invites[inv_id]
+            if invite_status(rec, now) != "pending":
+                raise InviteError(GENERIC_INVALID)
+            rec.update({"status": "used", "used_at": iso_utc(now if now is not None else time.time()),
+                        "used_ip": ip, "used_device": device, "used_fingerprint": fingerprint})
+        self._mutate(go)
+
+
+def make_invite(store, conf, project, label, hours, frm, created_by, now=None, sshd_port_fn=None):
+    """生成邀请，返回 (邀请文本, 记录)。项目须已登记且启用；label 不能与已授权标签或 pending 邀请重复。"""
+    now = now if now is not None else time.time()
+    if not valid_name(project) or project not in registered_names():
+        raise InviteError("项目未登记：%s" % project)
+    uid, member = account_info(project)
+    if not member:
+        raise InviteError("%s 不是 %s 项目账号" % (project, GROUP))
+    if is_disabled(project):
+        raise InviteError("项目 %s 已停用，不能生成邀请" % project)
+    if not LABEL_RE.fullmatch(label or ""):
+        raise InviteError("标签只能用字母、数字和 . _ @ -（1–64 字符）")
+    try:
+        hours = int(hours)
+    except (TypeError, ValueError):
+        raise InviteError("有效小时须为 1–168 的整数")
+    if not 1 <= hours <= 168:
+        raise InviteError("有效小时须为 1–168 的整数")
+    frm = normalize_from_spec(frm)
+    for key in ("lan_ip", "port", "tls_cert"):
+        if not conf.get(key):
+            raise InviteError("面板未安装或 %s 缺少 %s，请先运行 install_panel.sh" % (PANEL_CONF, key))
+    key_labels = {k["label"] for k in (parse_key_line(l) for l in read_text(os.path.join(KEYS_DIR, project)).splitlines()) if k}
+    snap = store.snapshot()
+    pending = {r["label"] for r in snap.values() if r.get("project") == project and invite_status(r, now) == "pending"}
+    problem = label_conflict(label, key_labels, pending)
+    if problem:
+        raise InviteError(problem)
+    host_files = []
+    import glob
+    for f in sorted(glob.glob("/etc/ssh/ssh_host_*_key.pub")):
+        host_files.append(read_text(f))
+    host_keys = parse_host_keys(host_files)
+    if not host_keys:
+        raise InviteError("读不到 /etc/ssh/ssh_host_*_key.pub，无法生成邀请")
+    try:
+        fp = cert_sha256_hex(read_text(conf["tls_cert"]))
+    except (ValueError, OSError) as e:
+        raise InviteError("读取面板证书失败：%s" % e)
+    code = new_code()
+    ssh_port = (sshd_port_fn or sshd_port)()
+    expires = iso_utc(now + hours * 3600)
+    payload = {"v": 1, "host": conf["lan_ip"], "ssh_port": ssh_port, "project": project,
+               "panel": "https://%s:%s" % (conf["lan_ip"], conf["port"]), "panel_cert_sha256": fp,
+               "ssh_host_keys": host_keys, "code": code, "expires": expires, "label": label}
+    rec = {"id": secrets.token_hex(4), "code_sha256": code_hash(code), "project": project, "label": label,
+           "from": frm, "created_by": created_by, "created": iso_utc(now), "expires": expires,
+           "ssh_port": ssh_port, "status": "pending"}
+    store.add(rec)
+    return encode_invite(payload), rec
+
+
+def invite_summary(rec, now=None):
+    st = invite_status(rec, now)
+    s = "%s  %s  %s  %s  过期 %s" % (rec["id"], rec["project"], rec["label"], STATUS_TEXT.get(st, st), rec["expires"])
+    if rec.get("from"):
+        s += "  限来源 %s" % rec["from"]
+    if rec.get("status") == "used":
+        s += "  [%s 从 %s 登记，设备 %s，指纹 %s]" % (rec.get("used_at", ""), rec.get("used_ip", ""),
+                                                  rec.get("used_device", ""), rec.get("used_fingerprint", ""))
+    return s
+
+
+def process_enroll(state, raw, ip, grant=None, info_fn=None):
+    """处理 POST /enroll。返回 (HTTP 状态码, 响应 dict)。同一个码并发提交只会成功一次。"""
+    lim = state.enroll_limiter
+
+    def fail(e, count=True, extra=None):
+        if count:
+            lim.record_failure(ip)
+        params = {"result": e.why}
+        params.update(extra or {})
+        audit(state.log_file, "enroll", params, 1, ip)
+        return e.status, {"ok": False, "error": e.msg}
+
+    left = lim.locked_for(ip)
+    if left > 0:
+        audit(state.log_file, "enroll", {"result": "locked"}, 429, ip)
+        return 429, {"ok": False, "error": "尝试次数过多，请 %d 分钟后再试" % ((left + 59) // 60)}
+    try:
+        code, pubkey, device = parse_enroll_body(raw)
+    except EnrollError as e:
+        return fail(e)
+    with state.enroll_lock:
+        try:
+            rec = state.invites.find_by_code(code)
+        except InviteError as e:
+            return fail(EnrollError("服务端邀请库异常", 500, "store_error"), count=False)
+        if not rec or invite_status(rec) != "pending":
+            return fail(EnrollError(GENERIC_INVALID, 403, "invalid_code"))
+        extra = {"invite": rec["id"], "project": rec["project"], "device": device}
+        if not invite_from_allows(rec.get("from", ""), ip):
+            return fail(EnrollError("来源地址不在邀请允许的范围内", 403, "from_denied"), extra=extra)
+        try:
+            pub = validate_pubkey(pubkey)
+        except ValueError as e:
+            return fail(EnrollError(str(e), 400, "bad_pubkey"), extra=extra)
+        project = rec["project"]
+        uid, member = account_info(project)
+        if project not in registered_names() or not member or is_disabled(project):
+            return fail(EnrollError("项目不存在或已停用", 409, "project_unavailable"), count=False, extra=extra)
+        args = [SRV_PROJECT, "grant", project, "-", "--label", rec["label"]]
+        if rec.get("from"):
+            args += ["--from", rec["from"]]
+        with state.lock:
+            rc, out, err = (grant or run_cmd)(args, stdin_text=pub + "\n", timeout=60)
+        if rc != 0:
+            reason = (err.strip() or out.strip() or "未知错误").splitlines()[0]
+            return fail(EnrollError("授权失败：" + reason, 409, "grant_failed"), count=False, extra=extra)
+        fp = key_fingerprint(pub)
+        try:
+            state.invites.mark_used(rec["id"], ip, device, fp)
+        except InviteError as e:
+            return fail(EnrollError(GENERIC_INVALID, 403, "invalid_code"), extra=extra)
+        info = (info_fn or project_info)(project, state.lan_ip)
+    lim.record_success(ip)
+    audit(state.log_file, "enroll", dict(extra, result="ok", fingerprint=fp), 0, ip)
+    return 200, {"ok": True, "project": project, "account": project, "ssh_port": rec.get("ssh_port", 22),
+                 "host": state.lan_ip, "fingerprint": fp, "info": info}
+
+
+def invite_cli(argv):
+    """srv_panel.py invite create|list|revoke …（root 运行，直接读写邀请库）。"""
+    ap = argparse.ArgumentParser(prog="srv_panel.py invite", description="设备邀请管理")
+    ap.add_argument("--invites-file", default=INVITES_FILE)
+    ap.add_argument("--panel-conf", default=PANEL_CONF)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    c = sub.add_parser("create", help="生成邀请")
+    c.add_argument("project")
+    c.add_argument("--label", required=True)
+    c.add_argument("--hours", type=int, default=24)
+    c.add_argument("--from", dest="frm", default="")
+    sub.add_parser("list", help="列出邀请").add_argument("--project")
+    sub.add_parser("revoke", help="作废邀请").add_argument("id")
+    a = ap.parse_args(argv)
+    try:
+        store = InviteStore(a.invites_file)
+        if a.cmd == "create":
+            who = "cli:" + (os.environ.get("SUDO_USER") or "root")
+            text, rec = make_invite(store, load_panel_conf(a.panel_conf), a.project, a.label, a.hours, a.frm, who)
+            print(text)
+            sys.stderr.write("邀请 %s（项目 %s，标签 %s）有效至 %s UTC。上面这一行原样转发给申请方，仅此一次显示。\n"
+                             % (rec["id"], rec["project"], rec["label"], rec["expires"]))
+        elif a.cmd == "list":
+            rows = [r for r in store.snapshot().values() if not a.project or r.get("project") == a.project]
+            for r in sorted(rows, key=lambda r: r["created"]):
+                print(invite_summary(r))
+            if not rows:
+                print("（没有邀请）")
+        else:
+            rec = store.revoke(a.id)
+            print("已作废邀请 %s（项目 %s，标签 %s）" % (rec["id"], rec["project"], rec["label"]))
+    except InviteError as e:
+        sys.exit("错误：%s" % e)
+    audit(LOG_FILE, "invite_" + a.cmd, {k: v for k, v in vars(a).items() if k in ("project", "label", "id", "hours", "frm")},
+          0, "cli:" + (os.environ.get("SUDO_USER") or "root"))
+
+
 # ───────────────────────── 审计与变更操作 ─────────────────────────
 
 _log_lock = threading.Lock()
@@ -961,7 +1432,7 @@ def page(title, body, csrf=None, flash=""):
         if u and u.get("must_change"):
             links = ""
         else:
-            links = ('<a href="/">总览</a><a href="/global">全局检查</a><a href="/new">新建项目</a>'
+            links = ('<a href="/">总览</a><a href="/global">全局检查</a><a href="/new">新建项目</a><a href="/invites">邀请</a>'
                      + ('<a href="/users">用户管理</a>' if u and u.get("role") == "super" else ""))
         who = ('<span class="mute">%s（%s）</span><a href="/password">修改密码</a>'
                % (esc(u["name"]), "超级管理员" if u["role"] == "super" else "管理员")) if u else ""
@@ -1048,8 +1519,8 @@ def render_project(p, tools, findings, decl, csrf, info_text=""):
                 '<button class="danger">删除项目…</button></form>' % hidden(csrf, action="delete", project=name))
     body += '<div class="card"><h2>项目操作</h2><p>%s</p></div>' % ops
     if info_text:
-        body += ('<div class="card"><h2>接入信息</h2><p class="mute">可直接复制转发给申请方；不含密钥内容和密码。</p><pre>%s</pre></div>'
-                 % esc(info_text))
+        body += ('<div class="card"><h2>接入信息</h2><p class="mute">可直接复制转发给申请方；不含密钥内容和密码。</p><pre>%s</pre>'
+                 '%s</div>' % (esc(info_text), '' if p["disabled"] else '<p><a href="/invites?project=%s">为此项目生成邀请</a>（新设备凭邀请自助登记公钥）</p>' % esc(urllib.parse.quote(name))))
     # 公钥
     rows = "".join(
         "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td><form class='inline' method='post' action='/action'>%s<button class='danger'>吊销…</button></form></td></tr>"
@@ -1210,11 +1681,69 @@ USER_CONFIRM_TEXT = {
 }
 
 
+# ───────────────────────── 邀请页面 ─────────────────────────
+
+INVITE_CONFIRM_TEXT = {
+    "revoke_invite": "作废后这条邀请立即失效，申请方再用它登记会被拒绝；已经完成的登记不受影响。",
+}
+
+
+def enabled_projects():
+    """已登记、账号在 srvproj 组且未停用的项目名。"""
+    names = []
+    for r in load_registry():
+        uid, member = account_info(r["name"])
+        if uid is not None and member and not is_disabled(r["name"]):
+            names.append(r["name"])
+    return names
+
+
+def render_invites(csrf, projects, invites, preselect="", error=""):
+    err = '<div class="problem">%s</div>' % esc(error) if error else ""
+    opts = "".join('<option value="%s"%s>%s</option>' % (esc(n), " selected" if n == preselect else "", esc(n)) for n in projects)
+    form = ('<div class="card"><h2>生成邀请</h2>%s<form method="post" action="/invites/action">%s'
+            '<p>项目（只列已启用的项目）<select name="project" required>%s</select></p>'
+            '<p>标签（设备名，字母数字 . _ @ -；登记后成为公钥标签）<input type="text" name="label" required maxlength="64"></p>'
+            '<p>有效小时（1–168）<input type="text" name="hours" value="24" maxlength="3"></p>'
+            '<p>来源限制（可选，IP 或 CIDR，多个用逗号分隔；同时限制登记来源和这把公钥的登录来源）<input type="text" name="from" maxlength="200"></p>'
+            '<button class="primary">生成邀请</button></form></div>'
+            % (err, hidden(csrf, action="create_invite"), opts or "<option disabled>（没有已启用的项目）</option>"))
+    now = time.time()
+    rows = ""
+    for rec in sorted(invites.values(), key=lambda r: r.get("created", ""), reverse=True):
+        st = invite_status(rec, now)
+        cls = {"pending": "ok", "used": "mute", "revoked": "bad", "expired": "warn"}.get(st, "mute")
+        used = ""
+        if rec.get("status") == "used":
+            used = "%s 从 %s，设备 %s，指纹 %s" % (rec.get("used_at", ""), rec.get("used_ip", ""), rec.get("used_device", ""), rec.get("used_fingerprint", ""))
+        op = ""
+        if st == "pending":
+            op = ('<form class="inline" method="post" action="/invites/action">%s<button class="danger">作废…</button></form>'
+                  % hidden(csrf, action="revoke_invite", id=rec["id"]))
+        rows += ("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
+                 % (esc(rec["id"]), esc(rec["project"]), esc(rec["label"]), tag(STATUS_TEXT.get(st, st), cls),
+                    esc(rec["expires"]), esc(rec.get("from") or "不限"), esc(used or rec.get("created_by", "")), op))
+    table = ('<div class="card"><h2>邀请列表</h2><table><tr><th>编号</th><th>项目</th><th>标签</th><th>状态</th><th>过期（UTC）</th>'
+             '<th>来源限制</th><th>创建者 / 使用信息</th><th></th></tr>%s</table></div>'
+             % (rows or '<tr><td colspan="8" class="mute">还没有邀请</td></tr>'))
+    return page("邀请", "<h1>设备邀请</h1>" + form + table, csrf)
+
+
+def render_invite_result(text, rec, csrf):
+    return page("邀请已生成", '<h1>邀请已生成</h1><div class="card"><p>项目 <b>%s</b>，标签 <b>%s</b>，有效至 %s（UTC）%s。</p>'
+                '<p class="warn"><b>邀请文本只显示这一次，离开本页后无法再查看</b>（可以作废后重新生成）。</p>'
+                '<textarea readonly rows="6" style="font-family:monospace">%s</textarea>'
+                '<p>原样发给申请方，让他交给自己的 agent（由 agent 运行 <code>safe_push.py enroll</code>）。</p></div>'
+                '<p><a href="/invites">返回邀请页</a></p>'
+                % (esc(rec["project"]), esc(rec["label"]), esc(rec["expires"]),
+                   "，仅限来源 " + esc(rec["from"]) if rec.get("from") else "", esc(text)), csrf)
+
+
 # ───────────────────────── HTTP 服务 ─────────────────────────
 
 class State:
     def __init__(self, store, port, extra_hosts=(), log_file=LOG_FILE, allow_nets=(), secure=False,
-                 initial_pw_file=INITIAL_PW_FILE, limiter=None, lan_ip=""):
+                 initial_pw_file=INITIAL_PW_FILE, limiter=None, lan_ip="", invites=None):
         self.store = store
         self.port = port
         self.extra_hosts = tuple(extra_hosts)
@@ -1222,6 +1751,9 @@ class State:
         self.allow_nets = list(allow_nets)
         self.secure = secure
         self.lan_ip = lan_ip
+        self.invites = invites
+        self.enroll_limiter = RateLimiter(5, 900, 900)     # 与登录限流分开计数
+        self.enroll_lock = threading.Lock()                 # 同一个码并发提交只成功一次
         self.initial_pw_file = initial_pw_file
         self.limiter = limiter or RateLimiter()
         self.secret = secrets.token_bytes(32)
@@ -1320,10 +1852,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 audit(st.log_file, "ip_denied", {}, 403, ip)
             self.send(403, "<h1>403 Forbidden</h1>")
             return False
+        return self.host_guard()
+
+    def host_guard(self):
+        st = self.state
         if not host_ok(self.headers.get("Host", ""), st.port, st.extra_hosts):
             self.send(400, "<h1>Bad Host</h1>")
             return False
         return True
+
+    def send_json(self, code, obj):
+        self.send(code, json.dumps(obj, ensure_ascii=False), ctype="application/json; charset=utf-8")
+
+    def do_enroll(self):
+        """POST /enroll：不需要登录、不检查 CSRF、不受 --allow-from 限制（受邀请自己的 from 限制），Host 头照常校验。"""
+        if not self.host_guard():
+            return
+        try:
+            n = int(self.headers.get("Content-Length", "-1"))
+        except ValueError:
+            n = -1
+        if n < 0 or n > ENROLL_MAX_BODY:
+            return self.send_json(413, {"ok": False, "error": "请求体过大或缺少 Content-Length"})
+        raw = self.rfile.read(n)
+        code, resp = process_enroll(self.state, raw, self.who())
+        self.send_json(code, resp)
 
     def read_form(self):
         try:
@@ -1359,6 +1912,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             if u.path == "/password":
                 return self.send(200, render_password(csrf, me, forced=bool(user.get("must_change"))))
+            if u.path == "/invites":
+                return self.send(200, render_invites(csrf, enabled_projects(), self.state.invites.snapshot(), q.get("project", "")))
             if u.path == "/users":
                 if user["role"] != "super":
                     return self.send(403, page("无权限", "<h1>只有超级管理员能管理用户</h1>", csrf))
@@ -1396,9 +1951,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
     # --- POST ---
     def do_POST(self):
         _ctx.user = None
+        path = urllib.parse.urlsplit(self.path).path
+        if path == "/enroll":
+            return self.do_enroll()
         if not self.guard():
             return
-        path = urllib.parse.urlsplit(self.path).path
         form = self.read_form()
         if form is None:
             return
@@ -1424,6 +1981,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if user["role"] != "super":
                 return self.send(403, page("无权限", "<h1>只有超级管理员能管理用户</h1>", csrf))
             return self.do_users_action(form, me, csrf)
+        if path == "/invites/action":
+            return self.do_invites_action(form, me, csrf)
         if path != "/action":
             return self.send(404, page("未找到", "<h1>404</h1>", csrf))
         try:
@@ -1458,6 +2017,34 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if locked:
             audit(st.log_file, "login_locked", {"minutes": int(st.limiter.lock_seconds // 60)}, 429, ip)
         self.login_page(401, "用户名或密码不对")
+
+    def do_invites_action(self, form, me, csrf):
+        st = self.state
+        action = form.get("action", "")
+        try:
+            if action == "create_invite":
+                conf = load_panel_conf(getattr(st, "panel_conf", PANEL_CONF))
+                conf.setdefault("lan_ip", st.lan_ip)
+                conf.setdefault("port", st.port)
+                conf.setdefault("tls_cert", getattr(st, "tls_cert", ""))
+                text, rec = make_invite(st.invites, conf, form.get("project", "").strip(), form.get("label", "").strip(),
+                                        form.get("hours", "24").strip() or "24", form.get("from", ""), "panel:" + me)
+                audit(st.log_file, "invite_create", {"invite": rec["id"], "project": rec["project"], "label": rec["label"],
+                                                      "hours": form.get("hours", "24"), "from": rec["from"], "by": me}, 0, self.who())
+                return self.send(200, render_invite_result(text, rec, csrf))
+            if action == "revoke_invite":
+                inv_id = form.get("id", "").strip()
+                if not re.fullmatch(r"[0-9a-f]{8}", inv_id):
+                    raise InviteError("邀请编号格式不对")
+                if form.get("confirmed") != "1":
+                    return self.send(200, render_confirm(form, csrf, post_to="/invites/action", texts=INVITE_CONFIRM_TEXT))
+                rec = st.invites.revoke(inv_id)
+                audit(st.log_file, "invite_revoke", {"invite": inv_id, "project": rec["project"], "by": me}, 0, self.who())
+                return self.send(200, render_invites(csrf, enabled_projects(), st.invites.snapshot(), ""))
+            raise InviteError("未知操作：%s" % action)
+        except InviteError as e:
+            audit(st.log_file, action or "invite", {"by": me}, 1, self.who())
+            return self.send(400, render_invites(csrf, enabled_projects(), st.invites.snapshot(), form.get("project", ""), str(e)))
 
     def do_password(self, form, me, user, csrf):
         st = self.state
@@ -1567,7 +2154,9 @@ def make_servers(binds, port, state, tls_ctx=None):
 def main(argv=None):
     ap = argparse.ArgumentParser(description="/srv 项目管理面板")
     ap.add_argument("--bind", action="append", help="监听地址，可重复，默认 127.0.0.1")
-    ap.add_argument("--port", type=int, default=9300)
+    ap.add_argument("--port", type=int, default=None, help="监听端口，默认取 panel.conf 里的 port，再默认 9300")
+    ap.add_argument("--panel-conf", default=PANEL_CONF)
+    ap.add_argument("--invites-file", default=INVITES_FILE)
     ap.add_argument("--allow-remote", action="store_true", help="允许绑定非回环地址（还必须同时提供 TLS 证书）")
     ap.add_argument("--allowed-host", action="append", default=[], help="额外允许的 Host 头主机名/IP（局域网访问时填服务器 IP）")
     ap.add_argument("--allow-from", action="append", default=[], metavar="CIDR", help="只允许这些来源网段访问，可重复；默认不限制")
@@ -1580,6 +2169,11 @@ def main(argv=None):
     ap.add_argument("--reset-admin", action="store_true", help="重置 admin 的初始密码；admin 不存在则清空用户库重建")
     ap.add_argument("--print-san", metavar="IP", help="校验局域网 IP 并打印证书 SAN，供安装脚本使用")
     ap.add_argument("--check-cidr", metavar="CIDR", help="校验 CIDR 格式，供安装脚本使用")
+    args_in = sys.argv[1:] if argv is None else list(argv)
+    if args_in and args_in[0] == "invite":
+        if os.geteuid() != 0:
+            sys.exit("需要 root 运行")
+        return invite_cli(args_in[1:])
     a = ap.parse_args(argv)
     if a.print_san:
         try:
@@ -1601,6 +2195,14 @@ def main(argv=None):
         except UserError as e:
             sys.exit(str(e))
         return
+    try:
+        conf = load_panel_conf(a.panel_conf)
+    except InviteError as e:
+        sys.exit(str(e))
+    port = a.port or int(conf.get("port") or 9300)
+    a.tls_cert = a.tls_cert or conf.get("tls_cert")
+    if a.tls_cert and not a.tls_key:
+        a.tls_key = conf.get("tls_key") or os.path.splitext(a.tls_cert)[0] + ".key"
     binds = a.bind or ["127.0.0.1"]
     remote = [b for b in binds if not is_loopback(b)]
     if remote and not a.allow_remote:
@@ -1613,20 +2215,22 @@ def main(argv=None):
         nets = parse_allow_from(a.allow_from)
         store = UserStore(a.users_file)
         tls = make_tls_context(a.tls_cert, a.tls_key) if a.tls_cert else None
-    except (ValueError, UserError, OSError, ssl.SSLError) as e:
+        invites = InviteStore(a.invites_file)
+    except (ValueError, UserError, InviteError, OSError, ssl.SSLError) as e:
         sys.exit("启动检查失败：%s" % e)
     if not store.names():
         sys.exit("用户库为空或不存在：请先 sudo bash install_panel.sh（或 python3 srv_panel.py --bootstrap）")
-    lan_ip = next((b for b in binds if not is_loopback(b) and ":" not in b), "")
-    state = State(store, a.port, a.allowed_host, a.log_file, nets, secure=tls is not None,
-                  initial_pw_file=a.initial_password_file, lan_ip=lan_ip)
+    lan_ip = next((b for b in binds if not is_loopback(b) and ":" not in b), "") or conf.get("lan_ip", "")
+    state = State(store, port, a.allowed_host, a.log_file, nets, secure=tls is not None,
+                  initial_pw_file=a.initial_password_file, lan_ip=lan_ip, invites=invites)
+    state.panel_conf, state.tls_cert = a.panel_conf, a.tls_cert
     try:
-        servers = make_servers(binds, a.port, state, tls)
+        servers = make_servers(binds, port, state, tls)
     except OSError as e:
         sys.exit("无法监听：%s" % e)
     for s in servers[1:]:
         threading.Thread(target=s.serve_forever, daemon=True).start()
-    print("srv-panel 监听 %s:%d（%s）" % ("、".join(binds), a.port, "HTTPS" if tls else "HTTP"), flush=True)
+    print("srv-panel 监听 %s:%d（%s）" % ("、".join(binds), port, "HTTPS" if tls else "HTTP"), flush=True)
     try:
         servers[0].serve_forever()
     except KeyboardInterrupt:
