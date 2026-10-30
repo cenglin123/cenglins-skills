@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # install_panel.sh — 安装 /srv 项目管理面板（以 root 运行，可重复执行）。
-#   sudo bash install_panel.sh [--lan-ip <IP>] [--allow-from <CIDR>]...
+#   sudo bash install_panel.sh [--lan-ip <IP>] [--allow-from <CIDR>]... [--enroll-only | --full]
+#     --enroll-only  登记模式：只开放 POST /enroll，管理页一律 404（有知识库后台管理项目的服务器用）
+#     --full         完整模式：恢复管理页；两者都不给则保持原有模式（首次安装默认完整模式）
 #   sudo bash install_panel.sh --reset-admin     忘记密码：重置 admin 的初始密码
 # 前提：已安装 srv-project（/usr/local/sbin/srv-project）并执行过 install。
 set -euo pipefail
@@ -20,12 +22,15 @@ die() { echo "错误：$*" >&2; exit 1; }
 
 LAN_IP=""
 RESET=0
+MODE_FLAG=""
 ALLOW_FROM=()
 while [ $# -gt 0 ]; do
     case $1 in
         --lan-ip) LAN_IP=${2:-}; [ -n "$LAN_IP" ] || die "--lan-ip 需要一个 IP"; shift 2 ;;
         --allow-from) [ -n "${2:-}" ] || die "--allow-from 需要一个网段（CIDR）"; ALLOW_FROM+=("$2"); shift 2 ;;
         --reset-admin) RESET=1; shift ;;
+        --enroll-only) [ -z "$MODE_FLAG" ] || [ "$MODE_FLAG" = --enroll-only ] || die "--enroll-only 与 --full 不能同时给"; MODE_FLAG=--enroll-only; shift ;;
+        --full) [ -z "$MODE_FLAG" ] || [ "$MODE_FLAG" = --full ] || die "--enroll-only 与 --full 不能同时给"; MODE_FLAG=--full; shift ;;
         *) die "未知参数：$1" ;;
     esac
 done
@@ -91,15 +96,18 @@ chown root:root "$CERT" "$KEY"
 chmod 644 "$CERT"
 chmod 600 "$KEY"
 
-# ── 用户库：不存在时建 admin 并写初始密码文件（不打印密码）
-if [ ! -s "$USERS_FILE" ]; then
-    python3 "$LIB_DIR/srv_panel.py" --bootstrap
-fi
-chmod 600 "$USERS_FILE"
+# ── 面板配置：服务与 srv-project 的 invite/api（CLI）共用，保证邀请里的地址、端口、证书指纹与服务一致。
+#    模式（enroll_only）只在给了 --enroll-only / --full 时改变，其余重复安装保留原值。
+MODE=$(python3 "$LIB_DIR/srv_panel.py" --write-panel-conf --lan-ip "$LAN_IP" --port "$PORT" --tls-cert "$CERT" $MODE_FLAG | tail -n 1)
+case $MODE in enroll_only=true) ENROLL_ONLY=1 ;; enroll_only=false) ENROLL_ONLY=0 ;; *) die "写入 panel.conf 失败" ;; esac
 
-# ── 面板配置：服务与 srv-project invite（CLI）共用，保证邀请里的地址、端口、证书指纹与服务一致
-printf '{"lan_ip": "%s", "port": %s, "tls_cert": "%s"}\n' "$LAN_IP" "$PORT" "$CERT" >"$CONF_DIR/panel.conf"
-chmod 644 "$CONF_DIR/panel.conf"
+# ── 用户库：完整模式下不存在时建 admin 并写初始密码文件（不打印密码）；登记模式不需要账号体系
+if [ "$ENROLL_ONLY" -eq 0 ]; then
+    if [ ! -s "$USERS_FILE" ]; then
+        python3 "$LIB_DIR/srv_panel.py" --bootstrap
+    fi
+    chmod 600 "$USERS_FILE"
+fi
 # 邀请库：不存在时建空库；重复安装保留已有邀请
 [ -s "$CONF_DIR/invites.json" ] || python3 - "$CONF_DIR/invites.json" <<'PYEND'
 import os, sys
@@ -133,17 +141,24 @@ chmod 644 "$UNIT"
 
 systemctl daemon-reload
 systemctl enable srv-panel.service >/dev/null 2>&1
+systemctl reset-failed srv-panel.service 2>/dev/null || true   # 连续重装触发 systemd 启动频率限制时也能重启
 systemctl restart srv-panel.service
 sleep 1
 systemctl is-active --quiet srv-panel.service || die "srv-panel 启动失败：journalctl -u srv-panel -n 30"
 
 echo "面板已启动：监听 $LAN_IP:$PORT（HTTPS）和 127.0.0.1:$PORT。"
-echo "浏览器打开：https://$LAN_IP:$PORT"
-echo "  首次打开浏览器会警告自签证书，选择「高级 → 继续访问」确认一次即可。"
-if [ -s "$PW_FILE" ]; then
-    echo "  首次登录：用户名 admin，初始密码在 $PW_FILE（sudo cat 查看），登录后必须改密；改密后该文件自动删除。"
+if [ "$ENROLL_ONLY" -eq 1 ]; then
+    echo "当前模式：登记模式（enroll-only）——只开放 POST /enroll，管理页一律 404；项目管理请用知识库后台【项目运维】或 srv-project。"
+    echo "  恢复管理页：sudo bash $0 --full"
 else
-    echo "  已有用户库，用现有账号密码登录。忘记密码：sudo bash $0 --reset-admin"
+    echo "当前模式：完整模式——管理页和设备登记接口都开放。改为只开放登记接口：sudo bash $0 --enroll-only"
+    echo "浏览器打开：https://$LAN_IP:$PORT"
+    echo "  首次打开浏览器会警告自签证书，选择「高级 → 继续访问」确认一次即可。"
+    if [ -s "$PW_FILE" ]; then
+        echo "  首次登录：用户名 admin，初始密码在 $PW_FILE（sudo cat 查看），登录后必须改密；改密后该文件自动删除。"
+    else
+        echo "  已有用户库，用现有账号密码登录。忘记密码：sudo bash $0 --reset-admin"
+    fi
 fi
 [ ${#ALLOW_FROM[@]} -eq 0 ] || echo "  只允许来源网段：${ALLOW_FROM[*]}（本机回环不受限）"
 echo "设备邀请：面板「邀请」页，或 sudo srv-project invite <项目> --label <标签>"

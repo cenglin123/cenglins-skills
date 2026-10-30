@@ -10,11 +10,13 @@
                          [--allowed-host 主机名或IP]... [--users-file /etc/srv-panel/users.json]
                          [--log-file /var/log/srv-panel.log]
     python3 srv_panel.py --bootstrap | --reset-admin     （安装脚本调用）
-    python3 srv_panel.py invite create <项目> --label L [--hours N] [--from X] | list | revoke <编号>
+    python3 srv_panel.py invite create <项目> --label L [--hours N] [--from X] | list | revoke <项目> <编号>
+    python3 srv_panel.py api list|status|env|info|invites|logs|svc …      （srv-project 的 JSON 子命令转调到这里）
 
 纯函数（解析、校验、密码、限流）可直接 import 测试；导入时不检查 root、不启动服务。
 """
 import argparse
+import base64
 import hashlib
 import hmac
 import html
@@ -363,22 +365,31 @@ def project_head(name):
     return out.strip() if rc == 0 and out.strip() else "（无法读取 HEAD：%s）" % (err.strip()[:120] or "无提交")
 
 
-def disk_usage(name):
+def disk_usage_kb(name):
     rc, out, _ = run_cmd(["du", "-sk", "--one-file-system", os.path.join(SRV_ROOT, name)], timeout=30)
     if rc != 0 and not out:
-        return "未知"
+        return None
     try:
-        kb = int(out.split()[0])
+        return int(out.split()[0])
     except (ValueError, IndexError):
+        return None
+
+
+def format_kb(kb):
+    if kb is None:
         return "未知"
     return "%.1f MB" % (kb / 1024) if kb < 1024 * 1024 else "%.2f GB" % (kb / 1024 / 1024)
+
+
+def disk_usage(name):
+    return format_kb(disk_usage_kb(name))
 
 
 def load_registry():
     return parse_registry(read_text(REGISTRY))
 
 
-def collect_project(entry, lst):
+def collect_project(entry, lst, keys=True):
     name = entry["name"]
     uid, member = account_info(name)
     d = {"entry": entry, "uid": uid, "member": member, "problems": [], "notes": []}
@@ -401,18 +412,19 @@ def collect_project(entry, lst):
         d["problems"].append("端口 %s 被其他账号占用：%s" % (port, "、".join(foreign)))
     elif on_port and not owners:
         d["notes"].append("端口在监听，但看不到进程属主")
-    d["keys"] = project_keys(name)
+    d["keys"] = project_keys(name) if keys else []
     d["services"], d["services_err"] = project_services(name, uid, d["disabled"])
     d["head"] = project_head(name)
-    d["disk"] = disk_usage(name)
+    d["disk_kb"] = disk_usage_kb(name)
+    d["disk"] = format_kb(d["disk_kb"])
     return d
 
 
-def collect_all():
+def collect_all(keys=True):
     lst = listeners()
     reg = load_registry()
     with ThreadPoolExecutor(max_workers=4) as ex:
-        projects = list(ex.map(lambda e: collect_project(e, lst), reg))
+        projects = list(ex.map(lambda e: collect_project(e, lst, keys), reg))
     by_port = {}
     for p in projects:
         by_port.setdefault(p["entry"]["port"], []).append(p["entry"]["name"])
@@ -1127,11 +1139,11 @@ class InviteStore:
             self.invites[rec["id"]] = rec
         self._mutate(go)
 
-    def revoke(self, inv_id, now=None):
+    def revoke(self, inv_id, now=None, project=None):
         def go():
             rec = self.invites.get(inv_id)
-            if not rec:
-                raise InviteError("没有这条邀请：%s" % inv_id)
+            if not rec or (project is not None and rec.get("project") != project):
+                raise InviteError("找不到邀请：%s" % inv_id)
             st = invite_status(rec, now)
             if st != "pending":
                 raise InviteError("邀请 %s 当前状态为「%s」，不能作废" % (inv_id, STATUS_TEXT.get(st, st)))
@@ -1283,7 +1295,9 @@ def invite_cli(argv):
     c.add_argument("--hours", type=int, default=24)
     c.add_argument("--from", dest="frm", default="")
     sub.add_parser("list", help="列出邀请").add_argument("--project")
-    sub.add_parser("revoke", help="作废邀请").add_argument("id")
+    rv = sub.add_parser("revoke", help="作废邀请")
+    rv.add_argument("project")
+    rv.add_argument("id")
     a = ap.parse_args(argv)
     try:
         store = InviteStore(a.invites_file)
@@ -1300,12 +1314,288 @@ def invite_cli(argv):
             if not rows:
                 print("（没有邀请）")
         else:
-            rec = store.revoke(a.id)
+            rec = store.revoke(a.id, project=a.project)
             print("已作废邀请 %s（项目 %s，标签 %s）" % (rec["id"], rec["project"], rec["label"]))
     except InviteError as e:
         sys.exit("错误：%s" % e)
     audit(LOG_FILE, "invite_" + a.cmd, {k: v for k, v in vars(a).items() if k in ("project", "label", "id", "hours", "frm")},
           0, "cli:" + (os.environ.get("SUDO_USER") or "root"))
+
+
+# ───────────────────────── JSON 接口（srv-project 的 list/status/env/info/invites/logs/svc 转调到这里） ─────────────────────────
+
+def ssh_fingerprint(b64):
+    """公钥 blob（base64）→ SHA256:xxxx（与 ssh-keygen -l 同格式），纯计算不起子进程。"""
+    return "SHA256:" + base64.b64encode(hashlib.sha256(base64.b64decode(b64)).digest()).decode("ascii").rstrip("=")
+
+
+def key_entries(lines):
+    out = []
+    for line in lines:
+        k = parse_key_line(line)
+        if not k:
+            continue
+        try:
+            fp = ssh_fingerprint(k["blob"])
+        except (ValueError, TypeError):
+            fp = ""
+        out.append({"label": k["label"], "fingerprint": fp, "from": k["from"] or None})
+    return out
+
+
+def _port_int(text):
+    return int(text) if str(text).isdigit() else None
+
+
+def light_record(entry, exists, disabled, key_lines):
+    """list --json 的一条记录：只来自登记表、shadow 和公钥文件。"""
+    return {"name": entry["name"], "port": _port_int(entry["port"]), "contact": entry["contact"],
+            "created": entry["created"], "account_exists": bool(exists),
+            "disabled": bool(disabled) if exists else False,
+            "keys": key_entries(key_lines) if exists else []}
+
+
+HEAD_RE = re.compile(r"^[0-9a-f]{7,40}\s")
+
+
+def status_record(light, d):
+    """status --json 的一条记录。d 是 collect_project 的结果；账号缺失或没有采集时各字段补成 null / []，结构保持一致。"""
+    rec = dict(light)
+    rec.update({"listening": False, "listen_owner": None, "services": [], "head": None, "disk_kb": None,
+                "problems": [], "notes": [], "services_error": None})
+    if d:
+        rec["problems"] = list(d.get("problems", []))
+        rec["notes"] = list(d.get("notes", []))
+    if d and not d.get("missing"):
+        owners = d.get("owners") or []
+        rec["listening"] = bool(d.get("listening"))
+        rec["listen_owner"] = ",".join(owners) if owners else None
+        rec["services"] = [{"unit": u["unit"], "active": u["active"], "sub": u["sub"]} for u in d.get("services", [])]
+        head = d.get("head") or ""
+        rec["head"] = head if HEAD_RE.match(head) else None
+        rec["disk_kb"] = d.get("disk_kb")
+        rec["services_error"] = d.get("services_err") or None
+    return rec
+
+
+def scan_srv_dirs(registered):
+    """/srv 下的目录：对 other 可读的、以及未登记的（不含以 . 开头的，如 .archived）。"""
+    world, extra = [], []
+    try:
+        for n in sorted(x for x in os.listdir(SRV_ROOT) if not x.startswith(".")):
+            full = os.path.join(SRV_ROOT, n)
+            if os.path.isdir(full) and not os.path.islink(full):
+                if os.stat(full).st_mode & stat.S_IROTH:
+                    world.append(full)
+                if n not in registered:
+                    extra.append(full)
+    except OSError:
+        pass
+    return world, extra
+
+
+def global_record(listeners_, ports, world, extra, sshd_rule, srv_project_ok):
+    return {"sshd_rule": bool(sshd_rule), "world_readable": list(world),
+            "listeners": [{"port": r["port"], "owner": ",".join(r["owners"]) or None, "project": ports.get(str(r["port"]))}
+                          for r in sorted(listeners_, key=lambda r: (r["port"], r["addr"]))],
+            "srv_project": bool(srv_project_ok), "unregistered_dirs": list(extra)}
+
+
+def env_record(name, disabled, tools, findings, decl):
+    return {"project": name, "disabled": bool(disabled),
+            "tools": [{"name": t, "available": bool((tools[t] or {}).get("path")) if t in tools else False,
+                       "version": (tools.get(t) or {}).get("version") or None,
+                       "path": (tools.get(t) or {}).get("path") or None} for t in TOOLS] if tools else [],
+            "declarations": [{"file": src, "requirement": spec} for src, spec in decl],
+            "findings": [text for _, text in findings],
+            "findings_detail": [{"level": lvl, "text": text} for lvl, text in findings]}
+
+
+def info_record(name, entry, host, ssh_port, disabled, keys, text):
+    return {"project": name, "host": host, "ssh_port": int(ssh_port), "account": name,
+            "dir": "%s/%s" % (SRV_ROOT, name), "port": _port_int(entry["port"]), "disabled": bool(disabled),
+            "keys": keys, "text": text}
+
+
+def invites_record(invites, project, now=None):
+    rows = []
+    for rec in sorted(invites.values(), key=lambda r: (r.get("created", ""), r.get("id", ""))):
+        if rec.get("project") != project:
+            continue
+        used = None
+        if rec.get("status") == "used":
+            used = {"at": rec.get("used_at"), "ip": rec.get("used_ip"), "device": rec.get("used_device"),
+                    "fingerprint": rec.get("used_fingerprint")}
+        rows.append({"id": rec["id"], "project": rec["project"], "label": rec["label"], "from": rec.get("from") or None,
+                     "created": rec.get("created"), "expires": rec.get("expires"),
+                     "status": invite_status(rec, now), "used": used})
+    return {"invites": rows}
+
+
+def merge_panel_conf(existing, lan_ip, port, tls_cert, enroll_only=None):
+    """合并安装时写入的面板配置。enroll_only 为 None 表示保持原值（没有原值则为 False）。"""
+    conf = dict(existing or {})
+    conf.update({"lan_ip": lan_ip, "port": int(port), "tls_cert": tls_cert})
+    conf["enroll_only"] = bool(conf.get("enroll_only", False)) if enroll_only is None else bool(enroll_only)
+    return conf
+
+
+def write_panel_conf(path, lan_ip, port, tls_cert, enroll_only=None):
+    conf = merge_panel_conf(load_panel_conf(path), lan_ip, port, tls_cert, enroll_only)
+    write_file_atomic(path, json.dumps(conf, ensure_ascii=False, sort_keys=True) + "\n", mode=0o644)
+    return conf
+
+
+def route_allowed(enroll_only, method, path):
+    """登记模式只开放 POST /enroll，其余一律 404。"""
+    return (not enroll_only) or (method == "POST" and path == "/enroll")
+
+
+def _account_exists(name):
+    try:
+        import pwd
+        pwd.getpwnam(name)
+        return True
+    except (ImportError, KeyError):
+        return False
+
+
+def light_projects():
+    out = []
+    for entry in load_registry():
+        exists = _account_exists(entry["name"])
+        lines = read_text(os.path.join(KEYS_DIR, entry["name"])).splitlines() if exists else []
+        out.append(light_record(entry, exists, is_disabled(entry["name"]) if exists else False, lines))
+    return out
+
+
+def default_route_ip():
+    rc, out, _ = run_cmd(["ip", "-4", "route", "get", "1.1.1.1"], timeout=5)
+    parts = out.split()
+    return parts[parts.index("src") + 1] if "src" in parts and parts.index("src") + 1 < len(parts) else ""
+
+
+class ApiExit(Exception):
+    def __init__(self, msg, code=1):
+        super().__init__(msg)
+        self.code = code
+
+
+def _api_project(name):
+    """校验项目名并要求已登记；否则退出码 2。返回登记表条目。"""
+    if not valid_name(name):
+        raise ApiExit("项目名不合法：%s" % name, 2)
+    entry = next((r for r in load_registry() if r["name"] == name), None)
+    if not entry:
+        raise ApiExit("项目不存在：%s" % name, 2)
+    return entry
+
+
+def api_status(project=None):
+    reg = load_registry()
+    lst = listeners()
+    light_by = {l["name"]: l for l in light_projects()}
+    if project is not None:
+        entry = _api_project(project)
+        d = collect_project(entry, lst, keys=False)
+        same = [r["name"] for r in reg if r["port"] == entry["port"] and r["name"] != entry["name"]]
+        if same:
+            d["problems"].append("登记端口 %s 与项目 %s 重复" % (entry["port"], "、".join(same)))
+        return {"projects": [status_record(light_by[entry["name"]], d)]}
+    projects, lst, reg = collect_all(keys=False)
+    recs = [status_record(light_by[p["entry"]["name"]], p) for p in projects]
+    ports = {p["entry"]["port"]: p["entry"]["name"] for p in projects}
+    world, extra = scan_srv_dirs({r["name"] for r in reg})
+    return {"projects": recs,
+            "global": global_record(lst, ports, world, extra, os.path.exists(SSHD_DROPIN), os.access(SRV_PROJECT, os.X_OK))}
+
+
+def api_env(project):
+    _api_project(project)
+    tools, findings, decl = project_env(project)
+    return env_record(project, is_disabled(project), tools, findings, decl)
+
+
+def api_info(project, host=""):
+    entry = _api_project(project)
+    host = host or load_panel_conf().get("lan_ip") or default_route_ip() or ""
+    args = [SRV_PROJECT, "info", project] + (["--host", host] if host else [])
+    rc, out, err = run_cmd(args, timeout=30)
+    if rc != 0:
+        raise ApiExit("info 失败：%s" % (err.strip() or out.strip()), 1)
+    keys = key_entries(read_text(os.path.join(KEYS_DIR, project)).splitlines())
+    return info_record(project, entry, host or "", sshd_port(), is_disabled(project), keys, out.strip())
+
+
+def api_invites(project, invites_file=INVITES_FILE):
+    _api_project(project)
+    return invites_record(InviteStore(invites_file).snapshot(), project)
+
+
+def api_cli(argv):
+    """srv_panel.py api …（root 运行；srv-project 的新子命令转调到这里）。JSON 只写 stdout，原因写 stderr。"""
+    ap = argparse.ArgumentParser(prog="srv_panel.py api")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("list")
+    sub.add_parser("status").add_argument("project", nargs="?")
+    sub.add_parser("env").add_argument("project")
+    i = sub.add_parser("info")
+    i.add_argument("project")
+    i.add_argument("--host", default="")
+    sub.add_parser("invites").add_argument("project")
+    lg = sub.add_parser("logs")
+    lg.add_argument("project")
+    lg.add_argument("unit")
+    lg.add_argument("--lines", type=int, default=100)
+    sv = sub.add_parser("svc")
+    sv.add_argument("project")
+    sv.add_argument("op", choices=SERVICE_OPS)
+    sv.add_argument("unit")
+    a = ap.parse_args(argv)
+    try:
+        if a.cmd == "list":
+            data = {"projects": light_projects()}
+        elif a.cmd == "status":
+            data = api_status(a.project)
+        elif a.cmd == "env":
+            data = api_env(a.project)
+        elif a.cmd == "info":
+            data = api_info(a.project, a.host)
+        elif a.cmd == "invites":
+            data = api_invites(a.project)
+        elif a.cmd == "logs":
+            _api_project(a.project)
+            if not valid_unit(a.unit):
+                raise ApiExit("服务名格式不对：%s" % a.unit, 1)
+            if not 1 <= a.lines <= 1000:
+                raise ApiExit("--lines 须为 1–1000", 1)
+            rc, out, err = service_log(a.project, a.unit, a.lines)
+            sys.stdout.write(out)
+            if rc != 0:
+                sys.stderr.write(err)
+            return rc
+        else:
+            _api_project(a.project)
+            if not valid_unit(a.unit):
+                raise ApiExit("服务名格式不对：%s" % a.unit, 1)
+            uid, member = account_info(a.project)
+            if not member:
+                raise ApiExit("%s 不是 %s 项目账号" % (a.project, GROUP), 2)
+            rc, out, err = run_cmd(["systemctl", "--user", "--machine=%s@" % a.project, a.op, a.unit], timeout=60)
+            audit(LOG_FILE, "api_svc", {"project": a.project, "unit": a.unit, "op": a.op}, rc,
+                  "cli:" + (os.environ.get("SUDO_USER") or "root"))
+            if rc != 0:
+                raise ApiExit("systemctl %s %s 失败（退出码 %s）：%s" % (a.op, a.unit, rc, (err.strip() or out.strip())), 1)
+            print("已对项目 %s 的用户服务 %s 执行 %s" % (a.project, a.unit, a.op))
+            return 0
+    except ApiExit as e:
+        sys.stderr.write("错误：%s\n" % e)
+        return e.code
+    except InviteError as e:
+        sys.stderr.write("错误：%s\n" % e)
+        return 1
+    print(json.dumps(data, ensure_ascii=False, indent=2))
+    return 0
 
 
 # ───────────────────────── 审计与变更操作 ─────────────────────────
@@ -1392,12 +1682,12 @@ def project_info(name, lan_ip=""):
     return out.strip() if rc == 0 else "（接入信息生成失败，退出码 %s）\n%s" % (rc, err.strip())
 
 
-def service_log(name, unit):
+def service_log(name, unit, lines=100):
     uid, member = account_info(name)
     if not member or name not in registered_names():
         return 1, "", "不是项目账号"
     u = str(uid)
-    return run_cmd(["journalctl", "-n", "100", "--no-pager", "-o", "short-iso",
+    return run_cmd(["journalctl", "-n", str(int(lines)), "--no-pager", "-o", "short-iso",
                     "_UID=" + u, "_SYSTEMD_USER_UNIT=" + unit, "+",
                     "_UID=" + u, "USER_UNIT=" + unit], timeout=20)
 
@@ -1743,7 +2033,7 @@ def render_invite_result(text, rec, csrf):
 
 class State:
     def __init__(self, store, port, extra_hosts=(), log_file=LOG_FILE, allow_nets=(), secure=False,
-                 initial_pw_file=INITIAL_PW_FILE, limiter=None, lan_ip="", invites=None):
+                 initial_pw_file=INITIAL_PW_FILE, limiter=None, lan_ip="", invites=None, enroll_only=False):
         self.store = store
         self.port = port
         self.extra_hosts = tuple(extra_hosts)
@@ -1752,6 +2042,7 @@ class State:
         self.secure = secure
         self.lan_ip = lan_ip
         self.invites = invites
+        self.enroll_only = enroll_only
         self.enroll_limiter = RateLimiter(5, 900, 900)     # 与登录限流分开计数
         self.enroll_lock = threading.Lock()                 # 同一个码并发提交只成功一次
         self.initial_pw_file = initial_pw_file
@@ -1893,8 +2184,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send(code, render_login(make_csrf(self.state.secret, "login"), error))
 
     # --- GET ---
+    def not_found(self):
+        self.send(404, "<h1>404</h1>")
+
+    do_HEAD = do_PUT = do_DELETE = do_PATCH = do_OPTIONS = not_found
+
     def do_GET(self):
         _ctx.user = None
+        if not route_allowed(self.state.enroll_only, "GET", urllib.parse.urlsplit(self.path).path):
+            return self.not_found()
         if not self.guard():
             return
         u = urllib.parse.urlsplit(self.path)
@@ -1952,6 +2250,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         _ctx.user = None
         path = urllib.parse.urlsplit(self.path).path
+        if not route_allowed(self.state.enroll_only, "POST", path):
+            return self.not_found()
         if path == "/enroll":
             return self.do_enroll()
         if not self.guard():
@@ -2156,6 +2456,10 @@ def main(argv=None):
     ap.add_argument("--bind", action="append", help="监听地址，可重复，默认 127.0.0.1")
     ap.add_argument("--port", type=int, default=None, help="监听端口，默认取 panel.conf 里的 port，再默认 9300")
     ap.add_argument("--panel-conf", default=PANEL_CONF)
+    ap.add_argument("--write-panel-conf", action="store_true", help="安装脚本用：合并写入 panel.conf（需要 --lan-ip 与 --tls-cert，端口取 --port）")
+    ap.add_argument("--lan-ip", default="")
+    ap.add_argument("--enroll-only", action="store_true", help="与 --write-panel-conf 合用：打开登记模式")
+    ap.add_argument("--full", action="store_true", help="与 --write-panel-conf 合用：关闭登记模式")
     ap.add_argument("--invites-file", default=INVITES_FILE)
     ap.add_argument("--allow-remote", action="store_true", help="允许绑定非回环地址（还必须同时提供 TLS 证书）")
     ap.add_argument("--allowed-host", action="append", default=[], help="额外允许的 Host 头主机名/IP（局域网访问时填服务器 IP）")
@@ -2170,9 +2474,11 @@ def main(argv=None):
     ap.add_argument("--print-san", metavar="IP", help="校验局域网 IP 并打印证书 SAN，供安装脚本使用")
     ap.add_argument("--check-cidr", metavar="CIDR", help="校验 CIDR 格式，供安装脚本使用")
     args_in = sys.argv[1:] if argv is None else list(argv)
-    if args_in and args_in[0] == "invite":
+    if args_in and args_in[0] in ("invite", "api"):
         if os.geteuid() != 0:
             sys.exit("需要 root 运行")
+        if args_in[0] == "api":
+            sys.exit(api_cli(args_in[1:]))
         return invite_cli(args_in[1:])
     a = ap.parse_args(argv)
     if a.print_san:
@@ -2189,6 +2495,18 @@ def main(argv=None):
         return
     if os.geteuid() != 0:
         sys.exit("需要 root 运行")
+    if a.write_panel_conf:
+        if a.enroll_only and a.full:
+            sys.exit("--enroll-only 与 --full 不能同时给")
+        if not (a.lan_ip and a.tls_cert and a.port):
+            sys.exit("--write-panel-conf 需要 --lan-ip、--port 和 --tls-cert")
+        try:
+            conf = write_panel_conf(a.panel_conf, a.lan_ip, a.port, a.tls_cert,
+                                    True if a.enroll_only else (False if a.full else None))
+        except (InviteError, OSError) as e:
+            sys.exit(str(e))
+        print("enroll_only=%s" % ("true" if conf["enroll_only"] else "false"))
+        return
     if a.bootstrap or a.reset_admin:
         try:
             print(bootstrap_store(a.users_file, a.initial_password_file, reset=a.reset_admin))
@@ -2200,6 +2518,7 @@ def main(argv=None):
     except InviteError as e:
         sys.exit(str(e))
     port = a.port or int(conf.get("port") or 9300)
+    enroll_only = bool(conf.get("enroll_only"))
     a.tls_cert = a.tls_cert or conf.get("tls_cert")
     if a.tls_cert and not a.tls_key:
         a.tls_key = conf.get("tls_key") or os.path.splitext(a.tls_cert)[0] + ".key"
@@ -2213,16 +2532,17 @@ def main(argv=None):
         sys.exit("--tls-cert 与 --tls-key 须同时提供")
     try:
         nets = parse_allow_from(a.allow_from)
-        store = UserStore(a.users_file)
+        store = None if enroll_only else UserStore(a.users_file)    # 登记模式不依赖账号体系
         tls = make_tls_context(a.tls_cert, a.tls_key) if a.tls_cert else None
         invites = InviteStore(a.invites_file)
     except (ValueError, UserError, InviteError, OSError, ssl.SSLError) as e:
         sys.exit("启动检查失败：%s" % e)
-    if not store.names():
+    if store is not None and not store.names():
         sys.exit("用户库为空或不存在：请先 sudo bash install_panel.sh（或 python3 srv_panel.py --bootstrap）")
     lan_ip = next((b for b in binds if not is_loopback(b) and ":" not in b), "") or conf.get("lan_ip", "")
     state = State(store, port, a.allowed_host, a.log_file, nets, secure=tls is not None,
-                  initial_pw_file=a.initial_password_file, lan_ip=lan_ip, invites=invites)
+                  initial_pw_file=a.initial_password_file, lan_ip=lan_ip, invites=invites,
+                  enroll_only=enroll_only)
     state.panel_conf, state.tls_cert = a.panel_conf, a.tls_cert
     try:
         servers = make_servers(binds, port, state, tls)
@@ -2230,7 +2550,8 @@ def main(argv=None):
         sys.exit("无法监听：%s" % e)
     for s in servers[1:]:
         threading.Thread(target=s.serve_forever, daemon=True).start()
-    print("srv-panel 监听 %s:%d（%s）" % ("、".join(binds), port, "HTTPS" if tls else "HTTP"), flush=True)
+    print("srv-panel 监听 %s:%d（%s，%s）" % ("、".join(binds), port, "HTTPS" if tls else "HTTP",
+                                         "登记模式：只开放 POST /enroll" if enroll_only else "完整模式"), flush=True)
     try:
         servers[0].serve_forever()
     except KeyboardInterrupt:

@@ -12,17 +12,18 @@
 前提：服务器已安装 `/usr/local/sbin/srv-project` 并执行过 `srv-project install`，且有 `python3` 和 `openssl`。
 
 ```bash
-sudo bash panel/install_panel.sh [--lan-ip <服务器IP>] [--allow-from <网段CIDR>]...
+sudo bash panel/install_panel.sh [--lan-ip <服务器IP>] [--allow-from <网段CIDR>]... [--enroll-only | --full]
 ```
 
 - `--lan-ip`：局域网 IP，写入证书并作为监听地址。不传则自动取默认路由出口网卡的 IPv4，并在终端打印，不对请加参数重跑。服务器应使用固定 IP，IP 变了要重新运行脚本（会重签证书）
+- `--enroll-only` / `--full`：登记模式开关，见下文「登记模式」。两者都不给则保持原有模式（首次安装为完整模式）
 - `--allow-from`：只允许这些来源网段访问，可重复，例如 `--allow-from 192.168.1.0/24`。默认不限制。服务器本机（回环来源）始终放行，避免把自己锁在外面
 
 脚本会：
 
 1. 把 `srv_panel.py` 装到 `/usr/local/lib/srv-panel/`
 2. 用 `openssl` 生成自签证书 `/etc/srv-panel/tls.crt` 和 `tls.key`（key 权限 600，有效期 3 年，SAN 含局域网 IP、`127.0.0.1`、`localhost`）。证书已存在、SAN 含当前 IP 且 30 天内不到期时沿用
-3. 没有用户库时创建超级管理员 `admin`，随机初始密码写入 `/etc/srv-panel/initial-password`（root 600）。终端只提示文件位置，不打印密码
+3. 完整模式下，没有用户库时创建超级管理员 `admin`，随机初始密码写入 `/etc/srv-panel/initial-password`（root 600）。终端只提示文件位置，不打印密码
 4. 发现旧版令牌文件 `/etc/srv-panel/token` 就删除并提示（令牌登录已取消）
 5. 写 `/etc/systemd/system/srv-panel.service`（root 运行，`Restart=on-failure`），`enable` 并启动
 
@@ -103,6 +104,69 @@ sudo bash panel/install_panel.sh --reset-admin
 - 项目目录由项目账号控制，所以：读 `repo/` 的版本声明文件只读真实路径仍在 `/srv/<项目>/` 内的小普通文件；读 git HEAD 用 `runuser -u <账号>` 降权运行，避免 root 执行仓库里可触发命令的 git 配置
 - 审计日志 `/var/log/srv-panel.log`（600）：时间、动作、参数、来源 IP、退出码。覆盖登录成败、锁定、改密、用户新建/重置/删除、IP 拒绝、CSRF 拒绝和全部项目操作。授权公钥只记标签、来源限制和指纹。**任何密码都不记**
 
+## 登记模式（enroll-only）
+
+服务器上有知识库后台的【项目运维】时，项目管理走知识库后台，独立面板只负责设备登记：
+
+```bash
+sudo bash panel/install_panel.sh --enroll-only     # 打开登记模式
+sudo bash panel/install_panel.sh --full            # 关闭登记模式，恢复管理页
+```
+
+- 登记模式写在 `/etc/srv-panel/panel.conf`（键 `enroll_only`，值 `true`），由面板服务读取并强制执行：**只开放 `POST /enroll`，其余任何路径、任何方法一律返回 404**（`GET /` 也是 404）
+- 登记模式不依赖账号体系：没有 `users.json` 也能启动，安装时也不创建 `admin` 和初始密码；之前的用户库不会被删除，`--full` 后继续使用
+- 模式只由 `--enroll-only` / `--full` 改变。不带这两个参数的重复安装（升级代码、证书临期重签、换 IP）**保留原有模式**，不会悄悄重新打开管理页。安装输出的最后会写明当前是哪种模式
+- 设备邀请的生成、列表、作废仍由 `srv-project invite / invites / invite-revoke`（或知识库后台）完成，这些不经过网页，不受登记模式影响
+
+## JSON 接口（`srv-project` 子命令）
+
+知识库后台等程序通过 `sudo -n srv-project …` 调用下面的子命令；它们都转调 `srv_panel.py api …`，面板代码没装时报「请先安装管理面板」。**字段只能增加，不能删减或改名。** 所有命令失败时退出码非 0，原因写到 stderr；指定的项目不存在时退出码为 2。
+
+```text
+list --json
+  {"projects":[{"name","port":int,"contact","created","account_exists":bool,"disabled":bool,
+                "keys":[{"label","fingerprint","from":str|null}]}]}
+
+status --json [<项目>]
+  {"projects":[{…list 的全部字段…,
+                "listening":bool, "listen_owner":str|null,
+                "services":[{"unit","active","sub"}], "head":str|null, "disk_kb":int|null,
+                "problems":[str]}],
+   "global":{"sshd_rule":bool, "world_readable":[str],
+             "listeners":[{"port":int,"owner":str|null,"project":str|null}]}}
+  指定项目时不输出 "global"；项目不存在时退出码为 2
+
+env --json <项目>
+  {"project","disabled":bool,"tools":[{"name","available":bool,"version":str|null,"path":str|null}],
+   "declarations":[{"file","requirement":str|null}],"findings":[str]}
+
+info --json <项目>
+  {"project","host","ssh_port":int,"account","dir","port":int,"disabled":bool,"keys":[…同上…],"text":"<原 info 的完整文本>"}
+
+invites --json <项目>
+  {"invites":[{"id","project","label","from":str|null,"created","expires","status":"pending|used|revoked|expired",
+               "used":{"at","ip","device","fingerprint"}|null}]}
+
+logs <项目> <服务> [--lines N]
+  纯文本，N 默认 100、最多 1000
+
+svc <项目> <start|stop|restart> <服务>
+  人类可读文本 + 退出码
+
+invite <项目> --label L [--hours N] [--from X]
+  stdout 只有一行邀请文本，说明写到 stderr
+
+invite-revoke <项目> <编号>
+```
+
+实现说明：
+
+- `list --json` 很轻：只读登记表、`/etc/shadow` 和公钥文件，指纹在进程内计算，不跑 `du`、`git`、`systemctl`，也不起任何子进程。
+- `status --json` 复用面板总览的采集（`collect_all` / `collect_project`）。账号缺失的项目，`listening` 为 `false`，`listen_owner`、`head`、`disk_kb` 为 `null`，`keys`、`services` 为 `[]`，`disabled` 为 `false`，`problems` 里有原因，保证每条记录字段一致。`head` 只在能读到提交时才有值（否则为 `null`）。
+- 新增字段（不影响约定）：`status` 的项目里有 `notes`、`services_error`；`status` 的 `global` 里有 `srv_project`、`unregistered_dirs`；`env` 里有 `findings_detail`（`level` + `text`）。
+- `invites` 和 `invite-revoke` 必须带项目参数。`invite-revoke <项目> <编号>` 会断言该邀请属于这个项目，不属于就报「找不到邀请」，退出码非 0；旧的单参数写法直接报用法错误。面板网页的作废走内部函数，不受影响。
+- 校验：项目名用 `^[a-z][a-z0-9_-]{1,31}$`，服务名要以 `.service` 结尾（首字符字母或数字，允许 `@ . _ : -`），`--lines` 取 1–1000。
+
 ## 参数
 
 ```
@@ -112,6 +176,9 @@ srv_panel.py [--bind IP]... [--port 9300] [--allow-remote]
              [--initial-password-file /etc/srv-panel/initial-password]
              [--log-file /var/log/srv-panel.log]
 srv_panel.py --bootstrap | --reset-admin        # 安装脚本调用
+srv_panel.py --write-panel-conf --lan-ip IP --port N --tls-cert 证书 [--enroll-only | --full]   # 安装脚本调用
+srv_panel.py invite create|list|revoke …        # srv-project invite* 转调
+srv_panel.py api list|status|env|info|invites|logs|svc …   # srv-project 的 JSON 子命令转调
 ```
 
 ## 已知限制

@@ -99,6 +99,8 @@ step and act only in your own role:
 | 2. Enroll | Requester's agent | `safe_push.py enroll '<invite>'`: generates the key, pins the panel certificate, registers the public key, writes known_hosts and the SSH alias from the invite, verifies login. |
 | 3. First deploy | Requester's agent | `config-save`, `bootstrap`, runtime, `config/.env` with random secrets, systemd user service, post-sync/health scripts, then deliver URL and initial password to its user. |
 
+On a server that runs the knowledge-base backend, day-to-day project operations go through the backend's 【项目运维】 admin page instead of the panel's web pages: delegate `srv-project` to the account the backend runs as (`install --delegate <that account>`) and run the panel with `install_panel.sh --enroll-only`, so port 9300 only serves the device-enrollment endpoint and every other path returns 404. See [`references/project-accounts.md`](references/project-accounts.md) and the JSON interface in [`references/srv-panel.md`](references/srv-panel.md).
+
 The SSH host keys written by `enroll` come from the admin's invite, a trusted
 channel, so this is not automatic host-key acceptance; a conflicting existing
 known_hosts entry still stops. A new device for the same person is a new

@@ -15,9 +15,17 @@
 #   info    <项目> [--host <服务器地址>]      打印可转发给申请方的接入信息（不含密钥内容与密码）
 #   delete  <项目> [--purge]                  删除已停用的项目：删账号、公钥、登记；目录归档到 /srv/.archived（--purge 直接删除）
 #   invite  <项目> --label <标签> [--hours N] [--from X]   生成一次性设备邀请（需先装管理面板）
-#   invites [<项目>]                          列出邀请及状态
-#   invite-revoke <邀请编号>                  作废待使用的邀请
-#   list
+#   invites <项目>                            列出该项目的邀请及状态
+#   invite-revoke <项目> <邀请编号>           作废该项目下待使用的邀请（编号不属于该项目则报找不到）
+#   list                                      人类可读的项目清单
+#   JSON / 运维子命令（转调管理面板代码；失败时退出码非 0，原因写 stderr；项目不存在退出码 2）：
+#   list --json                               轻量：只读登记表、shadow、公钥文件
+#   status --json [<项目>]                    全量：监听、属主冲突、服务、git HEAD、磁盘、问题（指定项目时不含 global）
+#   env --json <项目>                         以项目账号检测 git/node/npm/python3/docker 及 repo 声明
+#   info --json <项目> [--host <地址>]        接入信息的结构化版本（含原文 text）
+#   invites --json <项目>                     邀请列表（JSON）
+#   logs <项目> <服务> [--lines N]            用户服务最近日志（纯文本，N 默认 100，1–1000）
+#   svc <项目> <start|stop|restart> <服务>    启停用户服务
 set -euo pipefail
 
 GROUP=srvproj
@@ -276,6 +284,7 @@ cmd_enable() {
 }
 
 cmd_list() {
+    if [ "${1:-}" = --json ]; then panel_api list; return; fi
     need_installed
     local name port contact created
     while IFS=$'\t' read -r name port contact created; do
@@ -292,6 +301,15 @@ cmd_list() {
 }
 
 cmd_info() {
+    local json=0 a rest=()
+    for a in "$@"; do if [ "$a" = --json ]; then json=1; else rest+=("$a"); fi; done
+    set -- ${rest[@]+"${rest[@]}"}
+    if [ "$json" -eq 1 ]; then
+        [ -n "${1:-}" ] || die "用法：info --json <项目> [--host <服务器地址>]"
+        valid_name "$1"
+        panel_api info "$@"
+        return
+    fi
     local name=${1:-} host="" port ssh_port acct_state f line from fp label
     [ -n "$name" ] || die "用法：info <项目> [--host <服务器地址>]"
     shift
@@ -399,12 +417,64 @@ cmd_invite() {
 }
 
 cmd_invites() {
-    if [ -n "${1:-}" ]; then panel_invite list --project "$1"; else panel_invite list; fi
+    local json=0 a rest=()
+    for a in "$@"; do if [ "$a" = --json ]; then json=1; else rest+=("$a"); fi; done
+    set -- ${rest[@]+"${rest[@]}"}
+    [ -n "${1:-}" ] || die "用法：invites [--json] <项目>"
+    valid_name "$1"
+    if [ "$json" -eq 1 ]; then panel_api invites "$1"; else panel_invite list --project "$1"; fi
 }
 
 cmd_invite_revoke() {
-    [ -n "${1:-}" ] || die "用法：invite-revoke <邀请编号>"
-    panel_invite revoke "$1"
+    [ -n "${1:-}" ] && [ -n "${2:-}" ] && [ $# -eq 2 ] || die "用法：invite-revoke <项目> <邀请编号>"
+    valid_name "$1"
+    panel_invite revoke "$1" "$2"
+}
+
+# JSON / 运维子命令：同样转调管理面板代码
+panel_api() {
+    [ -f "$PANEL_PY" ] || die "请先安装管理面板（panel/install_panel.sh）"
+    python3 "$PANEL_PY" api "$@"
+}
+
+valid_unit() {
+    [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_.@:-]{0,99}\.service$ ]] || die "服务名格式不对：$1"
+}
+
+cmd_status() {
+    [ "${1:-}" = --json ] || die "用法：status --json [<项目>]"
+    shift
+    if [ -n "${1:-}" ]; then valid_name "$1"; panel_api status "$1"; else panel_api status; fi
+}
+
+cmd_env() {
+    [ "${1:-}" = --json ] && [ -n "${2:-}" ] || die "用法：env --json <项目>"
+    valid_name "$2"
+    panel_api env "$2"
+}
+
+cmd_logs() {
+    local project=${1:-} unit=${2:-} lines=100
+    [ -n "$project" ] && [ -n "$unit" ] || die "用法：logs <项目> <服务> [--lines N]"
+    shift 2
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --lines) lines=${2:-}; shift 2 ;;
+            *) die "未知参数：$1" ;;
+        esac
+    done
+    valid_name "$project"
+    valid_unit "$unit"
+    [[ "$lines" =~ ^[0-9]+$ ]] && [ "$lines" -ge 1 ] && [ "$lines" -le 1000 ] || die "--lines 须为 1–1000"
+    panel_api logs "$project" "$unit" --lines "$lines"
+}
+
+cmd_svc() {
+    [ $# -eq 3 ] || die "用法：svc <项目> <start|stop|restart> <服务>"
+    valid_name "$1"
+    case $2 in start | stop | restart) ;; *) die "操作须为 start、stop 或 restart：$2" ;; esac
+    valid_unit "$3"
+    panel_api svc "$1" "$2" "$3"
 }
 
 need_root "$@"
@@ -422,5 +492,9 @@ case ${1:-} in
     invite) shift; cmd_invite "$@" ;;
     invites) shift; cmd_invites "$@" ;;
     invite-revoke) shift; cmd_invite_revoke "$@" ;;
-    *) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+    status) shift; cmd_status "$@" ;;
+    env) shift; cmd_env "$@" ;;
+    logs) shift; cmd_logs "$@" ;;
+    svc) shift; cmd_svc "$@" ;;
+    *) sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

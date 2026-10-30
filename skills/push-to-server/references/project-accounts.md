@@ -34,6 +34,16 @@ ssh -t <管理员>@<服务器> 'cd /tmp/srv-setup && sudo install -m 755 srv_pro
 - `--delegate <管理员>` 让这个账号免密执行 `sudo srv-project`，只放行这一个命令。之后管理员的 agent 在管理员批准后，就能自动开项目、发邀请。
 - **先装管理面板，再开第一个项目。** 邀请登记要经过面板。面板的首次登录（修改初始密码）由管理员本人在浏览器里完成，见 [`srv-panel.md`](srv-panel.md)。
 
+### 有知识库的服务器
+
+服务器上部署了知识库时，项目的日常管理（看状态、启停服务、看日志、发邀请、吊销公钥、新建和删除项目）用知识库后台的【项目运维】，不再用独立面板的网页。做法：
+
+1. 把 `srv-project` 委托给知识库后端所在的账号：`sudo srv-project install --delegate <该账号>`。
+2. 面板以登记模式运行：`sudo bash install_panel.sh --enroll-only`。此时 9300 端口只开放设备登记接口 `POST /enroll`，管理页一律 404。
+3. 知识库后端通过 `sudo -n srv-project list/status/env/info/invites --json`、`logs`、`svc` 等子命令读取和操作，字段约定见 [`srv-panel.md`](srv-panel.md)。
+
+没有知识库的服务器不受影响，面板仍以完整模式运行。
+
 ## 阶段 1：发邀请（管理员 agent，或管理员在面板上操作）
 
 1. 先在对话里向管理员确认四件事：项目名、给谁、用哪台设备、端口。新项目的端口先查登记表和监听情况再定。管理员明确批准后才能执行，而且这次批准只对这一次邀请有效。
@@ -47,7 +57,7 @@ ssh -t <管理员>@<服务器> 'cd /tmp/srv-setup && sudo install -m 755 srv_pro
    - `create` 遇到端口已被占用或已登记会拒绝。这时换一个空闲端口，告诉管理员换成了哪个，再重新执行。
    - 邀请默认 24 小时有效，只能用一次。知道申请人的 IP 时加上 `--from`，被别人截获也用不了。
 3. 把输出里那一行 `srvinvite1.…` 原样交给管理员，由管理员转发给申请方，并说明「交给你的 agent」。邀请里不含任何密码或私钥，但持有它的人可以登记一次设备，所以只发给申请人本人。
-4. 查看和作废邀请：`sudo -n srv-project invites [<项目>]`、`sudo -n srv-project invite-revoke <id>`。在面板的「邀请」页也能操作。
+4. 查看和作废邀请：`sudo -n srv-project invites <项目>`、`sudo -n srv-project invite-revoke <项目> <id>`（编号不属于该项目会报找不到）。在面板的「邀请」页也能操作。
 
 申请方换电脑时，给同一个项目发一个新标签的邀请。新设备登记成功后，执行 `srv-project revoke <项目> <旧标签>` 吊销旧设备的公钥。
 
