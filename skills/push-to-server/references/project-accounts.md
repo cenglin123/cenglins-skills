@@ -44,6 +44,7 @@ scp scripts/srv_project.sh <服务器>:/tmp/ && ssh -t <服务器> 'sudo install
 项目目录：/srv/<项目>/{repo,config,data,backups}
 服务端口：<端口>（只用这个端口，监听 0.0.0.0:<端口>）
 权限：只能写自己的目录；没有 sudo；用 systemctl --user 管服务
+应用初始密码：在 /srv/<项目>/config/.env 里，自己登录服务器读取（已部署时）
 ```
 
 ## 对方 agent 的首次部署
@@ -80,3 +81,17 @@ journalctl --user -u <服务> -n 100
 ```
 
 部署后要重启服务的，把 `systemctl --user restart <服务>` 写进仓库里的 post-sync 脚本。
+
+## 应用的初始账号密码
+
+项目自带的初始管理员密码、JWT 密钥等，在服务器上首次部署时随机生成，只写进 `/srv/<项目>/config/.env`（权限 640）。不进 git、不写进部署文档、不打印到终端或日志，也不沿用示例里的默认值。
+
+- 能读到它的只有两方：项目账号（即对方 agent），以及项目组里的服务器管理员。
+- 对方 agent 需要登录应用时，自己从服务器读取，再交给它的用户：
+
+  ```bash
+  ssh <项目>@<主机> 'grep INITIAL_ADMIN_PASSWORD ~/config/.env'
+  ```
+
+- 部署由服务器管理员代办时，管理员不在聊天或文档里转述密码，只告诉对方 agent 去读哪个文件、哪个变量。
+- 首次登录后在应用里改密码。`.env` 里的初始值只用于首次建库，之后改它不会改掉已有账号的密码。
