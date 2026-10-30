@@ -200,10 +200,12 @@ class PasswordTests(unittest.TestCase):
 
     def test_password_problem(self):
         cur = panel.hash_password("initial-Password-1")
-        self.assertIn("至少", panel.password_problem("short", "bob"))
+        for weak in ("Sh0rt!", "alllower1!", "ALLUPPER1!", "NoDigits!!", "NoSymbol12", "Abc 12345"):
+            with self.subTest(weak=weak):
+                self.assertIn("至少 8 位", panel.password_problem(weak, "bob"))
         self.assertIn("相同", panel.password_problem("initial-Password-1", "bob", cur))
-        self.assertIsNone(panel.password_problem("a-brand-new-pass", "bob", cur))
-        self.assertIn("用户名", panel.password_problem("bobbobbobbob", "bobbobbobbob"))
+        self.assertIsNone(panel.password_problem("Ab1!efgh", "bob", cur))
+        self.assertIn("用户名", panel.password_problem("Bob-bob-1", "Bob-bob-1"))
 
     def test_username(self):
         self.assertTrue(panel.valid_username("admin"))

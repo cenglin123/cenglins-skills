@@ -528,7 +528,8 @@ def project_env(name):
 # ───────────────────────── 账号、密码、限流、来源控制 ─────────────────────────
 
 USERNAME_RE = re.compile(r"^[a-z][a-z0-9_.-]{1,31}$")
-MIN_PW_LEN = 12
+MIN_PW_LEN = 8
+PW_RULE = "至少 %d 位，须同时包含大写字母、小写字母、数字和特殊符号" % MIN_PW_LEN
 SCRYPT_N, SCRYPT_R, SCRYPT_P = 2 ** 14, 8, 1
 PW_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789"
 
@@ -578,10 +579,12 @@ def dummy_hash():
 
 def password_problem(new, username, current_hash=None):
     """新密码不合格时返回中文原因，否则 None。current_hash 非空时，新密码不能与当前密码（含初始密码）相同。"""
-    if len(new) < MIN_PW_LEN:
-        return "新密码至少 %d 位" % MIN_PW_LEN
     if len(new) > 128:
         return "新密码不超过 128 位"
+    if (len(new) < MIN_PW_LEN or not any(c.isascii() and c.isupper() for c in new)
+            or not any(c.isascii() and c.islower() for c in new) or not any(c.isdigit() for c in new)
+            or not any(not c.isalnum() and not c.isspace() for c in new)):
+        return "新密码" + PW_RULE
     if new == username:
         return "新密码不能与用户名相同"
     if current_hash and verify_password(new, current_hash):
@@ -1172,9 +1175,9 @@ def render_password(csrf, user, error="", forced=False):
     return page("修改密码", '<h1>修改密码</h1><div class="card" style="max-width:480px">%s%s'
                 '<form method="post" action="/password">%s'
                 '<p>当前密码<input type="password" name="old" autocomplete="current-password" required></p>'
-                '<p>新密码（至少 %d 位，不能与当前密码相同）<input type="password" name="new" autocomplete="new-password" required></p>'
+                '<p>新密码（%s，不能与当前密码相同）<input type="password" name="new" autocomplete="new-password" required></p>'
                 '<p>再输一次新密码<input type="password" name="confirm" autocomplete="new-password" required></p>'
-                '<button class="primary">修改密码</button></form></div>' % (note, err, hidden(csrf), MIN_PW_LEN), csrf)
+                '<button class="primary">修改密码</button></form></div>' % (note, err, hidden(csrf), esc(PW_RULE)), csrf)
 
 
 def render_users(users, me, csrf):
