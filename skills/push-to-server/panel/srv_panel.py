@@ -336,23 +336,25 @@ def project_keys(name):
     return keys
 
 
+def own_unit(name, unit):
+    """服务是不是项目自己定义的：unit 文件（实例化服务看模板）在 /srv/<项目>/.config/systemd/user 下。
+    服务器装了桌面时，每个用户都会自动跑 pipewire、xdg-portal 之类的默认服务，那些不属于项目，不展示也不允许操作。"""
+    d = os.path.join(SRV_ROOT, name, ".config/systemd/user")
+    cands = [unit]
+    if "@" in unit:
+        cands.append(unit.split("@", 1)[0] + "@.service")
+    return any(os.path.isfile(os.path.join(d, c)) for c in cands)
+
+
 def project_services(name, uid, disabled):
-    """用户服务。只展示项目自己的服务：有 unit 文件，或不是 inactive+dead。"""
+    """用户服务。只展示项目自己定义的服务（见 own_unit）。"""
     if disabled:
         return [], "项目已停用，用户管理器未运行"
     rc, out, err = run_cmd(["systemctl", "--user", "--machine=%s@" % name, "list-units",
                             "--type=service", "--all", "--no-legend", "--plain", "--no-pager"], timeout=15)
     if rc != 0:
         return [], "无法读取用户服务（%s）" % (err.strip().splitlines()[-1] if err.strip() else "用户管理器未运行")
-    ignore = ("dbus.service", "dbus-broker.service")
-    shown = []
-    for u in parse_units(out):
-        if u["unit"] in ignore:
-            continue
-        own = os.path.exists(os.path.join(SRV_ROOT, name, ".config/systemd/user", u["unit"]))
-        if own or not (u["active"] == "inactive" and u["sub"] == "dead"):
-            shown.append(u)
-    return shown, ""
+    return [u for u in parse_units(out) if own_unit(name, u["unit"])], ""
 
 
 def project_head(name):
@@ -1574,6 +1576,8 @@ def api_cli(argv):
             _api_project(a.project)
             if not valid_unit(a.unit):
                 raise ApiExit("服务名格式不对：%s" % a.unit, 1)
+            if not own_unit(a.project, a.unit):
+                raise ApiExit("%s 不是项目 %s 自己定义的服务" % (a.unit, a.project), 1)
             if not 1 <= a.lines <= 1000:
                 raise ApiExit("--lines 须为 1–1000", 1)
             rc, out, err = service_log(a.project, a.unit, a.lines)
@@ -1588,6 +1592,8 @@ def api_cli(argv):
             uid, member = account_info(a.project)
             if not member:
                 raise ApiExit("%s 不是 %s 项目账号" % (a.project, GROUP), 2)
+            if not own_unit(a.project, a.unit):
+                raise ApiExit("%s 不是项目 %s 自己定义的服务" % (a.unit, a.project), 1)
             rc, out, err = run_cmd(["systemctl", "--user", "--machine=%s@" % a.project, a.op, a.unit], timeout=60)
             audit(LOG_FILE, "api_svc", {"project": a.project, "unit": a.unit, "op": a.op}, rc,
                   "cli:" + (os.environ.get("SUDO_USER") or "root"))
@@ -1676,6 +1682,8 @@ def build_action(form):
         uid, member = account_info(name)
         if not member:
             raise ValueError("%s 不是 %s 项目账号" % (name, GROUP))
+        if not own_unit(name, unit):
+            raise ValueError("%s 不是项目 %s 自己定义的服务" % (unit, name))
         op = action[4:]
         args = ["systemctl", "--user", "--machine=%s@" % name, op, unit]
         return action, {"project": name, "unit": unit}, args, None

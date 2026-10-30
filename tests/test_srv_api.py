@@ -198,7 +198,8 @@ class InfoAndInvitesTests(unittest.TestCase):
 
 class ApiCliTests(unittest.TestCase):
     def run_cli(self, argv, registry=(ENTRY,)):
-        with patch.object(panel, "load_registry", return_value=list(registry)):
+        own = lambda name, unit: unit != "pipewire.service"   # 视为项目自己定义的服务，pipewire 是桌面默认服务
+        with patch.object(panel, "load_registry", return_value=list(registry)), patch.object(panel, "own_unit", own):
             with patch("sys.stdout") as out, patch("sys.stderr") as err:
                 rc = panel.api_cli(argv)
         return rc, "".join(c.args[0] for c in out.write.call_args_list), "".join(c.args[0] for c in err.write.call_args_list)
@@ -223,6 +224,16 @@ class ApiCliTests(unittest.TestCase):
             rc, out, _ = self.run_cli(["logs", "demo", "app.service", "--lines", "1000"])
         self.assertEqual((rc, out), (0, "line1\nline2\n"))
         self.assertEqual(sl.call_args.args, ("demo", "app.service", 1000))
+
+    def test_foreign_unit_rejected(self):
+        with patch.object(panel, "service_log") as sl, patch.object(panel, "run_cmd") as rc_, \
+                patch.object(panel, "account_info", return_value=(1001, True)):
+            for argv in (["logs", "demo", "pipewire.service"], ["svc", "demo", "stop", "pipewire.service"]):
+                rc, _, err = self.run_cli(argv)
+                self.assertEqual(rc, 1, argv)
+                self.assertIn("不是项目 demo 自己定义的服务", err)
+        sl.assert_not_called()
+        rc_.assert_not_called()
 
     def test_logs_default_is_100(self):
         with patch.object(panel, "service_log", return_value=(0, "", "")) as sl:
@@ -434,6 +445,35 @@ class StartupWithoutUsersTests(unittest.TestCase):
         with self.assertRaises(SystemExit) as cm:
             self.run_main({"lan_ip": "192.0.2.1", "port": 9311}, False)
         self.assertIn("用户库", str(cm.exception))
+
+
+class OwnUnitTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        d = Path(self.dir.name) / "demo" / ".config" / "systemd" / "user"
+        d.mkdir(parents=True)
+        (d / "app.service").write_text("[Service]\n", encoding="utf-8")
+        (d / "worker@.service").write_text("[Service]\n", encoding="utf-8")
+        self.p = patch.object(panel, "SRV_ROOT", self.dir.name)
+        self.p.start()
+
+    def tearDown(self):
+        self.p.stop()
+        self.dir.cleanup()
+
+    def test_own_unit(self):
+        self.assertTrue(panel.own_unit("demo", "app.service"))
+        self.assertTrue(panel.own_unit("demo", "worker@1.service"))   # 实例化服务看模板
+        self.assertFalse(panel.own_unit("demo", "pipewire.service"))
+        self.assertFalse(panel.own_unit("other", "app.service"))
+
+    def test_project_services_only_own(self):
+        listing = ("app.service loaded active running App\n"
+                   "pipewire.service loaded active running PipeWire\n"
+                   "snap.firmware-updater.firmware-notifier.service loaded failed failed Notifier\n")
+        with patch.object(panel, "run_cmd", return_value=(0, listing, "")):
+            shown, err = panel.project_services("demo", 1001, False)
+        self.assertEqual(([u["unit"] for u in shown], err), (["app.service"], ""))
 
 
 if __name__ == "__main__":
