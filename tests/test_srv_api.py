@@ -1,7 +1,9 @@
 import base64
+import contextlib
 import hashlib
 import http.client
 import importlib.util
+import io
 import json
 import tempfile
 import threading
@@ -290,9 +292,11 @@ class InviteRevokeProjectTests(unittest.TestCase):
         self.assertEqual(self.store.revoke("aaaa1111", project="demo")["status"], "revoked")
 
     def test_cli_revoke_needs_project_and_rejects_cross_project(self):
-        with self.assertRaises(SystemExit) as cm:
+        err = io.StringIO()
+        with self.assertRaises(SystemExit) as cm, contextlib.redirect_stderr(err):
             panel.invite_cli(["--invites-file", self.path, "revoke", "demo", "bbbb2222"])
-        self.assertIn("找不到", str(cm.exception))
+        self.assertEqual(cm.exception.code, 2)   # 与「项目不存在」同口径，后端据此映射 404
+        self.assertIn("找不到", err.getvalue())
         with self.assertRaises(SystemExit) as cm:
             panel.invite_cli(["--invites-file", self.path, "revoke", "aaaa1111"])    # 旧的单参数写法：用法错误
         self.assertEqual(cm.exception.code, 2)

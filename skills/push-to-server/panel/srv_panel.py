@@ -867,6 +867,10 @@ class InviteError(ValueError):
     """生成/管理邀请时的中文错误。"""
 
 
+class InviteNotFound(InviteError):
+    """邀请不存在或不属于指定项目；CLI 以退出码 2 报告，与「项目不存在」同口径。"""
+
+
 class EnrollError(Exception):
     """登记请求被拒：msg 对外可见，status 为 HTTP 状态码，why 只进审计日志。"""
 
@@ -1143,7 +1147,7 @@ class InviteStore:
         def go():
             rec = self.invites.get(inv_id)
             if not rec or (project is not None and rec.get("project") != project):
-                raise InviteError("找不到邀请：%s" % inv_id)
+                raise InviteNotFound("找不到邀请：%s" % inv_id)
             st = invite_status(rec, now)
             if st != "pending":
                 raise InviteError("邀请 %s 当前状态为「%s」，不能作废" % (inv_id, STATUS_TEXT.get(st, st)))
@@ -1316,6 +1320,9 @@ def invite_cli(argv):
         else:
             rec = store.revoke(a.id, project=a.project)
             print("已作废邀请 %s（项目 %s，标签 %s）" % (rec["id"], rec["project"], rec["label"]))
+    except InviteNotFound as e:
+        print("错误：%s" % e, file=sys.stderr)
+        sys.exit(2)
     except InviteError as e:
         sys.exit("错误：%s" % e)
     audit(LOG_FILE, "invite_" + a.cmd, {k: v for k, v in vars(a).items() if k in ("project", "label", "id", "hours", "frm")},
