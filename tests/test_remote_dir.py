@@ -11,7 +11,7 @@ SPEC.loader.exec_module(safe_push)
 
 class RemoteDirTests(unittest.TestCase):
     def test_srv_project_paths_are_accepted(self):
-        for d in ("/srv/app", "/srv/wenjuan_inner_web/repo", "/opt/app/repo"):
+        for d in ("/srv/app", "/srv/demo_web/repo", "/opt/app/repo"):
             safe_push._validate_remote_dir(d)
 
     def test_home_and_dangerous_paths_are_rejected(self):

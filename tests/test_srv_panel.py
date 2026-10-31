@@ -105,7 +105,7 @@ class EnvTests(unittest.TestCase):
 
 class UnitTests(unittest.TestCase):
     def test_parse_units(self):
-        text = "wenjuan.service loaded active running wenjuan.service\ndbus.service loaded active running D-Bus User Message Bus\n"
+        text = "app.service loaded active running app.service\ndbus.service loaded active running D-Bus User Message Bus\n"
         u = panel.parse_units(text)
         self.assertEqual(u[0]["active"], "active")
         self.assertEqual(u[1]["desc"], "D-Bus User Message Bus")
@@ -127,7 +127,7 @@ class ValidationTests(unittest.TestCase):
         self.assertTrue(ok("srv.internal:9300", 9300, ["srv.internal"]))
 
     def test_project_name(self):
-        for good in ("wenjuan_inner_web", "ab", "a-b_c9", "a" * 32):
+        for good in ("demo_web", "ab", "a-b_c9", "a" * 32):
             self.assertTrue(panel.valid_name(good), good)
         for bad in ("a", "A", "1abc", "a b", "../x", "a/b", "a" * 33, "", "ab\n", "-ab"):
             self.assertFalse(panel.valid_name(bad), repr(bad))
@@ -137,10 +137,10 @@ class ValidationTests(unittest.TestCase):
         self.assertFalse(panel.valid_port("80"))
         self.assertFalse(panel.valid_port("70000"))
         self.assertFalse(panel.valid_port("12a"))
-        self.assertTrue(panel.valid_unit("wenjuan.service"))
+        self.assertTrue(panel.valid_unit("app.service"))
         self.assertFalse(panel.valid_unit("--user.service"))
         self.assertFalse(panel.valid_unit("a b.service"))
-        self.assertFalse(panel.valid_unit("wenjuan"))
+        self.assertFalse(panel.valid_unit("app"))
 
     def test_escape(self):
         self.assertEqual(panel.esc('<a href="x">&'), "&lt;a href=&quot;x&quot;&gt;&amp;")
