@@ -11,12 +11,13 @@
                          [--log-file /var/log/srv-panel.log]
     python3 srv_panel.py --bootstrap | --reset-admin     （安装脚本调用）
     python3 srv_panel.py invite create <项目> --label L [--hours N] [--from X] | list | revoke <项目> <编号>
-    python3 srv_panel.py api list|status|env|info|invites|logs|svc …      （srv-project 的 JSON 子命令转调到这里）
+    python3 srv_panel.py api list|status|env|info|invites|logs|svc|external|takeover-copy …   （srv-project 的 JSON 子命令转调到这里）
 
 纯函数（解析、校验、密码、限流）可直接 import 测试；导入时不检查 root、不启动服务。
 """
 import argparse
 import base64
+import contextlib
 import hashlib
 import hmac
 import html
@@ -26,12 +27,14 @@ import json
 import os
 import re
 import secrets
+import shutil
 import socket
 import socketserver
 import ssl
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -40,6 +43,10 @@ from concurrent.futures import ThreadPoolExecutor
 SRV_PROJECT = "/usr/local/sbin/srv-project"
 SRV_ROOT = "/srv"
 REGISTRY = "/srv/PROJECTS.tsv"
+EXTERNAL = "/srv/EXTERNAL.tsv"
+EXTERNAL_LOCK = "/srv/.EXTERNAL.lock"
+REGISTRY_LOCK = "/srv/.PROJECTS.lock"      # PROJECTS.tsv 的 flock：srv_project.sh 的追加/删除与面板的改写共用同一把
+TAKEOVER_STAGING = "/srv/.takeover"
 KEYS_DIR = "/etc/ssh/srv-keys"
 SSHD_DROPIN = "/etc/ssh/sshd_config.d/60-srv-projects.conf"
 GROUP = "srvproj"
@@ -124,14 +131,15 @@ def parse_ss(text):
 
 
 def parse_registry(text):
-    """解析 PROJECTS.tsv，返回 [{name, port, contact, created}]；# 开头与空行跳过。"""
+    """解析 PROJECTS.tsv，返回 [{name, port, contact, created, source}]；# 开头与空行跳过。
+    第 5 列「来源」可缺省（旧的 4 列文件），迁入的项目写 external:<外部服务名>。"""
     rows = []
     for line in text.splitlines():
         if not line.strip() or line.startswith("#"):
             continue
         f = line.split("\t")
-        f += [""] * (4 - len(f))
-        rows.append({"name": f[0], "port": f[1], "contact": f[2], "created": f[3]})
+        f += [""] * (5 - len(f))
+        rows.append({"name": f[0], "port": f[1], "contact": f[2], "created": f[3], "source": f[4]})
     return rows
 
 
@@ -391,7 +399,15 @@ def load_registry():
     return parse_registry(read_text(REGISTRY))
 
 
-def collect_project(entry, lst, keys=True):
+def source_external(entry, externals):
+    """迁入来的项目返回它的来源外部服务（EXTERNAL.tsv 条目，已不在登记表则 None）。"""
+    src = entry.get("source") or ""
+    if not src.startswith("external:"):
+        return None
+    return next((e for e in externals or () if e["name"] == src[len("external:"):]), None)
+
+
+def collect_project(entry, lst, keys=True, externals=()):
     name = entry["name"]
     uid, member = account_info(name)
     d = {"entry": entry, "uid": uid, "member": member, "problems": [], "notes": []}
@@ -410,6 +426,11 @@ def collect_project(entry, lst, keys=True):
     d["owners"] = owners
     d["owner_ok"] = (not owners) or owners == [name]
     foreign = [o for o in owners if o != name]
+    ext = source_external(entry, externals)
+    if ext and ext.get("target") == name and ext["owner"] in foreign:
+        # 迁入中：旧服务仍占着端口是预期状态，只提示，不算问题
+        foreign = [o for o in foreign if o != ext["owner"]]
+        d["notes"].append("迁移中：旧服务仍在监听")
     if foreign:
         d["problems"].append("端口 %s 被其他账号占用：%s" % (port, "、".join(foreign)))
     elif on_port and not owners:
@@ -425,8 +446,9 @@ def collect_project(entry, lst, keys=True):
 def collect_all(keys=True):
     lst = listeners()
     reg = load_registry()
+    externals = load_external()
     with ThreadPoolExecutor(max_workers=4) as ex:
-        projects = list(ex.map(lambda e: collect_project(e, lst, keys), reg))
+        projects = list(ex.map(lambda e: collect_project(e, lst, keys, externals), reg))
     by_port = {}
     for p in projects:
         by_port.setdefault(p["entry"]["port"], []).append(p["entry"]["name"])
@@ -435,6 +457,7 @@ def collect_all(keys=True):
         if len(same) > 1:
             p["problems"].append("登记端口 %s 与项目 %s 重复" % (
                 p["entry"]["port"], "、".join(n for n in same if n != p["entry"]["name"])))
+        p["problems"].extend(external_port_problems(p["entry"], externals))
     return projects, lst, reg
 
 
@@ -1357,11 +1380,12 @@ def _port_int(text):
 
 
 def light_record(entry, exists, disabled, key_lines):
-    """list --json 的一条记录：只来自登记表、shadow 和公钥文件。"""
+    """list --json 的一条记录：只来自登记表、shadow 和公钥文件。source 为 external:<名称> 或 null。"""
     return {"name": entry["name"], "port": _port_int(entry["port"]), "contact": entry["contact"],
             "created": entry["created"], "account_exists": bool(exists),
             "disabled": bool(disabled) if exists else False,
-            "keys": key_entries(key_lines) if exists else []}
+            "keys": key_entries(key_lines) if exists else [],
+            "source": entry.get("source") or None}
 
 
 HEAD_RE = re.compile(r"^[0-9a-f]{7,40}\s")
@@ -1403,9 +1427,13 @@ def scan_srv_dirs(registered):
     return world, extra
 
 
-def global_record(listeners_, ports, world, extra, sshd_rule, srv_project_ok):
+def global_record(listeners_, ports, world, extra, sshd_rule, srv_project_ok, ext_ports=None):
+    """ext_ports：端口（字符串）→ {name, migrate_state}，来自外部服务登记表。端口既属项目又属外部服务时两个字段都写。"""
+    ext_ports = ext_ports or {}
     return {"sshd_rule": bool(sshd_rule), "world_readable": list(world),
-            "listeners": [{"port": r["port"], "owner": ",".join(r["owners"]) or None, "project": ports.get(str(r["port"]))}
+            "listeners": [{"port": r["port"], "owner": ",".join(r["owners"]) or None, "project": ports.get(str(r["port"])),
+                           "external": (ext_ports.get(str(r["port"])) or {}).get("name"),
+                           "migrate_state": (ext_ports.get(str(r["port"])) or {}).get("migrate_state")}
                           for r in sorted(listeners_, key=lambda r: (r["port"], r["addr"]))],
             "srv_project": bool(srv_project_ok), "unregistered_dirs": list(extra)}
 
@@ -1502,21 +1530,27 @@ def _api_project(name):
 
 def api_status(project=None):
     reg = load_registry()
+    externals = load_external()
     lst = listeners()
     light_by = {l["name"]: l for l in light_projects()}
     if project is not None:
         entry = _api_project(project)
-        d = collect_project(entry, lst, keys=False)
+        d = collect_project(entry, lst, keys=False, externals=externals)
         same = [r["name"] for r in reg if r["port"] == entry["port"] and r["name"] != entry["name"]]
         if same:
             d["problems"].append("登记端口 %s 与项目 %s 重复" % (entry["port"], "、".join(same)))
+        d["problems"].extend(external_port_problems(entry, externals))
         return {"projects": [status_record(light_by[entry["name"]], d)]}
     projects, lst, reg = collect_all(keys=False)
     recs = [status_record(light_by[p["entry"]["name"]], p) for p in projects]
     ports = {p["entry"]["port"]: p["entry"]["name"] for p in projects}
     world, extra = scan_srv_dirs({r["name"] for r in reg})
-    return {"projects": recs,
-            "global": global_record(lst, ports, world, extra, os.path.exists(SSHD_DROPIN), os.access(SRV_PROJECT, os.X_OK))}
+    ext_recs = [external_record(e, reg, lst) for e in externals]
+    ext_ports = {str(e["port"]): {"name": e["name"], "migrate_state": e["migrate_state"]} for e in ext_recs}
+    # externals 只在不带项目参数的全量 status 里出现
+    return {"projects": recs, "externals": ext_recs,
+            "global": global_record(lst, ports, world, extra, os.path.exists(SSHD_DROPIN), os.access(SRV_PROJECT, os.X_OK),
+                                    ext_ports)}
 
 
 def api_env(project):
@@ -1541,6 +1575,588 @@ def api_invites(project, invites_file=INVITES_FILE):
     return invites_record(InviteStore(invites_file).snapshot(), project)
 
 
+# ───────────────────────── 外部服务登记（EXTERNAL.tsv）与迁入 ─────────────────────────
+# 委托账号（知识库后端账号）可以免密执行整个 srv-project，所以下面五条不变量全部在这里强制，不依赖知识库后端：
+#   1. 只能迁入调用者自己的服务：可迁入只允许出现在属主 = SUDO_USER（root 直接调用不受此限）、端口 >= 1024、
+#      属主为普通账号（uid 1000–59999，非项目账号）的条目上
+#   2. 登记时核对属主：端口有进程监听，则监听属主必须等于登记属主；没有监听可以登记，说明里注明
+#   3. 不碰项目的端口和账号：登记属主、监听属主都不能是项目账号；端口不能已在 PROJECTS.tsv 或另一条外部服务上
+#   4. 迁入只豁免该外部服务的那个端口，PROJECTS.tsv 里的端口冲突永不豁免
+#   5. 名称唯一：外部服务与项目、外部服务之间不能重名
+# 读写、校验、属主判定、迁入状态只在这里实现一份；srv_project.sh 只透传参数。
+
+EXT_KEYS = ("name", "port", "owner", "unit", "migratable", "target", "desc", "created", "created_by")
+EXT_HEADER = "# 名称\t端口\t属主\t单元\t可迁入\t迁入目标\t说明\t登记时间\t登记人\n"
+REGISTRY_HEADER = "# 项目\t端口\t联系人\t创建时间\t来源\n"     # 与 srv_project.sh install 写的表头一致（5 列）
+EXT_DESC_MAX = 60
+OWNER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,31}$")
+MIGRATE_MIN_UID, MIGRATE_MAX_UID = 1000, 60000
+MIGRATING, SWITCHED = "迁移中", "已切换"
+COPY_TARGETS = ("data", "config")
+
+
+def parse_external(text):
+    """解析 EXTERNAL.tsv，返回 9 个键的 dict：
+    [{name, port, owner, unit, migratable, target, desc, created, created_by}]（全是字符串）。
+    旧文件没有第 9 列「登记人」时补空串，删除登记按「只有 root 或属主」处理（fail-closed）。"""
+    rows = []
+    for line in text.splitlines():
+        if not line.strip() or line.startswith("#"):
+            continue
+        f = line.split("\t")
+        f += [""] * (len(EXT_KEYS) - len(f))
+        rows.append(dict(zip(EXT_KEYS, f[:len(EXT_KEYS)])))
+    return rows
+
+
+def dump_external(rows):
+    return EXT_HEADER + "".join("\t".join(r.get(k, "") for k in EXT_KEYS) + "\n" for r in rows)
+
+
+def load_external():
+    """宽松读取（status 用）：读不到当作没有登记。"""
+    return parse_external(read_text(EXTERNAL))
+
+
+def _load_external_strict():
+    """变更前读取：文件不存在是空表，其他读取失败一律报错，避免据空表覆盖写入。"""
+    try:
+        with open(EXTERNAL, encoding="utf-8") as f:
+            return parse_external(f.read())
+    except FileNotFoundError:
+        return []
+    except (OSError, UnicodeDecodeError) as e:
+        raise ApiExit("%s 读取失败，未改动：%s" % (EXTERNAL, e))
+
+
+def _read_registry_strict():
+    """冲突核对与变更前的登记表原文：不存在返回 None（按空表处理）；其他读取失败一律报错，不据残缺内容放行。
+    不设长度上限：read_text 的 1 MiB 截断会漏掉后段行，冲突检查不能据残缺表放行。展示路径仍用带保护的 load_registry。"""
+    try:
+        with open(REGISTRY, encoding="utf-8", newline="") as f:
+            return f.read()
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError) as e:
+        raise ApiExit("%s 读取失败，未改动：%s" % (REGISTRY, e))
+
+
+def _load_registry_strict():
+    text = _read_registry_strict()
+    return parse_registry(text) if text is not None else []
+
+
+def _save_external(rows):
+    write_file_atomic(EXTERNAL, dump_external(rows), mode=0o644)
+
+
+@contextlib.contextmanager
+def _flock(path):
+    """对锁文件加排他 flock。没有 fcntl（非 Linux 的测试环境）时不加锁。"""
+    try:
+        import fcntl
+    except ImportError:
+        fcntl = None
+    if fcntl is None:
+        yield
+        return
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)
+    except OSError as e:
+        raise ApiExit("无法创建锁文件 %s：%s" % (path, e))
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def external_lock():
+    """串行化对 EXTERNAL.tsv 的读改写。"""
+    return _flock(EXTERNAL_LOCK)
+
+
+def registry_lock():
+    """串行化对 PROJECTS.tsv 的读改写（srv_project.sh 的追加/删除用 flock 命令锁同一个文件）。
+    锁序一律 EXTERNAL → PROJECTS：只在已持 external_lock 时嵌套取它，绝不反向，避免死锁。"""
+    return _flock(REGISTRY_LOCK)
+
+
+def caller_user():
+    """调用者：sudo 调用取 SUDO_USER，root 直接运行为 root。"""
+    return os.environ.get("SUDO_USER") or "root"
+
+
+def ext_text_ok(s):
+    return isinstance(s, str) and not any(ord(c) < 32 or c == "\x7f" for c in s)
+
+
+def valid_ext_unit(unit):
+    """单元可为空；否则 user:<unit> 或 system:<unit>，单元名同 UNIT_RE。"""
+    if unit == "":
+        return True
+    scope, _, name = unit.partition(":")
+    return scope in ("user", "system") and valid_unit(name)
+
+
+def _port_listeners(lst, port):
+    on_port = [r for r in lst if r["port"] == port]
+    return bool(on_port), sorted({o for r in on_port for o in r["owners"]})
+
+
+def same_port(a, b):
+    """端口按整数比较（09200 与 9200 是同一个端口），无法解析的不相等。"""
+    x, y = _port_int(a), _port_int(b)
+    return x is not None and x == y
+
+
+def migrate_state(target, owners):
+    """迁入状态：没有迁入目标为 None；监听属主恰好是新项目账号为「已切换」，其余为「迁移中」。"""
+    if not target:
+        return None
+    return SWITCHED if list(owners) == [target] else MIGRATING
+
+
+def external_port_problems(entry, externals):
+    """项目登记端口与外部服务重复的问题（迁入目标就是该项目时是预期的，不算）。"""
+    # 文案不带外部服务名：单项目 status 也会走到这里，运维管理员拿不到外部服务的信息
+    return ["登记端口 %s 与一条外部服务登记重复" % entry["port"]
+            for e in externals or () if same_port(e["port"], entry["port"]) and e.get("target") != entry["name"]]
+
+
+def external_record(row, reg, lst):
+    """status/list 里的一条外部服务记录：登记字段 + 监听情况 + 迁入状态 + problems/notes。不做服务、git、磁盘探测。"""
+    port = _port_int(row["port"])
+    listening, owners = _port_listeners(lst, port) if port else (False, [])
+    target = row["target"]
+    state = migrate_state(target, owners)
+    problems, notes = [], []
+    if not _account_exists(row["owner"]):
+        problems.append("属主账号 %s 不存在" % row["owner"])
+    if target and not any(r["name"] == target for r in reg):
+        problems.append("迁入目标项目 %s 不在登记表里（修复：srv-project external remove %s --cancel-migration）"
+                        % (target, row["name"]))
+    allowed = {row["owner"]} | ({target} if target else set())
+    if owners and not set(owners) <= allowed:
+        problems.append("端口 %s 当前由 %s 监听，与登记属主 %s 不符" % (row["port"], "、".join(owners), row["owner"]))
+    elif listening and not owners:
+        notes.append("端口在监听，但看不到进程属主")
+    for r in reg:
+        if same_port(r["port"], row["port"]) and r["name"] != target:
+            problems.append("登记端口 %s 与项目 %s 重复" % (row["port"], r["name"]))
+    if not listening:
+        notes.append("当前未监听")
+    if state == MIGRATING and row["owner"] in owners:
+        notes.append("迁移中：旧服务仍在监听")
+    if state == SWITCHED:
+        notes.append("已切换：新项目已接管端口，确认无误后可 external remove")
+    return {"name": row["name"], "port": port, "owner": row["owner"], "unit": row["unit"] or None,
+            "migratable": row["migratable"] == "1", "migrate_target": target or None,
+            "desc": row["desc"], "created": row["created"],
+            "listening": listening, "listen_owner": ",".join(owners) or None,
+            "owner_match": (owners == [row["owner"]]) if owners else None,
+            "migrate_state": state, "problems": problems, "notes": notes}
+
+
+def _find_external(rows, name, code=1):
+    row = next((r for r in rows if r["name"] == name), None)
+    if not row:
+        raise ApiExit("外部服务不存在：%s" % name, code)
+    return row
+
+
+def _check_migratable(owner, port, caller, uid):
+    """不变量 1。"""
+    if caller != "root" and owner != caller:
+        raise ApiExit("只能迁入调用者自己（%s）的服务；属主 %s 的服务只能只读登记" % (caller, owner))
+    if port < 1024:
+        raise ApiExit("端口 %d 低于 1024，不能迁入，只能只读登记" % port)
+    if uid is None or not MIGRATE_MIN_UID <= uid < MIGRATE_MAX_UID:
+        raise ApiExit("属主 %s 是系统账号（uid 不在 %d–%d），不能迁入，只能只读登记"
+                      % (owner, MIGRATE_MIN_UID, MIGRATE_MAX_UID - 1))
+
+
+def external_add(name, port, owner, unit="", desc="", migrate=False, caller=None, lst=None, now=None):
+    """登记外部服务，返回 (登记行, 提示列表)。"""
+    caller = caller or caller_user()
+    if not valid_name(name):
+        raise ApiExit("名称只能用小写字母、数字、- 和 _，以字母开头，2–32 个字符：%s" % name)
+    port_s = str(port)
+    if not port_s.isdigit() or not 1 <= int(port_s) <= 65535:
+        raise ApiExit("--port 须为 1–65535")
+    port_n = int(port_s)
+    port_s = str(port_n)
+    if not isinstance(owner, str) or not OWNER_RE.fullmatch(owner):
+        raise ApiExit("--owner 账号名格式不对：%s" % owner)
+    unit, desc = unit or "", desc or ""
+    if not ext_text_ok(unit) or not ext_text_ok(desc):
+        raise ApiExit("--unit/--desc 不能含制表符、换行等控制字符")
+    if not valid_ext_unit(unit):
+        raise ApiExit("--unit 须为空，或 user:<服务名>.service / system:<服务名>.service：%s" % unit)
+    if len(desc) > EXT_DESC_MAX:
+        raise ApiExit("--desc 不超过 %d 个字符" % EXT_DESC_MAX)
+    uid, is_project_account = account_info(owner)
+    if uid is None:
+        raise ApiExit("属主账号不存在：%s" % owner)
+    if is_project_account:
+        raise ApiExit("属主 %s 是 %s 项目账号，项目的端口和账号不能登记为外部服务" % (owner, GROUP))
+    notes = []
+    with external_lock():
+        rows = _load_external_strict()
+        with registry_lock():      # 读 PROJECTS 也持锁：shell delete 的就地改写不含原子保证，不能读到截断一半的表
+            reg = _load_registry_strict()
+        if any(r["name"] == name for r in rows):
+            raise ApiExit("外部服务 %s 已登记" % name)
+        if any(r["name"] == name for r in reg):
+            raise ApiExit("名称 %s 已被项目使用，外部服务不能与项目重名" % name)
+        clash = next((r["name"] for r in reg if same_port(r["port"], port_n)), None)
+        if clash:
+            raise ApiExit("端口 %s 已登记为项目 %s" % (port_s, clash))
+        clash = next((r["name"] for r in rows if same_port(r["port"], port_n)), None)
+        if clash:
+            raise ApiExit("端口 %s 已登记为外部服务 %s" % (port_s, clash))
+        lst = listeners() if lst is None else lst
+        listening, owners = _port_listeners(lst, port_n)
+        if listening:
+            if not owners:
+                raise ApiExit("端口 %s 在监听，但看不到进程属主，无法核对属主" % port_s)
+            for o in owners:
+                if account_info(o)[1]:
+                    raise ApiExit("端口 %s 当前由项目账号 %s 监听，不能登记为外部服务" % (port_s, o))
+            if owners != [owner]:
+                raise ApiExit("端口 %s 当前的监听属主是 %s，与登记的属主 %s 不符" % (port_s, "、".join(owners), owner))
+        else:
+            notes.append("登记时未监听")
+            suffix = "登记时未监听"
+            joined = (desc + "；" + suffix) if desc else suffix
+            if len(joined) <= EXT_DESC_MAX:
+                desc = joined
+        if migrate:
+            _check_migratable(owner, port_n, caller, uid)
+        row = {"name": name, "port": port_s, "owner": owner, "unit": unit, "migratable": "1" if migrate else "0",
+               "target": "", "desc": desc, "created": now or time.strftime("%Y-%m-%d %H:%M:%S"), "created_by": caller}
+        rows.append(row)
+        _save_external(rows)
+    return row, notes
+
+
+def external_precheck(name, port):
+    """不带 --takeover 的 create 前置核对（建议性 fail-fast）：项目名、端口不能撞外部服务。
+    这里不持锁：登记表的写入都是原子替换，读到旧表只是放行给后面的 register 再权威复查，不会读到半个文件。"""
+    rows = _load_external_strict()
+    if any(r["name"] == name for r in rows):
+        raise ApiExit("名称 %s 已被外部服务使用，项目不能与外部服务重名" % name)
+    clash = next((r["name"] for r in rows if same_port(r["port"], port)), None)
+    if clash:
+        raise ApiExit("端口 %s 已登记为外部服务 %s；要迁入请用 create --takeover %s" % (port, clash, clash))
+
+
+def external_takeover_begin(ext_name, project, port, caller=None, lst=None):
+    """create --takeover 的第 1 步：核对全部前置条件并在 EXTERNAL.tsv 标记迁入目标。失败什么都不改。"""
+    caller = caller or caller_user()
+    with external_lock():
+        rows = _load_external_strict()
+        row = _find_external(rows, ext_name)
+        if row["migratable"] != "1":
+            raise ApiExit("外部服务 %s 未标记可迁入（登记时需 --migrate，且属主是调用者自己）" % ext_name)
+        if row["target"]:
+            raise ApiExit("外部服务 %s 已在迁入项目 %s" % (ext_name, row["target"]))
+        if caller != "root" and caller != row["owner"]:
+            raise ApiExit("只有外部服务 %s 的属主 %s 或 root 能迁入它" % (ext_name, row["owner"]))
+        if not valid_name(project):
+            raise ApiExit("项目名不合法：%s" % project)
+        if any(r["name"] == project for r in rows):
+            raise ApiExit("名称 %s 已被外部服务使用，项目不能与外部服务重名" % project)
+        if not same_port(port, row["port"]):
+            raise ApiExit("--takeover 的项目端口必须等于外部服务 %s 的端口 %s" % (ext_name, row["port"]))
+        port_n = int(row["port"])
+        uid, is_project_account = account_info(row["owner"])
+        _check_migratable(row["owner"], port_n, caller, uid)
+        if is_project_account:
+            raise ApiExit("属主 %s 是项目账号" % row["owner"])
+        with registry_lock():
+            clash = next((r["name"] for r in _load_registry_strict() if same_port(r["port"], row["port"])), None)
+        if clash:
+            raise ApiExit("端口 %s 已登记为项目 %s，--takeover 只豁免外部服务的端口，项目端口冲突不豁免" % (row["port"], clash))
+        lst = listeners() if lst is None else lst
+        listening, owners = _port_listeners(lst, port_n)
+        if listening and (not owners or owners != [row["owner"]]):
+            raise ApiExit("端口 %s 当前的监听属主是 %s，不是外部服务的登记属主 %s，拒绝迁入"
+                          % (row["port"], "、".join(owners) or "（无法确认）", row["owner"]))
+        row["target"] = project
+        _save_external(rows)
+    return row
+
+
+def external_takeover_abort(ext_name, project):
+    """create 失败时回滚迁入标记：迁入目标仍是该项目才清，返回是否清了。"""
+    with external_lock():
+        rows = _load_external_strict()
+        row = next((r for r in rows if r["name"] == ext_name), None)
+        if not row or row["target"] != project:
+            return False
+        row["target"] = ""
+        _save_external(rows)
+    return True
+
+
+def external_release(project):
+    """delete 项目时清掉指向它的迁入目标。EXTERNAL.tsv 不存在、没有对应条目都静默跳过。"""
+    if not os.path.exists(EXTERNAL):
+        return 0
+    with external_lock():
+        rows = _load_external_strict()
+        hit = [r for r in rows if r["target"] == project]
+        for r in hit:
+            r["target"] = ""
+        if hit:
+            _save_external(rows)
+    return len(hit)
+
+
+def external_register(name, port, contact="", source=""):
+    """create 的权威登记：检查与落盘在同一个临界区（EXTERNAL → PROJECTS 两把锁），不给并发留窗口。
+    名称与端口按整数复查两张表；source 为 external:<名称> 时是迁入——只豁免该外部服务的端口，
+    且它的迁入目标必须仍是本项目（否则说明迁移已被取消或回滚，拒绝登记）。项目表端口冲突永不豁免。
+    返回追加的登记行。shell 在 register 成功后才建账号，失败时经 unregister + takeover-abort 回滚。"""
+    if not valid_name(name):
+        raise ApiExit("项目名不合法：%s" % name)
+    port_s = str(port)
+    if not port_s.isdigit() or not 1 <= int(port_s) <= 65535:
+        raise ApiExit("--port 须为 1–65535")
+    port_n = int(port_s)
+    port_s = str(port_n)
+    contact = contact or ""
+    if not ext_text_ok(contact):
+        raise ApiExit("--contact 不能含制表符、换行等控制字符")
+    ext_name = ""
+    if source:
+        if not source.startswith("external:") or not valid_name(source[len("external:"):]):
+            raise ApiExit("来源格式不对：%s" % source)
+        ext_name = source[len("external:"):]
+    with external_lock():
+        rows = _load_external_strict()
+        if any(r["name"] == name for r in rows):
+            raise ApiExit("名称 %s 已被外部服务使用，项目不能与外部服务重名" % name)
+        clash = next((r["name"] for r in rows if r["name"] != ext_name and same_port(r["port"], port_n)), None)
+        if clash:
+            raise ApiExit("端口 %s 已登记为外部服务 %s；要迁入请用 create --takeover %s" % (port_s, clash, clash))
+        if ext_name:
+            ext = next((r for r in rows if r["name"] == ext_name), None)
+            if not ext or ext["target"] != name:
+                raise ApiExit("外部服务 %s 不在迁入项目 %s 中（可能已被取消或回滚），拒绝登记" % (ext_name, name))
+            if not same_port(ext["port"], port_n):
+                raise ApiExit("--takeover 的项目端口必须等于外部服务 %s 的端口 %s" % (ext_name, ext["port"]))
+        with registry_lock():
+            text = _read_registry_strict()
+            reg = parse_registry(text or "")
+            if any(r["name"] == name for r in reg):
+                raise ApiExit("名称 %s 已被项目使用" % name)
+            clash = next((r["name"] for r in reg if same_port(r["port"], port_n)), None)
+            if clash:
+                raise ApiExit("端口 %s 已登记为项目 %s" % (port_s, clash))
+            created = time.strftime("%Y-%m-%d %H:%M:%S")
+            if text is None:
+                text = REGISTRY_HEADER      # 表还没建（未 install）：按空表起，表头与 install 一致
+            elif text and not text.endswith("\n"):
+                text += "\n"
+            write_file_atomic(REGISTRY, "%s%s\n" % (text, "\t".join([name, port_s, contact, created, source])), mode=0o644)
+    return {"name": name, "port": port_s, "contact": contact, "created": created, "source": source}
+
+
+def external_unregister(name):
+    """create 中途失败的回滚：按名删掉 register 刚追加的 PROJECTS 行，其余行原样保留。返回是否删了。"""
+    if not valid_name(name):
+        raise ApiExit("项目名不合法：%s" % name)
+    with registry_lock():
+        try:
+            with open(REGISTRY, encoding="utf-8", newline="") as f:
+                text = f.read()
+        except FileNotFoundError:
+            return False
+        except (OSError, UnicodeDecodeError) as e:
+            raise ApiExit("%s 读取失败，未改动：%s" % (REGISTRY, e))
+        out, removed = [], False
+        for line in text.split("\n"):
+            f = line.split("\t")
+            if line and not line.startswith("#") and f[0] == name:
+                removed = True
+                continue
+            out.append(line)
+        if removed:
+            write_file_atomic(REGISTRY, "\n".join(out), mode=0o644)
+    return removed
+
+
+def clear_project_source(project, ext_name):
+    """把 PROJECTS.tsv 里 project 的来源列（external:<ext_name>）清掉，其余行原样保留。返回是否改了。"""
+    with registry_lock():
+        try:
+            with open(REGISTRY, encoding="utf-8", newline="") as f:     # 不设长度上限，读不到就报错，不据残缺内容写回
+                text = f.read()
+        except FileNotFoundError:
+            return False
+        except (OSError, UnicodeDecodeError) as e:
+            raise ApiExit("%s 读取失败，未改动：%s" % (REGISTRY, e))
+        out, changed = [], False
+        for line in text.split("\n"):
+            f = line.split("\t")
+            if line and not line.startswith("#") and f[0] == project and len(f) >= 5 and f[4] == "external:" + ext_name:
+                line, changed = "\t".join(f[:4]), True      # 只动目标行的第 5 列，其余行原样
+            out.append(line)
+        if changed:
+            write_file_atomic(REGISTRY, "\n".join(out), mode=0o644)     # 临时文件 + os.replace
+    return changed
+
+
+def external_remove(name, cancel=False, lst=None, caller=None):
+    """删除登记（只删登记，不影响服务本身）。迁入中默认拒绝；已切换可直接删（项目的来源保留）；
+    --cancel-migration 先清迁入目标，同时清项目来源，再删除。
+    调用者：条目有迁入目标（迁入中或已切换）时只有 root 或条目属主能删/取消迁移；
+    普通只读登记只有 root、属主或登记人能删。"""
+    caller = caller or caller_user()
+    with external_lock():
+        rows = _load_external_strict()
+        row = _find_external(rows, name, 2)
+        target = row["target"]
+        if caller != "root" and caller != row["owner"]:
+            if target:
+                raise ApiExit("外部服务 %s 正在迁入项目 %s，只有 root 或它的属主 %s 能删除或取消迁移"
+                              % (name, target, row["owner"]))
+            if caller != row.get("created_by"):
+                raise ApiExit("只有 root、外部服务 %s 的属主 %s 或登记人能删除它的登记" % (name, row["owner"]))
+        if target:
+            lst = listeners() if lst is None else lst
+            state = migrate_state(target, _port_listeners(lst, _port_int(row["port"]) or 0)[1])
+            if cancel:
+                row["target"] = ""
+                _save_external(rows)
+                try:
+                    clear_project_source(target, name)
+                except (ApiExit, OSError) as e:
+                    # 迁入目标已落盘清除，不能报「未改动」：如实说明半途状态并给出手动修复步骤
+                    raise ApiExit("已清迁入目标，但清项目 %s 的来源失败（%s）；请手动去掉 %s 里该行的第 5 列后再 external remove %s"
+                                  % (target, e, REGISTRY, name))
+            elif state != SWITCHED:
+                raise ApiExit("外部服务 %s 正在迁入项目 %s（%s）。要放弃迁移请加 --cancel-migration；"
+                              "新服务接管端口（已切换）后可直接删除" % (name, target, state))
+        rows = [r for r in rows if r["name"] != name]
+        _save_external(rows)
+    return "已删除外部服务登记 %s（只删登记，服务本身不受影响）" % name
+
+
+def _uid_of(name):
+    try:
+        import pwd
+        return pwd.getpwnam(name).pw_uid
+    except (ImportError, KeyError):
+        return None
+
+
+def takeover_copy_check(project, src, to, caller=None):
+    """takeover-copy 的全部前置校验（不改任何东西）。返回 (外部服务行, 源目录真实路径, 目标路径)。"""
+    caller = caller or caller_user()
+    if to not in COPY_TARGETS:
+        raise ApiExit("--to 只能是 data 或 config")
+    if not valid_name(project):
+        raise ApiExit("项目名不合法：%s" % project, 2)
+    entry = next((r for r in load_registry() if r["name"] == project), None)
+    if not entry:
+        raise ApiExit("项目不存在：%s" % project, 2)
+    source = entry.get("source") or ""
+    if not source.startswith("external:"):
+        raise ApiExit("项目 %s 不是从外部服务迁入的，不能 takeover-copy" % project)
+    ext = next((r for r in _load_external_strict() if r["name"] == source[len("external:"):]), None)
+    if not ext or ext["target"] != project:
+        raise ApiExit("项目 %s 的来源外部服务已不在迁入中，不能 takeover-copy" % project)
+    if caller != "root" and caller != ext["owner"]:
+        raise ApiExit("只有外部服务 %s 的属主 %s 或 root 能执行 takeover-copy" % (ext["name"], ext["owner"]))
+    if not isinstance(src, str) or not src or not ext_text_ok(src) or not os.path.isabs(src):
+        raise ApiExit("源目录须为不含控制字符的绝对路径")
+    if ".." in src.replace("\\", "/").split("/"):
+        raise ApiExit("源目录路径不能含 ..")
+    real = os.path.realpath(src)
+    if real != os.path.normpath(src):
+        raise ApiExit("源目录路径含符号链接/重解析点（真实路径 %s），拒绝；请给真实路径" % real)
+    srv = os.path.normpath(SRV_ROOT)
+    if real == srv or real.startswith(srv + os.sep):
+        raise ApiExit("源目录不能位于 %s 下" % SRV_ROOT)
+    try:
+        st = os.lstat(real)
+    except OSError as e:
+        raise ApiExit("无法读取源目录：%s" % e)
+    if not stat.S_ISDIR(st.st_mode):
+        raise ApiExit("源路径不是目录：%s" % real)
+    owner_uid = _uid_of(ext["owner"])
+    if owner_uid is None or st.st_uid != owner_uid:
+        raise ApiExit("源目录 %s 的属主不是外部服务的属主 %s，拒绝" % (real, ext["owner"]))
+    base = os.path.basename(real)
+    if base in ("", ".", ".."):
+        raise ApiExit("源目录不能是根目录")
+    return ext, real, os.path.join(SRV_ROOT, project, to, base)
+
+
+def takeover_copy(project, src, to="data", caller=None):
+    """把迁入项目的旧数据目录复制进 /srv/<项目>/<data|config>/<源目录名>。
+    复制由源目录属主身份读取（读不到的文件就报错，不借 root 越权），落地和移动由项目账号身份完成，
+    root 只负责建暂存目录和 chown，所以项目账号替换自己目录里的符号链接也无法让 root 写到别处。"""
+    caller = caller or caller_user()
+    ext, real, dest = takeover_copy_check(project, src, to, caller)
+    owner = ext["owner"]
+    home_to = os.path.dirname(dest)
+    for check, why in ((["test", "-d", home_to], "目标父目录 %s 不存在" % home_to),
+                       (["test", "!", "-L", home_to], "目标父目录 %s 是符号链接" % home_to),
+                       (["test", "!", "-e", dest], "目标 %s 已存在，拒绝覆盖" % dest),
+                       (["test", "!", "-L", dest], "目标 %s 是符号链接" % dest)):
+        rc, _, _ = run_cmd(["runuser", "-u", project, "--"] + check, timeout=15)
+        if rc != 0:
+            raise ApiExit(why)
+    try:
+        os.makedirs(TAKEOVER_STAGING, mode=0o711)
+    except FileExistsError:
+        pass                                # 已存在：不动权限，保留管理员后来收紧的设置
+    else:
+        os.chmod(TAKEOVER_STAGING, 0o711)   # 只在新建时补齐被 umask 吃掉的位
+    stage = tempfile.mkdtemp(dir=TAKEOVER_STAGING)
+    staged = os.path.join(stage, os.path.basename(real))
+    who = "cli:" + caller
+    try:
+        os.chown(stage, _uid_of(owner), -1)
+        os.chmod(stage, 0o700)
+        rc, _, err = run_cmd(["runuser", "-u", owner, "--", "cp", "-a", "-x", "--no-preserve=ownership", "--", real, staged],
+                             timeout=3600)
+        if rc != 0:
+            raise ApiExit("复制失败（退出码 %s）：%s" % (rc, err.strip()[-300:]))
+        # --from：只改仍属于旧属主的条目。复制期间旧属主往树里塞的硬链接若指向别人的文件，不会被连带改成项目账号所有
+        rc, _, err = run_cmd(["chown", "--from=%s" % owner, "-hR", "%s:%s" % (project, project), stage], timeout=600)
+        if rc != 0:
+            raise ApiExit("chown 失败（退出码 %s）：%s" % (rc, err.strip()[-300:]))
+        files = size = 0
+        for _dir, dirs, names in os.walk(staged, followlinks=False):
+            for n in names:
+                files += 1
+                try:
+                    st = os.lstat(os.path.join(_dir, n))
+                    size += st.st_size if stat.S_ISREG(st.st_mode) else 0
+                except OSError:
+                    pass
+        rc, _, err = run_cmd(["runuser", "-u", project, "--", "mv", "-nT", "--", staged, dest], timeout=3600)
+        if rc != 0:
+            raise ApiExit("移入 %s 失败（退出码 %s）：%s" % (dest, rc, err.strip()[-300:]))
+        rc, _, _ = run_cmd(["runuser", "-u", project, "--", "test", "!", "-e", staged], timeout=15)
+        if rc != 0:
+            raise ApiExit("目标 %s 已存在，未覆盖" % dest)
+    except ApiExit as e:
+        audit(LOG_FILE, "api_takeover_copy", {"project": project, "src": real, "to": to, "stage": stage}, 1, who)
+        raise ApiExit("%s（暂存目录 %s，通常已自动清理；残留请手动删除）" % (e, stage), e.code)
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+        if os.path.exists(stage):
+            sys.stderr.write("警告：暂存目录 %s 未能清理，请手动删除\n" % stage)
+    audit(LOG_FILE, "api_takeover_copy", {"project": project, "src": real, "to": to, "files": files, "bytes": size}, 0, who)
+    return "已复制 %s → %s：%d 个文件，%d 字节（未停旧服务；请核对数目后再停旧进程）" % (real, dest, files, size)
+
+
 def api_cli(argv):
     """srv_panel.py api …（root 运行；srv-project 的新子命令转调到这里）。JSON 只写 stdout，原因写 stderr。"""
     ap = argparse.ArgumentParser(prog="srv_panel.py api")
@@ -1560,8 +2176,92 @@ def api_cli(argv):
     sv.add_argument("project")
     sv.add_argument("op", choices=SERVICE_OPS)
     sv.add_argument("unit")
+    ex = sub.add_parser("external").add_subparsers(dest="ecmd", required=True)
+    ea = ex.add_parser("add")
+    ea.add_argument("name")
+    ea.add_argument("--port", required=True)
+    ea.add_argument("--owner", required=True)
+    ea.add_argument("--unit", default="")
+    ea.add_argument("--desc", default="")
+    ea.add_argument("--migrate", action="store_true")
+    er = ex.add_parser("remove")
+    er.add_argument("name")
+    er.add_argument("--cancel-migration", action="store_true")
+    ex.add_parser("list")
+    ep = ex.add_parser("precheck")      # 内部：create 前核对
+    ep.add_argument("name")
+    ep.add_argument("port")
+    eb = ex.add_parser("takeover-begin")     # 内部：create --takeover 第 1 步
+    eb.add_argument("ext")
+    eb.add_argument("--project", required=True)
+    eb.add_argument("--port", required=True)
+    eo = ex.add_parser("takeover-abort")      # 内部：create 失败回滚
+    eo.add_argument("ext")
+    eo.add_argument("--project", required=True)
+    ex.add_parser("release").add_argument("project")      # 内部：delete 项目后清迁入目标
+    erg = ex.add_parser("register")           # 内部：create 的权威登记（锁内复查唯一性并追加 PROJECTS 行）
+    erg.add_argument("name")
+    erg.add_argument("--port", required=True)
+    erg.add_argument("--contact", default="")
+    erg.add_argument("--source", default="")
+    ex.add_parser("unregister").add_argument("name")      # 内部：create 失败回滚登记行
+    tc = sub.add_parser("takeover-copy")
+    tc.add_argument("project")
+    tc.add_argument("src")
+    tc.add_argument("--to", default="data", choices=COPY_TARGETS)
     a = ap.parse_args(argv)
+    who = "cli:" + caller_user()
     try:
+        if a.cmd == "external":
+            if a.ecmd == "add":
+                meta = {"name": a.name, "port": a.port, "owner": a.owner, "unit": a.unit, "migrate": a.migrate}
+                lst = listeners()
+                try:
+                    row, notes = external_add(a.name, a.port, a.owner, a.unit, a.desc, a.migrate, lst=lst)
+                except ApiExit as e:
+                    audit(LOG_FILE, "api_external_add", meta, e.code, who)     # 失败（含越权）也留痕；desc 是自由文本，不入审计
+                    raise
+                except OSError as e:
+                    audit(LOG_FILE, "api_external_add", meta, getattr(e, "errno", None) or 1, who)
+                    raise ApiExit("登记外部服务失败：写入 %s 时出错（%s）" % (EXTERNAL, e))
+                audit(LOG_FILE, "api_external_add", meta, 0, who)
+                rec = external_record(row, load_registry(), lst)
+                rec["notes"] = notes + [n for n in rec["notes"] if n not in notes]
+                print(json.dumps({"external": rec, "notes": notes}, ensure_ascii=False, indent=2))
+            elif a.ecmd == "remove":
+                meta = {"name": a.name, "cancel_migration": a.cancel_migration}
+                try:
+                    msg = external_remove(a.name, a.cancel_migration, caller=caller_user())
+                except ApiExit as e:
+                    audit(LOG_FILE, "api_external_remove", meta, e.code, who)
+                    raise
+                except OSError as e:
+                    audit(LOG_FILE, "api_external_remove", meta, getattr(e, "errno", None) or 1, who)
+                    raise ApiExit("删除外部服务登记失败：写入 %s 时出错（%s）" % (EXTERNAL, e))
+                audit(LOG_FILE, "api_external_remove", meta, 0, who)
+                print(msg)
+            elif a.ecmd == "list":
+                reg, lst = load_registry(), listeners()
+                print(json.dumps({"externals": [external_record(e, reg, lst) for e in load_external()]},
+                                 ensure_ascii=False, indent=2))
+            elif a.ecmd == "precheck":
+                external_precheck(a.name, a.port)
+            elif a.ecmd == "takeover-begin":
+                external_takeover_begin(a.ext, a.project, a.port)
+                audit(LOG_FILE, "api_takeover_begin", {"external": a.ext, "project": a.project}, 0, who)
+            elif a.ecmd == "takeover-abort":
+                if external_takeover_abort(a.ext, a.project):
+                    audit(LOG_FILE, "api_takeover_abort", {"external": a.ext, "project": a.project}, 0, who)
+            elif a.ecmd == "register":
+                external_register(a.name, a.port, a.contact, a.source)
+            elif a.ecmd == "unregister":
+                external_unregister(a.name)
+            else:
+                external_release(a.project)
+            return 0
+        if a.cmd == "takeover-copy":
+            print(takeover_copy(a.project, a.src, a.to))
+            return 0
         if a.cmd == "list":
             data = {"projects": light_projects()}
         elif a.cmd == "status":
@@ -2244,7 +2944,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 entry = next((r for r in load_registry() if r["name"] == name), None)
                 if not valid_name(name) or not entry:
                     return self.send(404, page("未找到", "<h1>项目未登记</h1>", csrf))
-                p = collect_project(entry, listeners())
+                p = collect_project(entry, listeners(), externals=load_external())
                 tools, findings, decl = (None, [], []) if p.get("missing") else project_env(name)
                 info = project_info(name, self.state.lan_ip) if not p.get("missing") else ""
                 return self.send(200, render_project(p, tools, findings, decl, csrf, info))

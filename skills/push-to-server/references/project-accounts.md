@@ -32,7 +32,7 @@ ssh -t <管理员>@<服务器> 'cd /tmp/srv-setup && sudo install -m 755 srv_pro
 
 - `install` 建 `srvproj` 组和公钥目录，写好 sshd 规则并重载 sshd。
 - `--delegate <管理员>` 让这个账号免密执行 `sudo srv-project`，只放行这一个命令。之后管理员的 agent 在管理员批准后，就能自动开项目、发邀请。
-- **先装管理面板，再开第一个项目。** 邀请登记要经过面板。面板的首次登录（修改初始密码）由管理员本人在浏览器里完成，见 [`srv-panel.md`](srv-panel.md)。
+- **先装管理面板，再开第一个项目。** 邀请登记要经过面板；`create`（含 `--takeover`）也会经面板的 `api external register` 在同一临界区写登记行。只装过 `srv-project install`、没装面板的旧部署，升级脚本后必须先补 `install_panel.sh`，否则 `create` 会报「请先安装管理面板」。面板的首次登录（修改初始密码）由管理员本人在浏览器里完成，见 [`srv-panel.md`](srv-panel.md)。
 
 ### 有知识库的服务器
 
@@ -66,7 +66,7 @@ ssh -t <管理员>@<服务器> 'cd /tmp/srv-setup && sudo install -m 755 srv_pro
 - `srv-project list`：查看各项目的端口、启用状态、已授权公钥和委托账号。
 - `srv-project revoke <项目> <标签|SHA256:指纹>`：吊销一把公钥。吊销不会断开已建立的会话，要立即断开还需执行 `pkill -u <项目> -x sshd`。
 - `srv-project disable <项目>` 停用项目，`enable <项目>` 恢复。停用后该账号不能登录，它的进程和服务全部停止，数据保留。
-- `srv-project delete <项目> [--purge]`：只能删除已停用的项目。不加 `--purge` 时，项目目录归档到 `/srv/.archived/`。
+- `srv-project delete <项目> [--purge]`：只能删除已停用的项目。不加 `--purge` 时，项目目录归档到 `/srv/.archived/`。例外：create 在 register 之后、建账号之前被中断留下的「登记行在、账号不存在」残留，只清登记行与迁入标记，保留目录、不执行 `userdel`。
 
 ## 阶段 2：登记设备（申请方 agent）
 
@@ -152,6 +152,53 @@ python <SKILL_DIR>/scripts/safe_push.py enroll '<邀请>'
 
    再把 `info` 的输出交给管理员转发给申请方。公钥和指纹走的是同一个渠道，被调包时指纹也会一起被换。渠道不可信时，请管理员当面或电话向申请人核对指纹。
 3. 申请方的 agent 手动写 `~/.ssh/config` 别名。第一次连接时，请用户确认服务器的主机指纹（本技能不会自动接受），之后从阶段 3 继续。
+
+## 迁入已有服务
+
+服务器上本来就在跑的服务（知识库前后端、裸进程小项目、nginx 站点、系统服务）不是 `/srv` 项目：它们没有项目账号，也不在 `/srv/<项目>` 里。处理分两层。
+
+**先登记为外部服务（只读）。** 登记表 `/srv/EXTERNAL.tsv`（root 所有、644），只做展示和端口占位：不能启停、不能看日志、不增加任何 root 委托。读写和校验只在面板代码里（`srv-project external …` 原样透传）：
+
+```bash
+sudo -n srv-project external add <名称> --port <端口> --owner <监听它的账号> [--unit user:<服务>.service|system:<服务>.service] [--desc <说明>] [--migrate]
+sudo -n srv-project external list --json
+sudo -n srv-project external remove <名称> [--cancel-migration]
+```
+
+登记时检查的是权限不是格式：
+
+- 端口当前有进程监听，监听属主必须等于 `--owner`；没人监听可以登记，说明里注明「登记时未监听」。
+- 属主、监听属主都不能是 `srvproj` 项目账号；端口不能已在 `PROJECTS.tsv` 或另一条外部服务上；名称不能与项目或其他外部服务重名。
+- 删除登记也核对调用者：条目有迁入目标（迁入中或已切换）时，只有 root 或条目属主能 `external remove`（含 `--cancel-migration`）；普通只读登记只有 root、属主或登记人（`EXTERNAL.tsv` 的「登记人」列）能删。
+- 端口一律按整数比较，`09200` 与 `9200` 是同一个端口；`create` 拒绝带前导 0 的 `--port`。
+- **`--migrate`（可迁入）只给调用者自己的服务**：属主必须等于 `SUDO_USER`（root 直接运行不受此限）、端口 ≥ 1024、属主是普通账号（uid 1000–59999）。root、www-data 和别人的服务只能只读登记。委托账号因此只能「抢占」它自己正在用的端口，不扩大权限。
+
+**可迁入的再迁成正式项目。** 迁入后默认归超级管理员管理，运维管理员被指派之前看不到。`create --takeover` 是 `create` 加一个外部服务名：
+
+```bash
+sudo -n srv-project create <项目> --port <同外部服务的端口> --takeover <外部服务名> [--contact …]
+```
+
+`--takeover` 只豁免那一个外部服务的端口，条件是监听属主等于该外部服务的登记属主，或者当前没人监听。`PROJECTS.tsv` 里的端口冲突永不豁免。写入顺序：`create --takeover` 先在 `EXTERNAL.tsv` 标记迁入目标；随后 `register` 在 `EXTERNAL → PROJECTS` 两把锁的同一临界区里写入 `PROJECTS.tsv` 的新行（第 5 列「来源」= `external:<名称>`）；登记成功后才建项目账号与目录。`register` 之后任一步失败，`trap` 依次回滚登记行（`unregister`）与迁入标记（`takeover-abort`）。回滚本身失败时，输出里有修复命令 `srv-project external remove <名称> --cancel-migration`。删除迁入来的项目会清掉外部服务上的迁入目标；若 create 在 register 之后被 SIGKILL/断电，留下「登记行在、账号没有」的残留，`delete <名称>` 只清登记行与迁入标记、保留磁盘目录、不执行 `userdel`（账号存在时仍要求先停用）。
+
+### 迁移步骤
+
+下面每一步都标了由谁执行。第 3、4 步是服务器终端上的运维动作，知识库后台做不了。
+
+1. **超级管理员**：登记外部服务（`--migrate`），在后台点「迁入为项目」或执行上面的 `create --takeover`，再 `invite` 生成邀请交给维护人。
+2. **维护人的 agent**：凭邀请登记设备，`bootstrap` 部署代码，配置 systemd 用户服务，`enable` 但**先不启动**。新旧服务共用一个端口，新服务必须等旧进程停掉后再启动。
+3. **旧属主，在服务器终端**：对需要的目录逐个执行（这一步不停旧服务，旧服务照常对外提供）：
+
+   ```bash
+   sudo -n srv-project takeover-copy <项目> <源目录> [--to data|config]
+   ```
+
+   复制到 `/srv/<项目>/<data|config>/<源目录名>`，输出文件数和字节数，据此核对。执行条件全部满足才会动手：该项目是从外部服务迁入的且迁入未结束；调用者是外部服务的属主或 root；源目录是真实路径（路径中无符号链接）、不在 `/srv` 下、属主就是外部服务的属主；目标不存在。读源目录用旧属主的身份、落地用项目账号的身份，root 只建暂存目录和 chown，所以读不到的文件会报错而不是被 root 越权读走。
+4. **旧属主**：停掉旧进程。裸进程用 `kill <pid>`；用户服务用 `systemctl --user stop <服务>` 再 `disable`。
+5. **维护人的 agent**：启动新服务并做健康检查。失败时：停新服务，旧属主重新拉起旧进程（裸进程重新执行原来的启动命令；用户服务 `systemctl --user enable --now <服务>`），再排查。
+6. **超级管理员**：`status --json` 里外部服务的 `migrate_state` 变成「已切换」（监听属主恰好是新项目账号）后，执行 `external remove <名称>` 删除登记；项目的「来源」保留。迁移中途放弃：`external remove <名称> --cancel-migration`，同时清空项目的来源。
+
+迁移期间状态面板把旧服务占着端口显示成「迁移中」，不算故障；监听属主既不是旧属主也不是新项目账号才算问题。
 
 ## 应用的初始账号密码
 

@@ -7,7 +7,7 @@
 #
 #   install [--delegate <用户>]...            一次性：建组、公钥目录、sshd 规则；--delegate 让该用户免密 sudo 本脚本
 #   undelegate <用户>                         取消委托
-#   create <项目> --port <端口> [--contact <联系人>]
+#   create <项目> --port <端口> [--contact <联系人>] [--takeover <外部服务>]   --takeover：从已登记且可迁入的外部服务迁入（端口须等于它的端口）
 #   grant  <项目> <公钥文件|-> --label <标签> [--from <来源地址>]
 #   revoke <项目> <标签|SHA256:指纹>
 #   disable <项目>                            停用：禁止登录、停掉该账号全部进程与服务
@@ -26,6 +26,11 @@
 #   invites --json <项目>                     邀请列表（JSON）
 #   logs <项目> <服务> [--lines N]            用户服务最近日志（纯文本，N 默认 100，1–1000）
 #   svc <项目> <start|stop|restart> <服务>    启停用户服务
+#   外部服务（只读登记存量服务；读写与校验全在管理面板代码里，本脚本只透传）：
+#   external add <名称> --port N --owner <账号> [--unit user:X.service|system:X.service] [--desc 说明] [--migrate]
+#   external remove <名称> [--cancel-migration]   迁入中默认拒绝；已切换可直接删；--cancel-migration 放弃迁移并清项目来源
+#   external list --json                      登记的外部服务及监听、迁入状态
+#   takeover-copy <项目> <源目录> [--to data|config]   把迁入项目的旧数据复制进 /srv/<项目>/<data|config>/（调用者须是旧服务属主或 root）
 set -euo pipefail
 
 GROUP=srvproj
@@ -33,6 +38,8 @@ SRV_ROOT=/srv
 KEYS_DIR=/etc/ssh/srv-keys
 SSHD_DROPIN=/etc/ssh/sshd_config.d/60-srv-projects.conf
 REGISTRY=$SRV_ROOT/PROJECTS.tsv
+REGISTRY_LOCK=$SRV_ROOT/.PROJECTS.lock   # 追加/删除/面板改写登记表时共用的 flock 文件
+EXTERNAL=$SRV_ROOT/EXTERNAL.tsv
 SUDOERS=/etc/sudoers.d/srv-project
 ARCHIVE_DIR=$SRV_ROOT/.archived
 PANEL_PY=/usr/local/lib/srv-panel/srv_panel.py
@@ -47,6 +54,27 @@ valid_name() {
 }
 
 is_project() { id -nG "$1" 2>/dev/null | tr ' ' '\n' | grep -qx "$GROUP"; }
+
+registry_has() {   # 登记表里有这个名称的行（账号可能不存在：create 在 register 之后、useradd 之前被中断）
+    [ -f "$REGISTRY" ] && awk -F'\t' -v n="$1" '$1 == n {f=1} END {exit !f}' "$REGISTRY"
+}
+
+registry_remove() {
+    local name=$1 tmp
+    [ -f "$REGISTRY" ] || return 0
+    tmp=$(mktemp)
+    ( flock 9; awk -F'\t' -v n="$name" '$1 != n' "$REGISTRY" >"$tmp"; cat "$tmp" >"$REGISTRY" ) 9>"$REGISTRY_LOCK"
+    rm -f "$tmp"
+}
+
+release_external_target() {   # 清掉外部服务上指向该项目的迁入目标
+    local name=$1
+    if [ -f "$EXTERNAL" ]; then
+        if [ -f "$PANEL_PY" ] && python3 "$PANEL_PY" api external release "$name"; then :; else
+            echo "警告：未能清理 $EXTERNAL 里指向 $name 的迁入标记，可用 srv-project external remove <外部服务> --cancel-migration 处理" >&2
+        fi
+    fi
+}
 
 reload_sshd() {
     sshd -t || die "sshd 配置检查失败，未重载"
@@ -129,7 +157,7 @@ Match Group $GROUP
     X11Forwarding no
 EOF
     chmod 644 "$SSHD_DROPIN"
-    [ -f "$REGISTRY" ] || printf '# 项目\t端口\t联系人\t创建时间\n' >"$REGISTRY"
+    [ -f "$REGISTRY" ] || printf '# 项目\t端口\t联系人\t创建时间\t来源\n' >"$REGISTRY"
     chmod 644 "$REGISTRY"
     reload_sshd
     echo "已安装：组 $GROUP、$KEYS_DIR、$SSHD_DROPIN、$REGISTRY"
@@ -147,29 +175,75 @@ check_srv_perms() {
     done
 }
 
+port_registered() {   # 端口已登记在项目表里（任何情况下都不豁免）
+    awk -F'\t' -v p="$1" '$1 !~ /^#/ && $2 + 0 == p + 0 {f=1} END {exit !f}' "$REGISTRY"
+}
+
 port_in_use() {
-    ss -Hltn "sport = :$1" | grep -q . || awk -F'\t' -v p="$1" '$2 == p {f=1} END {exit !f}' "$REGISTRY"
+    ss -Hltn "sport = :$1" | grep -q . || port_registered "$1"
+}
+
+# create：登记行由面板 register 在两把锁内复查唯一性后追加（检查与落盘同一临界区，不给并发留窗口）。
+# register 之后任一步失败，trap 回滚登记行与迁入标记，并给出修复命令。本脚本持 flock 时不再调面板（面板会取同一把锁，会死锁）。
+TK_EXT="" TK_PROJECT="" TK_REGISTERED=""
+create_rollback() {
+    local rc=$?
+    trap - EXIT
+    if [ "$rc" -ne 0 ]; then
+        if [ -n "$TK_REGISTERED" ]; then
+            if python3 "$PANEL_PY" api external unregister "$TK_PROJECT"; then
+                echo "已回滚 $REGISTRY 里 $TK_PROJECT 的登记行" >&2
+            else
+                echo "错误：登记行回滚失败；请手动从 $REGISTRY 删掉 $TK_PROJECT 行" >&2
+            fi
+        fi
+        if [ -n "$TK_EXT" ]; then
+            if python3 "$PANEL_PY" api external takeover-abort "$TK_EXT" --project "$TK_PROJECT"; then
+                echo "已回滚外部服务 $TK_EXT 的迁入标记" >&2
+            else
+                echo "错误：迁入标记回滚失败；请手动执行：srv-project external remove $TK_EXT --cancel-migration（会同时删除该登记，需要的话再重新 external add）" >&2
+            fi
+        fi
+    fi
+    exit "$rc"
 }
 
 cmd_create() {
-    local name=${1:-} port="" contact=""
-    [ -n "$name" ] || die "用法：create <项目> --port <端口> [--contact <联系人>]"
+    local name=${1:-} port="" contact="" takeover="" src=""
+    [ -n "$name" ] || die "用法：create <项目> --port <端口> [--contact <联系人>] [--takeover <外部服务>]"
     shift
     while [ $# -gt 0 ]; do
         case $1 in
             --port) port=${2:-}; shift 2 ;;
             --contact) contact=${2:-}; shift 2 ;;
+            --takeover) takeover=${2:-}; shift 2 ;;
             *) die "未知参数：$1" ;;
         esac
     done
     valid_name "$name"
     need_installed
-    [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1024 ] && [ "$port" -le 65535 ] || die "--port 须为 1024–65535"
+    [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] && [ "$port" -ge 1024 ] && [ "$port" -le 65535 ] || die "--port 须为 1024–65535 的整数（不带前导 0）"
     id "$name" >/dev/null 2>&1 && die "账号 $name 已存在"
     [ -e "$SRV_ROOT/$name" ] && die "$SRV_ROOT/$name 已存在，不接管已有目录"
-    port_in_use "$port" && die "端口 $port 已被占用或已登记"
     [[ "$contact" != *$'\t'* && "$contact" != *$'\n'* ]] || die "--contact 不能含制表符或换行"
+    # 下面是建议性 fail-fast（不持锁，读了也拦不住并发）；权威的唯一性核对在 register 的锁内复查里
+    if [ -n "$takeover" ]; then
+        valid_name "$takeover"
+        # 迁入只豁免外部服务那一个端口；项目表里的端口冲突永不豁免。其余核对（可迁入、属主、监听属主、重名）在面板代码里
+        ! port_registered "$port" || die "端口 $port 已登记在项目表里，--takeover 不豁免项目端口"
+        panel_api external takeover-begin "$takeover" --project "$name" --port "$port"
+        TK_EXT=$takeover TK_PROJECT=$name
+        src=external:$takeover
+    else
+        port_in_use "$port" && die "端口 $port 已被占用或已登记"
+        if [ -f "$EXTERNAL" ]; then panel_api external precheck "$name" "$port"; fi
+    fi
 
+    trap create_rollback EXIT
+    # 权威登记：EXTERNAL→PROJECTS 两把锁内复查名称/端口唯一并追加登记行（来源列第 5 列同行写入）。
+    # 先登记再建账号：register 失败说明撞了并发登记，此时什么都没建，不需要回滚账号
+    panel_api external register "$name" --port "$port" "--contact=$contact" ${src:+"--source=$src"}
+    TK_REGISTERED=1
     useradd --create-home --home-dir "$SRV_ROOT/$name" --shell /bin/bash --user-group --groups "$GROUP" "$name"
     chmod 750 "$SRV_ROOT/$name"
     install -d -o "$name" -g "$name" -m 750 "$SRV_ROOT/$name"/{repo,config,data,backups}
@@ -178,8 +252,12 @@ cmd_create() {
     if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
         usermod -aG "$name" "$SUDO_USER"
     fi
-    printf '%s\t%s\t%s\t%s\n' "$name" "$port" "$contact" "$(date '+%F %T')" >>"$REGISTRY"
+    TK_EXT="" TK_REGISTERED=""
+    trap - EXIT
     echo "已创建项目账号 $name：目录 $SRV_ROOT/$name/{repo,config,data,backups}，端口 $port；尚无授权公钥，用 grant 添加"
+    if [ -n "$takeover" ]; then
+        echo "已从外部服务 $takeover 迁入：旧服务仍占着端口 $port，新服务必须等旧进程停掉后再启动（步骤见 references/project-accounts.md「迁入已有服务」）"
+    fi
 }
 
 cmd_grant() {
@@ -286,14 +364,15 @@ cmd_enable() {
 cmd_list() {
     if [ "${1:-}" = --json ]; then panel_api list; return; fi
     need_installed
-    local name port contact created
-    while IFS=$'\t' read -r name port contact created; do
+    local name port contact created source
+    # 用 \037 做分隔：tab 是空白型 IFS，联系人为空时 read 会把空字段吞掉导致错位
+    while IFS=$'\037' read -r name port contact created source; do
         [[ "$name" == \#* || -z "$name" ]] && continue
-        echo "$name  端口 $port  联系人 ${contact:--}  创建 $created"
+        echo "$name  端口 $port  联系人 ${contact:--}  创建 $created${source:+  来源 $source}"
         if ! id "$name" >/dev/null 2>&1; then echo "  （账号已不存在）"; continue; fi
         if is_disabled "$name"; then echo "  状态：停用"; else echo "  状态：启用"; fi
         keys_of "$name" | sed 's/^/  公钥 /'
-    done <"$REGISTRY"
+    done < <(awk -F'\t' 'BEGIN { OFS = "\037" } !/^#/ && NF { print $1, $2, $3, $4, $5 }' "$REGISTRY")
     check_srv_perms
     local d
     d=$(delegates_of | tr '\n' ' ')
@@ -359,7 +438,7 @@ cmd_info() {
 }
 
 cmd_delete() {
-    local name=${1:-} purge=0 uid n dest tmp
+    local name=${1:-} purge=0 uid n dest
     [ -n "$name" ] || die "用法：delete <项目> [--purge]"
     shift
     while [ $# -gt 0 ]; do
@@ -370,6 +449,14 @@ cmd_delete() {
     done
     valid_name "$name"
     need_installed
+    if ! id "$name" >/dev/null 2>&1; then
+        # create 在 register 之后、useradd 之前被 SIGKILL/断电：登记行在、账号没有。只清残留，保目录，不 userdel。
+        registry_has "$name" || die "$name 不是 $GROUP 项目账号"
+        registry_remove "$name"
+        release_external_target "$name"
+        echo "账号 $name 不存在（登记后、建账号前被中断的残留）：已清除登记表条目与迁入标记；目录 $SRV_ROOT/$name 保留，未执行 userdel，--purge 不清理该目录"
+        return 0
+    fi
     is_project "$name" || die "$name 不是 $GROUP 项目账号"
     is_disabled "$name" || die "项目 $name 尚未停用，请先 disable"
     n=$(pgrep -c -u "$name" 2>/dev/null || true)
@@ -383,10 +470,9 @@ cmd_delete() {
     userdel "$name" 2>/dev/null || die "userdel $name 失败，未做其他改动"
     if getent group "$name" >/dev/null; then groupdel "$name" 2>/dev/null || true; fi
     rm -f "$KEYS_DIR/$name"
-    tmp=$(mktemp)
-    awk -F'\t' -v n="$name" '$1 != n' "$REGISTRY" >"$tmp"
-    cat "$tmp" >"$REGISTRY"
-    rm -f "$tmp"
+    registry_remove "$name"
+    # 迁入来的项目：清掉外部服务上指向它的迁入目标。EXTERNAL.tsv 不存在、条目已不在时静默跳过（set -e 下不能失败）
+    release_external_target "$name"
 
     if [ "$purge" -eq 1 ]; then
         rm -rf --one-file-system -- "${SRV_ROOT:?}/$name"
@@ -477,6 +563,35 @@ cmd_svc() {
     panel_api svc "$1" "$2" "$3"
 }
 
+# 外部服务：参数原样透传给面板代码（读写、校验、属主判定都在那里，调用者身份取 SUDO_USER），这里只校验名称
+cmd_external() {
+    local sub=${1:-}
+    need_installed
+    case $sub in
+        add)
+            [ -n "${2:-}" ] || die "用法：external add <名称> --port N --owner <账号> [--unit …] [--desc …] [--migrate]"
+            valid_name "$2"
+            shift
+            panel_api external add "$@" ;;
+        remove)
+            [ -n "${2:-}" ] || die "用法：external remove <名称> [--cancel-migration]"
+            valid_name "$2"
+            shift
+            panel_api external remove "$@" ;;
+        list)
+            [ "${2:-}" = --json ] && [ $# -eq 2 ] || die "用法：external list --json"
+            panel_api external list ;;
+        *) die "用法：external <add|remove|list> …" ;;
+    esac
+}
+
+cmd_takeover_copy() {
+    [ -n "${1:-}" ] && [ -n "${2:-}" ] || die "用法：takeover-copy <项目> <源目录> [--to data|config]"
+    valid_name "$1"
+    need_installed
+    panel_api takeover-copy "$@"
+}
+
 need_root "$@"
 case ${1:-} in
     install) shift; cmd_install "$@" ;;
@@ -496,5 +611,7 @@ case ${1:-} in
     env) shift; cmd_env "$@" ;;
     logs) shift; cmd_logs "$@" ;;
     svc) shift; cmd_svc "$@" ;;
-    *) sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+    external) shift; cmd_external "$@" ;;
+    takeover-copy) shift; cmd_takeover_copy "$@" ;;
+    *) sed -n '2,/^set -euo pipefail$/{/^set -euo pipefail$/!p}' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

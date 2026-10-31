@@ -127,10 +127,11 @@ class GlobalRecordTests(unittest.TestCase):
                {"addr": "0.0.0.0", "port": 22, "procs": [], "owners": []}]
         g = panel.global_record(lst, {"3101": "demo"}, ["/srv/x"], ["/srv/y"], True, True)
         self.assertTrue(GLOBAL_FIELDS <= set(g))
-        self.assertEqual(g["listeners"], [{"port": 22, "owner": None, "project": None},
-                                          {"port": 3101, "owner": "demo", "project": "demo"}])
+        self.assertEqual(g["listeners"], [{"port": 22, "owner": None, "project": None, "external": None, "migrate_state": None},
+                                          {"port": 3101, "owner": "demo", "project": "demo", "external": None, "migrate_state": None}])
         for l in g["listeners"]:
-            self.assertEqual(set(l), LISTENER_FIELDS)
+            self.assertTrue(LISTENER_FIELDS <= set(l))
+            self.assertEqual(set(l) - LISTENER_FIELDS, {"external", "migrate_state"})
         self.assertEqual((g["sshd_rule"], g["world_readable"]), (True, ["/srv/x"]))
 
     def test_scan_skips_hidden_dirs(self):
@@ -268,7 +269,7 @@ class ApiCliTests(unittest.TestCase):
              patch.object(panel, "collect_all", return_value=(ds, lst, entries)) as ca, \
              patch.object(panel, "scan_srv_dirs", return_value=([], [])):
             data = panel.api_status()
-        self.assertEqual(set(data), {"projects", "global"})
+        self.assertEqual(set(data), {"projects", "externals", "global"})
         self.assertEqual(set(data["projects"][0]), set(data["projects"][1]))
         self.assertTrue(ca.called)
         json.dumps(data)

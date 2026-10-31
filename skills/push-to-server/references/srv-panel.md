@@ -120,7 +120,7 @@ sudo bash panel/install_panel.sh --full            # 关闭登记模式，恢复
 
 ## JSON 接口（`srv-project` 子命令）
 
-知识库后台等程序通过 `sudo -n srv-project …` 调用下面的子命令；它们都转调 `srv_panel.py api …`，面板代码没装时报「请先安装管理面板」。**字段只能增加，不能删减或改名。** 所有命令失败时退出码非 0，原因写到 stderr；指定的项目不存在时退出码为 2。
+知识库后台等程序通过 `sudo -n srv-project …` 调用下面的子命令；它们都转调 `srv_panel.py api …`，面板代码没装时报「请先安装管理面板」。`create`（含 `--takeover`）也依赖面板代码：它经 `api external register` 在 `EXTERNAL → PROJECTS` 锁内写登记行，所以只装过 `srv-project install`、没装面板的旧部署升级脚本后，必须先补 `install_panel.sh` 才能继续新建项目。**字段只能增加，不能删减或改名。** 所有命令失败时退出码非 0，原因写到 stderr；指定的项目不存在时退出码为 2。
 
 ```text
 list --json
@@ -157,6 +157,23 @@ invite <项目> --label L [--hours N] [--from X]
   stdout 只有一行邀请文本，说明写到 stderr
 
 invite-revoke <项目> <编号>
+
+external list --json
+  {"externals":[{"name","port":int,"owner","unit":str|null,"migratable":bool,"migrate_target":str|null,
+                 "desc","created","listening":bool,"listen_owner":str|null,"owner_match":bool|null,
+                 "migrate_state":"迁移中"|"已切换"|null,"problems":[str],"notes":[str]}]}
+
+external add <名称> --port N --owner <账号> [--unit …] [--desc …] [--migrate]
+  {"external":{…同上…},"notes":[str]}；校验失败退出码 1
+
+external remove <名称> [--cancel-migration]
+  人类可读文本；名称不存在退出码 2
+
+create <项目> --port N [--contact C] [--takeover <外部服务>]
+  人类可读文本
+
+takeover-copy <项目> <源目录> [--to data|config]
+  人类可读文本（含文件数和字节数）
 ```
 
 实现说明：
@@ -164,6 +181,14 @@ invite-revoke <项目> <编号>
 - `list --json` 很轻：只读登记表、`/etc/shadow` 和公钥文件，指纹在进程内计算，不跑 `du`、`git`、`systemctl`，也不起任何子进程。
 - `status --json` 复用面板总览的采集（`collect_all` / `collect_project`）。账号缺失的项目，`listening` 为 `false`，`listen_owner`、`head`、`disk_kb` 为 `null`，`keys`、`services` 为 `[]`，`disabled` 为 `false`，`problems` 里有原因，保证每条记录字段一致。`head` 只在能读到提交时才有值（否则为 `null`）。
 - 新增字段（不影响约定）：`status` 的项目里有 `notes`、`services_error`；`status` 的 `global` 里有 `srv_project`、`unregistered_dirs`；`env` 里有 `findings_detail`（`level` + `text`）。
+- 外部服务（`/srv/EXTERNAL.tsv`，登记规则与安全不变量见 [`project-accounts.md`](project-accounts.md)「迁入已有服务」）相关的新增字段：
+  - `list` 和 `status` 的项目记录里有 `source`（迁入来的项目为 `external:<名称>`，否则 `null`）；知识库后台只让超级管理员看到它：运维管理员的项目记录在 `services/srv_ops.py` 里裁掉 `source` 与迁移提示；
+  - `status` 无项目参数的全量输出里有顶层 `externals`（字段同 `external list --json`，不做服务、git、磁盘探测）；**指定项目的 `status` 不带 `externals`**；
+  - `status` 的 `global.listeners` 每项多 `external`（该端口登记的外部服务名或 `null`）和 `migrate_state`；端口既属于项目又属于外部服务时 `project`、`external` 都写；
+  - 迁入中的新项目，端口的监听属主正好是外部服务的登记属主时不算问题，只在项目的 `notes` 里写「迁移中：旧服务仍在监听」；
+  - `migrate_state`：迁入目标已设置时，监听属主恰好是新项目账号为「已切换」，其余为「迁移中」；没有迁入目标为 `null`。
+- 独立面板的网页「全局检查」不显示外部服务，外部服务只在知识库后台【项目运维】里展示和维护。
+- `PROJECTS.tsv` 第 5 列「来源」可缺省；`install` 新建的文件表头是 5 列，已有 4 列的文件原样兼容。
 - `invites` 和 `invite-revoke` 必须带项目参数。`invite-revoke <项目> <编号>` 会断言该邀请属于这个项目，不属于就报「找不到邀请」，退出码非 0；旧的单参数写法直接报用法错误。面板网页的作废走内部函数，不受影响。
 - 校验：项目名用 `^[a-z][a-z0-9_-]{1,31}$`，服务名要以 `.service` 结尾（首字符字母或数字，允许 `@ . _ : -`），`--lines` 取 1–1000。
 
@@ -178,7 +203,7 @@ srv_panel.py [--bind IP]... [--port 9300] [--allow-remote]
 srv_panel.py --bootstrap | --reset-admin        # 安装脚本调用
 srv_panel.py --write-panel-conf --lan-ip IP --port N --tls-cert 证书 [--enroll-only | --full]   # 安装脚本调用
 srv_panel.py invite create|list|revoke …        # srv-project invite* 转调
-srv_panel.py api list|status|env|info|invites|logs|svc …   # srv-project 的 JSON 子命令转调
+srv_panel.py api list|status|env|info|invites|logs|svc|external|takeover-copy …   # srv-project 的 JSON 与外部服务子命令转调
 ```
 
 ## 已知限制
