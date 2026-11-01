@@ -1,0 +1,10 @@
+#!/bin/sh
+# Validate the content that will actually be committed.
+if command -v python >/dev/null 2>&1 && python -c 'import sys; sys.exit(sys.version_info < (3, 10))' >/dev/null 2>&1; then
+    exec python -X utf8 scripts/update-readme.py --check --staged
+elif command -v python3 >/dev/null 2>&1 && python3 -c 'import sys; sys.exit(sys.version_info < (3, 10))' >/dev/null 2>&1; then
+    exec python3 -X utf8 scripts/update-readme.py --check --staged
+else
+    echo "Python 3.10+ is required to check the README skill catalog." >&2
+    exit 1
+fi

@@ -9,44 +9,15 @@
 ```text
 cenglins-skills/
 ├── skills/
-│   ├── crlf-guard/
-│   │   └── SKILL.md
-│   ├── bilibili-comment-extractor/
-│   │   ├── SKILL.md
-│   │   └── scripts/
-│   ├── foxmail-grep/
-│   │   ├── SKILL.md
-│   │   ├── README.md
-│   │   ├── refs/
-│   │   └── scripts/
-│   ├── powershell-guard/
-│   │   └── SKILL.md
-│   ├── push-to-server/
-│   │   ├── SKILL.md
-│   │   ├── push-config.example.json
-│   │   ├── panel/
-│   │   ├── references/
-│   │   └── scripts/
-│   ├── utf8-guard/
-│   │   └── SKILL.md
-│   ├── video-to-srt/
-│   │   ├── SKILL.md
-│   │   └── scripts/
-│   ├── win-pup-forensics-cleanup/
-│   │   ├── SKILL.md
-│   │   ├── references/
-│   │   ├── scripts/
-│   │   └── tests/
-│   ├── winx-wt-takeover/
-│   │   ├── SKILL.md
-│   │   ├── README.md
-│   │   ├── references/
-│   │   └── scripts/
-│   └── zhihu-auto/
+│   └── <skill-name>/
 │       ├── SKILL.md
-│       ├── references/
-│       └── scripts/
+│       ├── scripts/       # 按需
+│       ├── references/    # 按需
+│       └── assets/        # 按需
+├── .githooks/
+│   └── pre-commit
 ├── scripts/
+│   ├── update-readme.py
 │   └── validate-skills.ps1
 ├── .gitattributes
 ├── README.md
@@ -112,19 +83,44 @@ git clone https://github.com/cenglin123/cenglins-skills.git "$env:USERPROFILE\.a
 & .\scripts\validate-skills.ps1
 ```
 
+### 自动维护技能列表
+
+技能表由 `skills/*/SKILL.md` 的一级标题生成，按目录名排序；修改用途说明时编辑对应的一级标题。不要手改生成区域。需要 Python 3.10 或更新版本，无第三方依赖。
+
+每次克隆后启用仓库自带的提交检查（Git 不会随克隆自动启用 hook）：
+
+```powershell
+git config --local core.hooksPath .githooks
+```
+
+Linux / macOS 还需运行 `chmod +x .githooks/pre-commit`，确保 hook 可执行。
+
+新增、删除、重命名技能或修改一级标题后运行：
+
+```powershell
+python scripts/update-readme.py
+python scripts/update-readme.py --check
+```
+
+将生成的 `README.md` 与技能改动一起暂存。`pre-commit` 使用 `--check --staged` 检查暂存区，列表遗漏、多余、顺序或标题不一致都会阻止提交；检查不会改文件或自动暂存。已有自定义 hook 的仓库需将检查命令合并到原 hook。Git hook 可被 `--no-verify` 跳过，不构成远端强制策略。
+
 ## 当前技能
+
+<!-- skills:start -->
 
 | Skill | 用途 |
 |---|---|
-| `bilibili-comment-extractor` | 通过 B 站 API 抓取主评论和楼中楼，并保存为结构化文本 |
-| `crlf-guard` | 防止 Windows Git 项目中的 CRLF/LF 与文本写入事故 |
-| `foxmail-grep` | 免密码检索 Foxmail 本地邮件（7.2 / 7.0-7.1 / 5.x-6.x），支持附件提取与 POP3 拉取 |
-| `powershell-guard` | 规避 Windows PowerShell 5.1 的语法、别名与编码陷阱 |
-| `push-to-server` | 通过 git bundle 安全部署代码到服务器，预检拦截 + 备份回滚，默认保护运行时数据；共享服务器按 /srv 项目开账号授权，附 root 管理面板 |
-| `utf8-guard` | 区分并处理 Windows 中文文本的 UTF-8、GBK 与显示层问题 |
-| `video-to-srt` | 下载视频、用 faster-whisper 生成字幕，并由 Agent 安全校对和导出文本 |
-| `win-pup-forensics-cleanup` | Windows 流氓软件/PUP 取证、来源复盘、精确清单清理及复核，支持受限资源规模与日志采集 |
-| `winx-wt-takeover` | 诊断 Windows 控制台交接失效，并让 Win+X 的 PowerShell 项打开 Windows Terminal |
-| `zhihu-auto` | 知乎自动化合集：抓取回答/评论/想法、争议立场分析、修正已发布回答、发布专栏文章 |
+| [`bilibili-comment-extractor`](skills/bilibili-comment-extractor/SKILL.md) | B 站视频评论批量抓取 |
+| [`crlf-guard`](skills/crlf-guard/SKILL.md) | CRLF Guard |
+| [`foxmail-grep`](skills/foxmail-grep/SKILL.md) | foxmail-grep |
+| [`powershell-guard`](skills/powershell-guard/SKILL.md) | PowerShell Guard |
+| [`push-to-server`](skills/push-to-server/SKILL.md) | Push To Server |
+| [`utf8-guard`](skills/utf8-guard/SKILL.md) | UTF-8 Guard |
+| [`video-to-srt`](skills/video-to-srt/SKILL.md) | 视频转字幕工作流 |
+| [`win-pup-forensics-cleanup`](skills/win-pup-forensics-cleanup/SKILL.md) | Windows 流氓软件取证与清理 |
+| [`winx-wt-takeover`](skills/winx-wt-takeover/SKILL.md) | Win+X → Windows Terminal 接管 / 控制台交接排障 |
+| [`zhihu-auto`](skills/zhihu-auto/SKILL.md) | 知乎自动化（zhihu-auto） |
+
+<!-- skills:end -->
 
 维护者：[cenglin123](https://github.com/cenglin123)
