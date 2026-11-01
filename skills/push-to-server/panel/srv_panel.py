@@ -89,13 +89,16 @@ _NOTE_FORBIDDEN = ("\x7f", "\x85", "\u2028", "\u2029")     # DEL、NEL、行分�
 def note_problem(note):
     """设置项目注释的统一校验（CLI / API / 前端计数共用同一谓词）。不合格返回中文原因，合格返回 None。
     只校验不改写：非纯空白、≤ NOTE_MAX 个 Unicode 码点、不含 C0 控制字符（含制表符/换行）、
-    DEL、NEL（U+0085）、U+2028/U+2029。错误只说明规则，不回显正文。"""
+    DEL、NEL（U+0085）、U+2028/U+2029、孤立代理（U+D800–DFFF，无法按 UTF-8 编码写盘）。
+    错误只说明规则，不回显正文。"""
     if not isinstance(note, str) or note.strip() == "":
         return "注释不能为空或纯空白"
     if len(note) > NOTE_MAX:
         return "注释过长：不超过 %d 个字符（Unicode 码点）" % NOTE_MAX
     if any(ord(c) < 32 or c in _NOTE_FORBIDDEN for c in note):
         return "注释不能含控制字符或换行（须为单行可见文本）"
+    if any(0xD800 <= ord(c) <= 0xDFFF for c in note):
+        return "注释不能含孤立代理字符"
     return None
 
 

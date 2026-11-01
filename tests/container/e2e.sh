@@ -186,7 +186,7 @@ expect_ok "登记 ext2（可迁入）" adm external add ext2 --port 9701 --owner
 expect_ok "迁入 app2" adm create app2 --takeover ext2 --port 9701
 expect_fail "账号存在但未停用仍拒绝 delete" "尚未停用" rt delete app2
 expect_ok "cancel-migration 删除" adm external remove ext2 --cancel-migration
-awk -F'\t' '$1=="app2"{print NF==5 ? "src=" $5 : "cols=" NF}' /srv/PROJECTS.tsv | grep -q '^src=$\|cols=4' && ok "app2 来源已清空" || { bad "app2 来源"; grep app2 /srv/PROJECTS.tsv | cat -A; }
+awk -F'\t' '$1=="app2"{f=1; print NF==5 ? "src=" $5 : "cols=" NF} END{if (!f) exit 1}' /srv/PROJECTS.tsv | grep -q '^src=$\|cols=4' && ok "app2 来源已清空" || { bad "app2 来源"; grep app2 /srv/PROJECTS.tsv | cat -A; }
 expect_ok "登记 ext3" adm external add ext3 --port 9702 --owner admin --migrate
 expect_ok "迁入 app3" adm create app3 --takeover ext3 --port 9702
 expect_ok "disable app3" rt disable app3
@@ -215,6 +215,12 @@ section "12c. 项目注释 note：第 6 列、幂等、校验与 JSON"
 expect_fail "非法项目名的无写入探测" "项目名" adm note __probe__ --clear
 grep -q '^__probe__' /srv/PROJECTS.tsv && bad "探测写入了登记表" || ok "探测未写表"
 expect_fail "未知项目退出码 2" "不存在" adm note nosuchp1 --clear
+# 退出码口径：shell 用法/互斥错误 2（与面板 argparse 一致），校验失败 1，项目不存在 2
+adm note >/dev/null 2>&1; [ $? -eq 2 ] && ok "note 缺参数退出码 2" || bad "note 缺参数退出码非 2"
+adm note plainp --set=a --clear >/dev/null 2>&1; [ $? -eq 2 ] && ok "set/clear 互斥退出码 2" || bad "set/clear 互斥退出码非 2"
+adm note plainp --bogus >/dev/null 2>&1; [ $? -eq 2 ] && ok "未知参数退出码 2" || bad "未知参数退出码非 2"
+adm note plainp "--set=   " >/dev/null 2>&1; [ $? -eq 1 ] && ok "纯空白校验失败退出码 1" || bad "纯空白校验失败退出码非 1"
+adm note nosuchp9 --clear >/dev/null 2>&1; [ $? -eq 2 ] && ok "项目不存在退出码 2" || bad "项目不存在退出码非 2"
 expect_ok "set（argv 形态，中文）" adm note plainp "--set=运维备注：迁移自旧 nginx"
 grep -P '^plainp\t[^\t]*\t[^\t]*\t[^\t]*\t[^\t]*\t运维备注：迁移自旧 nginx$' /srv/PROJECTS.tsv >/dev/null && ok "第 6 列写入且前 5 列不变" || { bad "注释列"; grep plainp /srv/PROJECTS.tsv | cat -A; }
 expect_ok "同值 set 幂等" adm note plainp "--set=运维备注：迁移自旧 nginx"
@@ -228,7 +234,7 @@ expect_fail "超 200 码点拒绝" "200" bash -c "python3 -c \"print('字'*201,e
 out=$(printf $'secretX\there' | /usr/local/sbin/srv-project note plainp --set=- 2>&1) && bad "控制字符应被拒绝" || { grep -q 'secretX' <<<"$out" && bad "错误回显了正文" || ok "控制字符拒绝且错误不回显正文"; }
 grep -q 'sudo stdin 备注' /srv/PROJECTS.tsv && ok "失败的写不改表" || bad "注释被破坏"
 expect_ok "clear 回到 5 列" adm note plainp --clear
-awk -F'\t' '$1=="plainp"{exit !(NF==5 && $5=="")}' /srv/PROJECTS.tsv && ok "第 6 列已删、无尾随 tab" || { bad "clear 后的列"; grep plainp /srv/PROJECTS.tsv | cat -A; }
+awk -F'\t' '$1=="plainp"{f=1; exit !(NF==5 && $5=="")} END{if (!f) exit 1}' /srv/PROJECTS.tsv && ok "第 6 列已删、无尾随 tab" || { bad "clear 后的列"; grep plainp /srv/PROJECTS.tsv | cat -A; }
 expect_ok "clear 幂等" adm note plainp --clear
 rt status --json plainp | j "p=d['projects'][0]; assert p['note'] is None, p; print('   note =', p['note'])" && ok "status --json 空注释为 null" || bad "status note null"
 expect_ok "重新 set（供 JSON 核对）" adm note plainp --set=JSON可见
@@ -239,7 +245,7 @@ expect_ok "登记 ext4（可迁入）" adm external add ext4 --port 9703 --owner
 expect_ok "迁入 app4" adm create app4 --takeover ext4 --port 9703
 expect_ok "给迁入项目 set 注释" adm note app4 --set=迁移期间备注
 expect_ok "cancel-migration" adm external remove ext4 --cancel-migration
-awk -F'\t' '$1=="app4"{exit !($5=="" && $6=="迁移期间备注" && NF==6)}' /srv/PROJECTS.tsv && ok "取消迁移：来源按列清空、注释保留" || { bad "取消迁移保留注释"; grep app4 /srv/PROJECTS.tsv | cat -A; }
+awk -F'\t' '$1=="app4"{f=1; exit !($5=="" && $6=="迁移期间备注" && NF==6)} END{if (!f) exit 1}' /srv/PROJECTS.tsv && ok "取消迁移：来源按列清空、注释保留" || { bad "取消迁移保留注释"; grep app4 /srv/PROJECTS.tsv | cat -A; }
 rt status --json app4 | j "p=d['projects'][0]; assert p['note']=='迁移期间备注' and p['source'] is None, p; print('   source =', p['source'], '| note =', p['note'])" && ok "status：来源 null、注释保留" || bad "status 取消迁移"
 expect_ok "disable app4" rt disable app4
 expect_ok "delete app4（整行删除，注释不归档）" rt delete app4 --purge

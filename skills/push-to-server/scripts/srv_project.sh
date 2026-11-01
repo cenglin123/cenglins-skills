@@ -47,6 +47,7 @@ PANEL_PY=/usr/local/lib/srv-panel/srv_panel.py
 SELF=/usr/local/sbin/srv-project
 
 die() { echo "错误：$*" >&2; exit 1; }
+die_usage() { echo "错误：$*" >&2; exit 2; }   # 用法/互斥错误退出码 2（与面板 argparse 一致）；校验失败才是 1
 need_root() { [ "$(id -u)" -eq 0 ] || die "需要 root：sudo $0 $*"; }
 need_installed() { [ -f "$SSHD_DROPIN" ] && getent group "$GROUP" >/dev/null || die "尚未 install"; }
 
@@ -595,19 +596,20 @@ cmd_takeover_copy() {
 
 # 注释：shell 只做参数透传与基本用法检查（校验、存在性、加锁与原子写都在面板代码里）。
 # 只认 --set=<文本> / --set=- / --clear 三种形态：= 形态消除以 - 开头文本的歧义，正文经 stdin 不进 argv / sudo 日志。
+# 用法/互斥错误退出码 2（与面板 argparse 同口径），面板的校验失败为 1、项目不存在为 2。
 cmd_note() {
     local project=${1:-} arg set_opt=0 clear_opt=0
-    [ -n "$project" ] && [ $# -ge 2 ] || die "用法：note <项目> --set=<文本> | note <项目> --set=- | note <项目> --clear"
+    [ -n "$project" ] && [ $# -ge 2 ] || die_usage "用法：note <项目> --set=<文本> | note <项目> --set=- | note <项目> --clear"
     valid_name "$project"
     need_installed
     for arg in "${@:2}"; do
         case $arg in
             --set=*) set_opt=1 ;;
             --clear) clear_opt=1 ;;
-            *) die "用法：note <项目> --set=<文本> | note <项目> --set=- | note <项目> --clear" ;;
+            *) die_usage "用法：note <项目> --set=<文本> | note <项目> --set=- | note <项目> --clear" ;;
         esac
     done
-    [ "$set_opt" -ne "$clear_opt" ] || die "--set=<文本> 与 --clear 必须二选一"
+    [ "$set_opt" -ne "$clear_opt" ] || die_usage "--set=<文本> 与 --clear 必须二选一"
     panel_api note "$@"
 }
 

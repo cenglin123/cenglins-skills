@@ -1,7 +1,7 @@
 """外部服务登记与迁入（EXTERNAL.tsv、create --takeover、takeover-copy）的面板侧逻辑。
 
 srv-project 只透传参数，所有读写、校验、属主判定都在 srv_panel.py，所以这里直接测面板函数；
-shell 侧（trap 回滚、delete 静默跳过、5 列表头）由容器端到端覆盖。
+shell 侧（trap 回滚、delete 静默跳过、6 列表头）由容器端到端覆盖。
 路径常量全部指向临时目录（含两把锁文件），系统账号/监听/子进程一律打桩，不碰真实系统：
 在 Linux 上跑（含非 root）时，flock 真实生效，锁文件也必须落在沙箱里，不能碰真实 /srv。
 """
@@ -1140,6 +1140,16 @@ class NoteTests(Sandbox):
         panel.set_project_note("p1", "字" * 200)                              # 恰好 200 合格
         panel.set_project_note("p1", "🎉" * 200)
 
+    def test_lone_surrogate_rejected_before_write(self):
+        """孤立代理（U+D800–DFFF）无法按 UTF-8 编码：校验就拒绝、错误不回显正文，
+        绝不把正文带进写盘路径产生 UnicodeEncodeError traceback。"""
+        self.write_registry("p1\t3000\t\tt\t")
+        for bad in ("a\ud800b", "\udfff", "🎉\ud800"):
+            with self.assertRaisesRegex(panel.ApiExit, "孤立代理") as cm:
+                panel.set_project_note("p1", bad)
+            self.assertNotIn(bad, str(cm.exception))     # 错误不回显正文
+        self.assertEqual(self.one_row(), "p1\t3000\t\tt\t")   # 失败不写表
+
     def test_unknown_project_exit_2_no_append(self):
         self.write_registry("p1\t3000\t\tt\t")
         before = self.reg_text()
@@ -1351,6 +1361,12 @@ class NoteCliTests(Sandbox):
         self.assertIn("空白", err)
         rc, _, err = self.run_cli(["note", "demo", "--set=" + "字" * 201])
         self.assertIn("200", err)
+        # 孤立代理经 stdin 进来：校验拒绝（退出码 1、不回显正文），不以 UnicodeEncodeError traceback 收场
+        rc, out, err = self.run_cli(["note", "demo", "--set=-"], stdin_text="a\ud800b")
+        self.assertEqual((rc, out), (1, ""))
+        self.assertIn("孤立代理", err)
+        self.assertNotIn("a\ud800b", err)
+        self.assertNotIn("Traceback", err)
 
     def test_audit_records_op_without_body(self):
         self.note_row()

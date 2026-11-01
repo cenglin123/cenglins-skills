@@ -154,7 +154,7 @@ svc <项目> <start|stop|restart> <服务>
   人类可读文本 + 退出码
 
 note <项目> --set=<文本> | --set=- | --clear
-  设置或清除项目注释：单行 UTF-8，≤200 个 Unicode 码点，非空非纯空白，不含控制字符；
+  设置或清除项目注释：单行 UTF-8，≤200 个 Unicode 码点，非空非纯空白，不含控制字符或孤立代理；
   保存时不改写原文（保留首尾空格）。--set=- 从 stdin 读正文（推荐：正文不经 argv / sudo 日志）；
   --set= 空值与纯空白拒绝，清除只能用 --clear；= 形态保证以 - 开头的文本不被误解为选项。
   成功 stdout 只输出 {"name","note":str|null}；同值 set 与已空 clear 幂等成功且不重写登记表；
