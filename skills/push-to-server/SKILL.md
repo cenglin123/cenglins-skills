@@ -51,7 +51,7 @@ Deploy projects under `/srv/<project>/`. The script rejects every path under
 
 ```text
 /srv/
-  PROJECTS.tsv              # Registry: project, port, contact, created
+  PROJECTS.tsv              # Registry: project, port, contact, created, source, note
   <project>/
     repo/                   # Git code, Compose files, deployment/check scripts
     config/                 # Server-specific configuration and .env
@@ -100,6 +100,8 @@ step and act only in your own role:
 | 3. First deploy | Requester's agent | `config-save`, `bootstrap`, runtime, `config/.env` with random secrets, systemd user service, post-sync/health scripts, then deliver URL and initial password to its user. |
 
 On a server that runs the knowledge-base backend, day-to-day project operations go through the backend's 【项目运维】 admin page instead of the panel's web pages: delegate `srv-project` to the account the backend runs as (`install --delegate <that account>`) and run the panel with `install_panel.sh --enroll-only`, so port 9300 only serves the device-enrollment endpoint and every other path returns 404. See [`references/project-accounts.md`](references/project-accounts.md) and the JSON interface in [`references/srv-panel.md`](references/srv-panel.md). `create` (including `--takeover`) calls the panel's `api external register` to write the registry row inside the lock: a deployment upgraded from an old `srv-project` without the panel must install the panel first, otherwise `create` fails with `请先安装管理面板`.
+
+Each project may carry one admin-maintained note (`srv-project note <project> --set=- | --set=<text> | --clear`, single line, ≤200 Unicode code points; pass the body via stdin). Notes are super-admin-only in the knowledge-base admin UI and appear only in `list/status --json`; the web panel and human-readable `list` never show them. The CLI is root-equivalent and the registry file is world-readable (0644) — a note is **not** a confidentiality boundary, so never put passwords or keys in it. Concurrent edits are last-write-wins; deleting the project deletes the note with it. See [`references/project-accounts.md`](references/project-accounts.md) "项目注释".
 
 Services that already run on the server (not `/srv` projects) are first registered read-only as external services (`srv-project external add`); ones marked migratable (`--migrate`, only the caller's own service on a port >= 1024) can become real projects with `srv-project create --takeover <external>`. Steps and who runs each: [`references/project-accounts.md`](references/project-accounts.md) "迁入已有服务".
 

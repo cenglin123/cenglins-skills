@@ -7,6 +7,7 @@ shell 侧（trap 回滚、delete 静默跳过、5 列表头）由容器端到端
 """
 import contextlib
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -91,6 +92,16 @@ class ParseTests(unittest.TestCase):
         rows = panel.parse_registry("# h\nold\t3000\tc\t2026-01-01 00:00:00\nnew\t3001\t\t2026-01-02 00:00:00\texternal:foo\n")
         self.assertEqual((rows[0]["source"], rows[1]["source"]), ("", "external:foo"))
         self.assertEqual(rows[1]["contact"], "")
+
+    def test_registry_note_column(self):
+        """第 6 列 note：6 列行读出注释；旧 4/5 列行按空注释处理（不迁移）。"""
+        rows = panel.parse_registry(
+            "# 项目\t端口\t联系人\t创建时间\t来源\t注释\n"
+            "a\t3000\tc\tt\texternal:x\t备注A\n"
+            "b\t3001\t\tt\t\t\n"
+            "c\t3002\t\tt\n")
+        self.assertEqual([r["note"] for r in rows], ["备注A", "", ""])
+        self.assertEqual([r["source"] for r in rows], ["external:x", "", ""])
 
     def test_light_record_source(self):
         e = {"name": "x1", "port": "3000", "contact": "", "created": "t", "source": "external:foo"}
@@ -541,11 +552,13 @@ class RegisterTests(Sandbox):
         self.assertFalse(os.path.exists(self.reg))
 
     def test_missing_registry_created_with_header(self):
-        """登记表还没建（未 install）时按空表起，表头与 install 一致；不因此拒绝首个登记。"""
+        """登记表还没建（未 install）时按空表起，表头与 install 一致（6 列）；不因此拒绝首个登记。"""
         panel.external_register("p1", "9200")
         text = Path(self.reg).read_text(encoding="utf-8")
-        self.assertTrue(text.startswith("# 项目\t端口\t联系人\t创建时间\t来源\n"))
+        self.assertTrue(text.startswith("# 项目\t端口\t联系人\t创建时间\t来源\t注释\n"))
         self.assertIn("p1\t9200\t", text)
+        rows = panel.parse_registry(text)
+        self.assertEqual(rows[0]["note"], "")      # 普通 create 仍写 5 列，注释为空
 
     def test_takeover_source_requires_marked_target(self):
         self.listening = [listen(9200, "appuser")]
@@ -668,6 +681,23 @@ class ReleaseAndRemoveTests(Sandbox):
         self.assertEqual(reg[1]["contact"], "c")
         self.assertTrue(Path(self.reg).read_text(encoding="utf-8").startswith("# 项目"))
 
+    def test_cancel_migration_keeps_note(self):
+        """取消迁移按列清空第 5 列来源，第 6 列注释原样保留（不物理删列）。"""
+        self.write_registry("old1\t3000\t\t2026-10-30 10:00:00",
+                            "newproj\t9200\tc\t2026-10-31 10:00:00\texternal:oldsvc\t迁移期间的备注")
+        panel.external_remove("oldsvc", True, lst=list(self.listening), caller="appuser")
+        raw = next(l for l in Path(self.reg).read_text(encoding="utf-8").split("\n") if l.startswith("newproj\t"))
+        self.assertEqual(raw, "newproj\t9200\tc\t2026-10-31 10:00:00\t\t迁移期间的备注")
+        reg = {r["name"]: r for r in panel.parse_registry(Path(self.reg).read_text(encoding="utf-8"))}
+        self.assertEqual((reg["newproj"]["source"], reg["newproj"]["note"]), ("", "迁移期间的备注"))
+
+    def test_remove_when_switched_keeps_source_and_note(self):
+        panel.set_project_note("newproj", "迁来的项目")
+        panel.external_remove("oldsvc", False, lst=[listen(9200, "newproj")])
+        reg = {r["name"]: r for r in panel.parse_registry(Path(self.reg).read_text(encoding="utf-8"))}
+        self.assertEqual(reg["newproj"]["source"], "external:oldsvc")     # 已切换删登记：来源与注释都保留
+        self.assertEqual(reg["newproj"]["note"], "迁来的项目")
+
     def test_cancel_migration_clear_source_failure_reports_half_done(self):
         """清迁入目标已落盘、清来源失败时：错误必须如实说「已清迁入目标」并给修复步骤，不能报「未改动」。"""
         for boom in (panel.ApiExit("%s 读取失败，未改动：boom" % self.reg), OSError("disk")):
@@ -762,7 +792,7 @@ class ReleaseAndRemoveTests(Sandbox):
         self.assertGreater(len(before.encode("utf-8")), 1 << 20)
         self.assertTrue(panel.clear_project_source("newproj", "oldsvc"))
         after = Path(self.reg).read_text(encoding="utf-8")
-        self.assertEqual(after, before.replace("\texternal:oldsvc", ""))
+        self.assertEqual(after, before.replace("external:oldsvc", ""))   # 按列清空第 5 列：保留空列（第 6 列注释位置不动）
         self.assertTrue(after.endswith("\n"))
 
     def test_clear_source_missing_registry(self):
@@ -1037,6 +1067,316 @@ class CliTests(Sandbox):
         self.assertNotIn("Traceback", err)
         rems = [c for c in panel.audit.call_args_list if c.args[1] == "api_external_remove"]
         self.assertTrue(any(c.args[3] == 28 and c.args[4] == "cli:appuser" for c in rems), rems)
+
+
+class NoteTests(Sandbox):
+    """项目注释（PROJECTS.tsv 第 6 列）：兼容 4/5/6 列、set/clear、幂等、fail-closed 与并发。"""
+
+    def reg_text(self):
+        return Path(self.reg).read_text(encoding="utf-8")
+
+    def one_row(self):
+        return next(l for l in self.reg_text().split("\n") if l.startswith("p1\t"))
+
+    def test_set_expands_5_columns_to_6_and_preserves_other_rows(self):
+        self.write_registry("old4\t3000\tc\t2026-01-01 00:00:00",
+                            "p1\t3100\t张三\t2026-01-02 00:00:00\t",
+                            "p2\t3200\t\t2026-01-03 00:00:00\texternal:foo")
+        before = self.reg_text().split("\n")
+        self.assertEqual(panel.set_project_note("p1", "运维备注：内部使用"), "运维备注：内部使用")
+        lines = self.reg_text().split("\n")
+        self.assertEqual(lines[0], before[0])            # 旧表头原样（不迁移）
+        self.assertEqual(lines[1], before[1])            # 其他行逐字节原样
+        self.assertEqual(lines[3], before[3])
+        self.assertEqual(lines[2], "p1\t3100\t张三\t2026-01-02 00:00:00\t\t运维备注：内部使用")
+
+    def test_set_on_4_column_row(self):
+        """旧 4 列行：补齐空的第 5 列，注释落到第 6 列（不能让注释挤进来源列）。"""
+        self.write_registry("old4\t3000\tc\t2026-01-01 00:00:00")
+        panel.set_project_note("old4", "补一条")
+        self.assertIn("old4\t3000\tc\t2026-01-01 00:00:00\t\t补一条", self.reg_text())
+        row = panel.parse_registry(self.reg_text())[0]
+        self.assertEqual((row["source"], row["note"]), ("", "补一条"))
+
+    def test_set_replaces_existing_note(self):
+        self.write_registry("p1\t3000\t\tt\texternal:x\t旧注")
+        panel.set_project_note("p1", "新注")
+        self.assertNotIn("旧注", self.reg_text())
+        self.assertEqual(self.one_row(), "p1\t3000\t\tt\texternal:x\t新注")
+
+    def test_clear_removes_sixth_field_without_trailing_tab(self):
+        self.write_registry("p1\t3000\t\tt\texternal:x\t有注")
+        self.assertIsNone(panel.set_project_note("p1", "", clear=True))
+        self.assertEqual(self.one_row(), "p1\t3000\t\tt\texternal:x")     # 回到 5 列、无尾随 tab
+
+    def test_clear_normalizes_stray_empty_sixth_field(self):
+        with open(self.reg, "w", encoding="utf-8", newline="") as f:
+            f.write("# 项目\t端口\t联系人\t创建时间\t来源\np1\t3000\t\tt\t\t\n")   # 手工编辑留下的 6 字段空注释
+        self.assertIsNone(panel.set_project_note("p1", "", clear=True))
+        self.assertEqual(self.one_row(), "p1\t3000\t\tt\t")               # 只删第 6 字段；空的第 5 列（尾随 tab）属于来源列，保留
+        with patch.object(panel, "write_file_atomic") as w:
+            self.assertIsNone(panel.set_project_note("p1", "", clear=True))   # 之后幂等无写
+            w.assert_not_called()
+
+    def test_unicode_roundtrip_without_strip(self):
+        note = "中文与空格 保留 🎉 π --不是选项  "
+        self.write_registry("p1\t3000\t\tt\t")
+        panel.set_project_note("p1", note)
+        self.assertEqual(panel.parse_registry(self.reg_text())[0]["note"], note)   # 保存不 strip，原样读回
+
+    def test_empty_set_is_rejected_not_treated_as_clear(self):
+        self.write_registry("p1\t3000\t\tt\t")
+        with self.assertRaisesRegex(panel.ApiExit, "空白"):
+            panel.set_project_note("p1", "")
+        self.assertEqual(panel.parse_registry(self.reg_text())[0]["note"], "")
+
+    def test_length_and_content_limits(self):
+        self.write_registry("p1\t3000\t\tt\t")
+        for bad in ("   ", "a\tb", "a\nb", "字" * 201, "🎉" * 201, "a\x7fb", "a\x85b", "a\u2028b", "a\u2029b"):
+            with self.assertRaisesRegex(panel.ApiExit, "注释") as cm:
+                panel.set_project_note("p1", bad)
+            self.assertNotIn(bad, str(cm.exception))     # 错误不回显正文
+        self.assertEqual(self.one_row(), "p1\t3000\t\tt\t")                   # 失败不写表
+        panel.set_project_note("p1", "字" * 200)                              # 恰好 200 合格
+        panel.set_project_note("p1", "🎉" * 200)
+
+    def test_unknown_project_exit_2_no_append(self):
+        self.write_registry("p1\t3000\t\tt\t")
+        before = self.reg_text()
+        with self.assertRaises(panel.ApiExit) as cm:
+            panel.set_project_note("ghost1", "x")
+        self.assertEqual(cm.exception.code, 2)
+        self.assertEqual(self.reg_text(), before)        # 绝不追加
+
+    def test_missing_registry_is_exit_2(self):
+        with self.assertRaises(panel.ApiExit) as cm:
+            panel.set_project_note("p1", "x")
+        self.assertEqual(cm.exception.code, 2)
+        self.assertFalse(os.path.exists(self.reg))
+
+    def test_invalid_name_exit_2(self):
+        for name in ("__probe__", "Bad", "../x", "a", ""):
+            with self.assertRaises(panel.ApiExit) as cm:
+                panel.set_project_note(name, "x", clear=True)
+            self.assertEqual(cm.exception.code, 2, name)
+            self.assertIn("项目名不合法", str(cm.exception))
+        self.assertFalse(os.path.exists(self.reg))       # 探测不写表
+
+    def test_duplicate_rows_fail_closed(self):
+        self.write_registry("dup\t3000\t\tt", "dup\t3001\t\tt")
+        before = self.reg_text()
+        with self.assertRaisesRegex(panel.ApiExit, "重复"):
+            panel.set_project_note("dup", "x")
+        self.assertEqual(self.reg_text(), before)
+
+    def test_crlf_rejected(self):
+        with open(self.reg, "w", encoding="utf-8", newline="") as f:
+            f.write("# 项目\t端口\t联系人\t创建时间\t来源\r\np1\t3000\t\tt\texternal:x\r\n")
+        before = Path(self.reg).read_bytes()
+        with self.assertRaisesRegex(panel.ApiExit, "CR"):
+            panel.set_project_note("p1", "x")
+        self.assertEqual(Path(self.reg).read_bytes(), before)
+
+    def test_malformed_short_row_refused(self):
+        self.write_registry("p1")
+        before = self.reg_text()
+        with self.assertRaisesRegex(panel.ApiExit, "格式异常"):
+            panel.set_project_note("p1", "x")
+        self.assertEqual(self.reg_text(), before)
+
+    def test_idempotent_set_and_clear_do_not_write(self):
+        self.write_registry("p1\t3000\t\tt\t")
+        panel.set_project_note("p1", "备注")              # 首次设置：真实写入
+        with patch.object(panel, "write_file_atomic") as w:
+            self.assertEqual(panel.set_project_note("p1", "备注"), "备注")     # 同值 set：幂等无写
+            w.assert_not_called()
+        panel.set_project_note("p1", "", clear=True)     # 清除：回到 5 列
+        with patch.object(panel, "write_file_atomic") as w:
+            self.assertIsNone(panel.set_project_note("p1", "", clear=True))    # 已空 clear：幂等无写
+            w.assert_not_called()
+
+    def test_tail_row_beyond_1mib(self):
+        pad = ["p%05d\t%d\t\t2026-01-01 00:00:00\t" % (i, 20000 + i) for i in range(40000)]
+        pad.append("tailp\t9300\t\t2026-01-01 00:00:00")
+        self.write_registry(*pad)
+        self.assertGreater(os.path.getsize(self.reg), 1 << 20)
+        panel.set_project_note("tailp", "表尾")
+        rows = panel.parse_registry(self.reg_text())
+        self.assertEqual(len(rows), len(pad))
+        self.assertEqual((rows[-1]["name"], rows[-1]["note"]), ("tailp", "表尾"))
+        self.assertEqual(rows[0]["name"], "p00000")      # 大表其余行未动
+
+    def test_note_only_takes_registry_lock(self):
+        """note 只持 PROJECTS 一把锁，不取 EXTERNAL 锁，无反向锁序。"""
+        self.write_registry("p1\t3000\t\tt\t")
+        order = []
+        real = panel._flock
+        def rec(path):
+            order.append(path)
+            return real(path)
+        with patch.object(panel, "_flock", rec):
+            panel.set_project_note("p1", "x")
+        self.assertEqual(order, [panel.REGISTRY_LOCK])
+
+    @unittest.skipUnless(HAS_FCNTL, "flock 只在有 fcntl 的平台（Linux）生效")
+    def test_concurrent_delete_wins_note_never_revives(self):
+        """锁内的 delete 先删行：note 进锁后按同一次完整读取定位不到目标，报不存在且不把行写回。"""
+        import threading
+        self.write_registry("gone1\t3000\t\t2026-01-01 00:00:00")
+        outcome = []
+        def worker():
+            try:
+                panel.set_project_note("gone1", "x")
+                outcome.append("ok")
+            except panel.ApiExit as e:
+                outcome.append("missing:%d" % e.code)
+        with panel.registry_lock():
+            lines = [l for l in self.reg_text().split("\n") if not l.startswith("gone1\t")]
+            with open(self.reg, "w", encoding="utf-8", newline="") as f:
+                f.write("\n".join(lines))                # 模拟并发的 delete 已在锁内落盘
+            t = threading.Thread(target=worker)
+            t.start()
+            t.join(0.5)
+            self.assertTrue(t.is_alive())                # 堵在锁上，没有偷跑
+        t.join(5)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(outcome, ["missing:2"])
+        self.assertNotIn("gone1", self.reg_text())
+
+    @unittest.skipUnless(HAS_FCNTL, "flock 只在有 fcntl 的平台（Linux）生效")
+    def test_concurrent_note_and_register_keep_both_rows(self):
+        import threading
+        self.write_registry("p1\t3000\t\t2026-01-01 00:00:00")
+        note_result, reg_result = [], []
+        def note_worker():
+            note_result.append(panel.set_project_note("p1", "并发备注"))
+        def reg_worker():
+            try:
+                panel.external_register("p2", "3001")
+                reg_result.append("ok")
+            except panel.ApiExit as e:
+                reg_result.append("clash:%s" % e)
+        with panel.registry_lock():
+            t1 = threading.Thread(target=note_worker)
+            t2 = threading.Thread(target=reg_worker)
+            t1.start()
+            t2.start()
+            t1.join(0.5)
+            t2.join(0.5)
+            self.assertTrue(t1.is_alive() and t2.is_alive())
+        t1.join(5)
+        t2.join(5)
+        rows = {r["name"]: r for r in panel.parse_registry(self.reg_text())}
+        self.assertEqual(set(rows), {"p1", "p2"})        # 并发不丢行
+        self.assertEqual((rows["p1"]["note"], note_result), ("并发备注", ["并发备注"]))
+        self.assertEqual(reg_result, ["ok"])
+
+
+class NoteCliTests(Sandbox):
+    """srv-panel.py api note 的 CLI 形态：stdout 仅 JSON、互斥必选、审计与错误不含正文、写失败口径。"""
+
+    def run_cli(self, argv, stdin_text=""):
+        with patch("sys.stdin", io.StringIO(stdin_text)), patch("sys.stdout") as out, patch("sys.stderr") as err:
+            rc = panel.api_cli(argv)
+        return rc, "".join(c.args[0] for c in out.write.call_args_list), "".join(c.args[0] for c in err.write.call_args_list)
+
+    def note_row(self):
+        self.write_registry("demo\t3100\t测试\t2026-01-01 00:00:00\t")
+
+    def test_set_stdout_is_json_only(self):
+        self.note_row()
+        rc, out, err = self.run_cli(["note", "demo", "--set=中文 备注 🎉"])
+        self.assertEqual((rc, err), (0, ""))
+        self.assertEqual(json.loads(out), {"name": "demo", "note": "中文 备注 🎉"})    # stdout 只有这一个 JSON
+
+    def test_stdin_form(self):
+        self.note_row()
+        rc, out, _ = self.run_cli(["note", "demo", "--set=-"], stdin_text="来自 stdin 的备注")
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(out)["note"], "来自 stdin 的备注")
+
+    def test_empty_stdin_is_rejected_not_clear(self):
+        self.note_row()
+        rc, out, err = self.run_cli(["note", "demo", "--set=-"], stdin_text="")
+        self.assertEqual((rc, out), (1, ""))
+        self.assertIn("空白", err)
+        self.assertEqual(panel.parse_registry(Path(self.reg).read_text(encoding="utf-8"))[0]["note"], "")
+
+    def test_clear_stdout_note_null_and_file_back_to_5(self):
+        self.note_row()
+        self.run_cli(["note", "demo", "--set=x"])
+        rc, out, _ = self.run_cli(["note", "demo", "--clear"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(out), {"name": "demo", "note": None})
+        line = next(l for l in Path(self.reg).read_text(encoding="utf-8").split("\n") if l.startswith("demo\t"))
+        self.assertEqual(line, "demo\t3100\t测试\t2026-01-01 00:00:00\t")   # 回到 5 列（空的第 5 列是来源列）
+
+    def test_dashed_values_are_plain_text(self):
+        """--set= 的 = 形态消除以 - 开头文本的 argparse 歧义：-x/--clear/-- 都是普通注释文本。"""
+        self.note_row()
+        for text in ("-x", "--clear", "--"):
+            rc, out, _ = self.run_cli(["note", "demo", "--set=" + text])
+            self.assertEqual((rc, json.loads(out)["note"]), (0, text), text)
+
+    def test_mutex_and_missing_options_exit_2(self):
+        self.note_row()
+        for argv in (["note"], ["note", "demo"], ["note", "demo", "--set=a", "--clear"]):
+            with self.assertRaises(SystemExit) as cm:
+                self.run_cli(argv)
+            self.assertEqual(cm.exception.code, 2, argv)
+
+    def test_unknown_project_exit_2_stdout_empty(self):
+        self.note_row()
+        rc, out, err = self.run_cli(["note", "nosuch1", "--clear"])
+        self.assertEqual((rc, out), (2, ""))
+        self.assertIn("不存在", err)
+
+    def test_invalid_name_reports_and_writes_nothing(self):
+        self.note_row()
+        rc, out, err = self.run_cli(["note", "__probe__", "--clear"])
+        self.assertEqual((rc, out), (2, ""))
+        self.assertIn("项目名不合法", err)
+        text = Path(self.reg).read_text(encoding="utf-8")
+        self.assertIn("demo\t3100", text)                # 表未动
+        self.assertNotIn("__probe__", text)              # 未追加
+
+    def test_validation_failure_exit_1_without_echo(self):
+        self.note_row()
+        rc, out, err = self.run_cli(["note", "demo", "--set=坏\t的"])
+        self.assertEqual((rc, out), (1, ""))
+        self.assertIn("控制字符", err)
+        self.assertNotIn("坏\t的", err)                  # 错误不回显正文
+        rc, out, err = self.run_cli(["note", "demo", "--set=   "])
+        self.assertEqual((rc, out), (1, ""))
+        self.assertIn("空白", err)
+        rc, _, err = self.run_cli(["note", "demo", "--set=" + "字" * 201])
+        self.assertIn("200", err)
+
+    def test_audit_records_op_without_body(self):
+        self.note_row()
+        self.run_cli(["note", "demo", "--set=机密正文保密"])
+        sets = [c for c in panel.audit.call_args_list if c.args[1] == "api_project_note"]
+        self.assertTrue(sets)
+        self.assertEqual(sets[-1].args[2], {"project": "demo", "op": "set"})
+        self.assertEqual(sets[-1].args[3], 0)
+        self.assertNotIn("机密正文保密", json.dumps(sets[-1].args[2], ensure_ascii=False))
+        panel.audit.reset_mock()
+        self.run_cli(["note", "demo", "--clear"])
+        clears = [c for c in panel.audit.call_args_list if c.args[1] == "api_project_note"]
+        self.assertEqual(clears[-1].args[2], {"project": "demo", "op": "clear"})
+
+    def test_write_failure_exit_1_readable_and_table_intact(self):
+        """ENOSPC：非零退出、错误可读、无 traceback、无半截表、失败也留审计。"""
+        self.note_row()
+        before = Path(self.reg).read_text(encoding="utf-8")
+        with patch.object(panel, "write_file_atomic", side_effect=OSError(28, "No space left on device")):
+            rc, out, err = self.run_cli(["note", "demo", "--set=x"])
+        self.assertEqual((rc, out), (1, ""))
+        self.assertIn("No space left on device", err)
+        self.assertNotIn("Traceback", err)
+        self.assertEqual(Path(self.reg).read_text(encoding="utf-8"), before)
+        fails = [c for c in panel.audit.call_args_list if c.args[1] == "api_project_note"]
+        self.assertTrue(any(c.args[3] == 28 for c in fails), fails)
 
 
 if __name__ == "__main__":

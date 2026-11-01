@@ -153,6 +153,13 @@ logs <项目> <服务> [--lines N]
 svc <项目> <start|stop|restart> <服务>
   人类可读文本 + 退出码
 
+note <项目> --set=<文本> | --set=- | --clear
+  设置或清除项目注释：单行 UTF-8，≤200 个 Unicode 码点，非空非纯空白，不含控制字符；
+  保存时不改写原文（保留首尾空格）。--set=- 从 stdin 读正文（推荐：正文不经 argv / sudo 日志）；
+  --set= 空值与纯空白拒绝，清除只能用 --clear；= 形态保证以 - 开头的文本不被误解为选项。
+  成功 stdout 只输出 {"name","note":str|null}；同值 set 与已空 clear 幂等成功且不重写登记表；
+  项目不存在或用法/互斥错误退出码 2；校验/写失败退出码 1，错误不回显注释正文
+
 invite <项目> --label L [--hours N] [--from X]
   stdout 只有一行邀请文本，说明写到 stderr
 
@@ -187,8 +194,12 @@ takeover-copy <项目> <源目录> [--to data|config]
   - `status` 的 `global.listeners` 每项多 `external`（该端口登记的外部服务名或 `null`）和 `migrate_state`；端口既属于项目又属于外部服务时 `project`、`external` 都写；
   - 迁入中的新项目，端口的监听属主正好是外部服务的登记属主时不算问题，只在项目的 `notes` 里写「迁移中：旧服务仍在监听」；
   - `migrate_state`：迁入目标已设置时，监听属主恰好是新项目账号为「已切换」，其余为「迁移中」；没有迁入目标为 `null`。
+- 项目注释（`note` 子命令读写 `PROJECTS.tsv` 第 6 列，使用边界见 [`project-accounts.md`](project-accounts.md)「项目注释」）相关的新增字段与行为：
+  - `list` 和 `status`（全量与单项目）的项目记录里有 `note`（没有注释为 `null`）。注释只进 JSON 输出：独立面板网页和人类可读 `srv-project list` 不展示；知识库后台仅超级管理员可见，运维管理员的记录同样裁掉 `note`；
+  - `note` 的写入只持 `PROJECTS` 一把锁，在同一次完整读取里定位目标行并按列更新：项目不存在退出码 2 且**绝不追加新行**；同一项目出现重复登记行时 fail-closed 拒写；表里发现 CR/CRLF 时拒绝并提示格式异常；写回仍是临时文件 + `os.replace`；
+  - `external remove --cancel-migration` 清来源只把第 5 列按列清空（不再用前 4 列重建行），注释（第 6 列）保留；失败提示也只要求按列清空、不要求物理删列。
 - 独立面板的网页「全局检查」不显示外部服务，外部服务只在知识库后台【项目运维】里展示和维护。
-- `PROJECTS.tsv` 第 5 列「来源」可缺省；`install` 新建的文件表头是 5 列，已有 4 列的文件原样兼容。
+- `PROJECTS.tsv` 第 5 列「来源」、第 6 列「注释」都可缺省；`install` 新建的文件表头是 6 列，已有 4/5 列的旧表原样兼容、不迁移。普通 `create`（含 `--takeover`）仍写 5 列，首次设置注释才把该行扩为 6 列，清除注释删掉第 6 字段（不留尾随 tab）。
 - `invites` 和 `invite-revoke` 必须带项目参数。`invite-revoke <项目> <编号>` 会断言该邀请属于这个项目，不属于就报「找不到邀请」，退出码非 0；旧的单参数写法直接报用法错误。面板网页的作废走内部函数，不受影响。
 - 校验：项目名用 `^[a-z][a-z0-9_-]{1,31}$`，服务名要以 `.service` 结尾（首字符字母或数字，允许 `@ . _ : -`），`--lines` 取 1–1000。
 
@@ -203,7 +214,7 @@ srv_panel.py [--bind IP]... [--port 9300] [--allow-remote]
 srv_panel.py --bootstrap | --reset-admin        # 安装脚本调用
 srv_panel.py --write-panel-conf --lan-ip IP --port N --tls-cert 证书 [--enroll-only | --full]   # 安装脚本调用
 srv_panel.py invite create|list|revoke …        # srv-project invite* 转调
-srv_panel.py api list|status|env|info|invites|logs|svc|external|takeover-copy …   # srv-project 的 JSON 与外部服务子命令转调
+srv_panel.py api list|status|env|info|invites|logs|svc|external|takeover-copy|note …   # srv-project 的 JSON 与外部服务子命令转调
 ```
 
 ## 已知限制

@@ -11,7 +11,7 @@
                          [--log-file /var/log/srv-panel.log]
     python3 srv_panel.py --bootstrap | --reset-admin     （安装脚本调用）
     python3 srv_panel.py invite create <项目> --label L [--hours N] [--from X] | list | revoke <项目> <编号>
-    python3 srv_panel.py api list|status|env|info|invites|logs|svc|external|takeover-copy …   （srv-project 的 JSON 子命令转调到这里）
+    python3 srv_panel.py api list|status|env|info|invites|logs|svc|external|takeover-copy|note …   （srv-project 的 JSON 子命令转调到这里）
 
 纯函数（解析、校验、密码、限流）可直接 import 测试；导入时不检查 root、不启动服务。
 """
@@ -82,6 +82,23 @@ def valid_unit(unit):
     return isinstance(unit, str) and UNIT_RE.fullmatch(unit) is not None
 
 
+NOTE_MAX = 200        # 注释上限：Unicode 码点（Python len 即码点数）
+_NOTE_FORBIDDEN = ("\x7f", "\x85", "\u2028", "\u2029")     # DEL、NEL、行分隔符、段分隔符
+
+
+def note_problem(note):
+    """设置项目注释的统一校验（CLI / API / 前端计数共用同一谓词）。不合格返回中文原因，合格返回 None。
+    只校验不改写：非纯空白、≤ NOTE_MAX 个 Unicode 码点、不含 C0 控制字符（含制表符/换行）、
+    DEL、NEL（U+0085）、U+2028/U+2029。错误只说明规则，不回显正文。"""
+    if not isinstance(note, str) or note.strip() == "":
+        return "注释不能为空或纯空白"
+    if len(note) > NOTE_MAX:
+        return "注释过长：不超过 %d 个字符（Unicode 码点）" % NOTE_MAX
+    if any(ord(c) < 32 or c in _NOTE_FORBIDDEN for c in note):
+        return "注释不能含控制字符或换行（须为单行可见文本）"
+    return None
+
+
 def host_ok(host_header, server_port, extra_hosts=()):
     """Host 头只能是 127.0.0.1 / localhost（可带本服务端口），防 DNS rebinding。"""
     if not host_header or len(host_header) > 255:
@@ -131,15 +148,17 @@ def parse_ss(text):
 
 
 def parse_registry(text):
-    """解析 PROJECTS.tsv，返回 [{name, port, contact, created, source}]；# 开头与空行跳过。
-    第 5 列「来源」可缺省（旧的 4 列文件），迁入的项目写 external:<外部服务名>。"""
+    """解析 PROJECTS.tsv，返回 [{name, port, contact, created, source, note}]；# 开头与空行跳过。
+    第 5 列「来源」可缺省（旧的 4 列文件），迁入的项目写 external:<外部服务名>；
+    第 6 列「注释」可缺省（旧的 4/5 列记录按空注释处理）。"""
     rows = []
     for line in text.splitlines():
         if not line.strip() or line.startswith("#"):
             continue
         f = line.split("\t")
-        f += [""] * (5 - len(f))
-        rows.append({"name": f[0], "port": f[1], "contact": f[2], "created": f[3], "source": f[4]})
+        f += [""] * (6 - len(f))
+        rows.append({"name": f[0], "port": f[1], "contact": f[2], "created": f[3],
+                     "source": f[4], "note": f[5]})
     return rows
 
 
@@ -642,11 +661,11 @@ def delete_problem(users, actor, target):
 
 
 def write_file_atomic(path, text, mode=0o600):
-    """先写同目录临时文件再 rename；文件从创建起就是 mode 权限。"""
+    """先写同目录临时文件再 rename；文件从创建起就是 mode 权限。newline="" 保证按原样落盘，不做平台换行翻译。"""
     tmp = "%s.tmp.%d.%s" % (path, os.getpid(), secrets.token_hex(4))
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
             f.write(text)
             f.flush()
             os.fsync(f.fileno())
@@ -1380,12 +1399,14 @@ def _port_int(text):
 
 
 def light_record(entry, exists, disabled, key_lines):
-    """list --json 的一条记录：只来自登记表、shadow 和公钥文件。source 为 external:<名称> 或 null。"""
+    """list --json 的一条记录：只来自登记表、shadow 和公钥文件。source/note 为 external:<名称>/注释或 null。
+    note 只进 JSON 输出：独立面板网页与人类可读 list 不展示注释。"""
     return {"name": entry["name"], "port": _port_int(entry["port"]), "contact": entry["contact"],
             "created": entry["created"], "account_exists": bool(exists),
             "disabled": bool(disabled) if exists else False,
             "keys": key_entries(key_lines) if exists else [],
-            "source": entry.get("source") or None}
+            "source": entry.get("source") or None,
+            "note": entry.get("note") or None}
 
 
 HEAD_RE = re.compile(r"^[0-9a-f]{7,40}\s")
@@ -1587,7 +1608,7 @@ def api_invites(project, invites_file=INVITES_FILE):
 
 EXT_KEYS = ("name", "port", "owner", "unit", "migratable", "target", "desc", "created", "created_by")
 EXT_HEADER = "# 名称\t端口\t属主\t单元\t可迁入\t迁入目标\t说明\t登记时间\t登记人\n"
-REGISTRY_HEADER = "# 项目\t端口\t联系人\t创建时间\t来源\n"     # 与 srv_project.sh install 写的表头一致（5 列）
+REGISTRY_HEADER = "# 项目\t端口\t联系人\t创建时间\t来源\t注释\n"     # 与 srv_project.sh install 写的表头一致（6 列；已有 4/5 列旧表原样兼容，不迁移）
 EXT_DESC_MAX = 60
 OWNER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,31}$")
 MIGRATE_MIN_UID, MIGRATE_MAX_UID = 1000, 60000
@@ -2002,11 +2023,59 @@ def clear_project_source(project, ext_name):
         for line in text.split("\n"):
             f = line.split("\t")
             if line and not line.startswith("#") and f[0] == project and len(f) >= 5 and f[4] == "external:" + ext_name:
-                line, changed = "\t".join(f[:4]), True      # 只动目标行的第 5 列，其余行原样
+                f[4] = ""                                   # 按列清空第 5 列（不用 f[:4] 重建行），第 6 列注释原样保留
+                line, changed = "\t".join(f), True
             out.append(line)
         if changed:
             write_file_atomic(REGISTRY, "\n".join(out), mode=0o644)     # 临时文件 + os.replace
     return changed
+
+
+def set_project_note(project, note, clear=False):
+    """项目注释（PROJECTS.tsv 第 6 列）：clear=True 删除第 6 字段（不留尾随 tab）；
+    否则把 note 设为注释（空值/纯空白按校验拒绝，不当成清除——清除只能显式 clear）。
+    校验、存在性检查与写回在同一把 REGISTRY_LOCK、同一次完整读取里完成：不调 _api_project 等截断展示读取，
+    未找到退出码 2 且绝不追加新行；同一项目出现重复登记行时 fail-closed 拒写；表里发现 CR/CRLF 拒绝本次写入；
+    写回为临时文件 + os.replace。只持 PROJECTS 一把锁（锁序不反向）。返回更新后的注释（无注释为 None）。
+    同值 set、已空的 clear 幂等成功且不重写文件。"""
+    if not valid_name(project):
+        raise ApiExit("项目名不合法：%s" % project, 2)
+    clearing = bool(clear)
+    if not clearing:
+        problem = note_problem(note)
+        if problem:
+            raise ApiExit(problem)
+    with registry_lock():
+        text = _read_registry_strict()
+        if text is None:
+            raise ApiExit("项目不存在：%s" % project, 2)
+        if "\r" in text:
+            raise ApiExit("登记表含 CR/CRLF 换行，格式异常，未改动；请先把换行统一为 LF 再设置注释")
+        lines = text.split("\n")
+        hits = [i for i, line in enumerate(lines)
+                if line and not line.startswith("#") and line.split("\t")[0] == project]
+        if len(hits) > 1:
+            raise ApiExit("登记表里项目 %s 有 %d 行重复登记，拒绝改注释；请先手工合并为一行" % (project, len(hits)))
+        if not hits:
+            raise ApiExit("项目不存在：%s" % project, 2)
+        f = lines[hits[0]].split("\t")
+        if len(f) < 4:
+            raise ApiExit("登记表里项目 %s 的行不足 4 列，格式异常，未改动" % project)
+        current = f[5] if len(f) >= 6 else ""
+        if clearing:
+            if len(f) <= 5:
+                return None                             # 幂等：本来就没有注释，不重写文件
+            del f[5]                                    # 只删第 6 字段，其余行原样
+            new_note = None
+        elif current == note:
+            return note                                 # 幂等：同值且注释列已存在，无需写
+        else:
+            head = f[:5] + [""] * (5 - len(f[:5]))      # 旧的 4 列行补齐到 5 列，首次设置注释才扩为 6 列
+            f = head + [note] + f[6:]
+            new_note = note
+        lines[hits[0]] = "\t".join(f)
+        write_file_atomic(REGISTRY, "\n".join(lines), mode=0o644)
+    return new_note
 
 
 def external_remove(name, cancel=False, lst=None, caller=None):
@@ -2035,7 +2104,8 @@ def external_remove(name, cancel=False, lst=None, caller=None):
                     clear_project_source(target, name)
                 except (ApiExit, OSError) as e:
                     # 迁入目标已落盘清除，不能报「未改动」：如实说明半途状态并给出手动修复步骤
-                    raise ApiExit("已清迁入目标，但清项目 %s 的来源失败（%s）；请手动去掉 %s 里该行的第 5 列后再 external remove %s"
+                    raise ApiExit("已清迁入目标，但清项目 %s 的来源失败（%s）；请手动按列把 %s 里该行第 5 列清空"
+                                  "（保留第 6 列注释，不要物理删列）后再 external remove %s"
                                   % (target, e, REGISTRY, name))
             elif state != SWITCHED:
                 raise ApiExit("外部服务 %s 正在迁入项目 %s（%s）。要放弃迁移请加 --cancel-migration；"
@@ -2176,6 +2246,12 @@ def api_cli(argv):
     sv.add_argument("project")
     sv.add_argument("op", choices=SERVICE_OPS)
     sv.add_argument("unit")
+    nt = sub.add_parser("note")
+    nt.add_argument("project")
+    ng = nt.add_mutually_exclusive_group(required=True)
+    ng.add_argument("--set", dest="note_set", metavar="文本", default=None,
+                    help="设置注释；--set=- 从 stdin 读正文，= 后的值即使以 - 开头也按普通文本")
+    ng.add_argument("--clear", action="store_true", help="清除注释")
     ex = sub.add_parser("external").add_subparsers(dest="ecmd", required=True)
     ea = ex.add_parser("add")
     ea.add_argument("name")
@@ -2261,6 +2337,22 @@ def api_cli(argv):
             return 0
         if a.cmd == "takeover-copy":
             print(takeover_copy(a.project, a.src, a.to))
+            return 0
+        if a.cmd == "note":
+            meta = {"project": a.project, "op": "clear" if a.clear else "set"}
+            try:
+                value = "" if a.clear else a.note_set
+                if value == "-":
+                    value = sys.stdin.read(MAX_BODY)    # 正文经 stdin：不进 argv / sudo 命令日志；有界读取
+                note = set_project_note(a.project, value, clear=bool(a.clear))
+            except ApiExit as e:
+                audit(LOG_FILE, "api_project_note", meta, e.code, who)      # 审计不含正文
+                raise
+            except OSError as e:
+                audit(LOG_FILE, "api_project_note", meta, getattr(e, "errno", None) or 1, who)
+                raise ApiExit("写注释失败：写入 %s 时出错（%s）" % (REGISTRY, e))
+            audit(LOG_FILE, "api_project_note", meta, 0, who)
+            print(json.dumps({"name": a.project, "note": note}, ensure_ascii=False, indent=2))
             return 0
         if a.cmd == "list":
             data = {"projects": light_projects()}

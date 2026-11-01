@@ -68,6 +68,26 @@ ssh -t <管理员>@<服务器> 'cd /tmp/srv-setup && sudo install -m 755 srv_pro
 - `srv-project disable <项目>` 停用项目，`enable <项目>` 恢复。停用后该账号不能登录，它的进程和服务全部停止，数据保留。
 - `srv-project delete <项目> [--purge]`：只能删除已停用的项目。不加 `--purge` 时，项目目录归档到 `/srv/.archived/`。例外：create 在 register 之后、建账号之前被中断留下的「登记行在、账号不存在」残留，只清登记行与迁入标记，保留目录、不执行 `userdel`。
 
+## 项目注释（note）
+
+每个项目可以在登记表 `PROJECTS.tsv` 第 6 列挂一条说明（用途、使用对象、迁移补充信息），与第 5 列「来源」互相独立：来源是系统审计字段、只读、由迁入自动写入；注释由管理员显式维护，不自动预填、不回填存量项目。
+
+```bash
+# 推荐：正文经 stdin，避免进入 argv / sudo 命令日志
+printf '%s' '项目用途与补充说明' | sudo -n srv-project note <项目> --set=-
+
+# 便捷形式；调用者自行承担 shell 历史与进程参数的可见性
+sudo -n srv-project note <项目> --set=<文本>
+
+sudo -n srv-project note <项目> --clear
+```
+
+- 规则：单行 UTF-8，最长 200 个 Unicode 码点，不能是空或纯空白，不含控制字符（含制表符与各类换行）；保存时不改写原文（保留首尾空格）。同值设置、清除已空的注释都幂等成功且不重写登记表。
+- 角色：知识库后台【项目运维】里仅超级管理员能看和改，运维管理员的列表与详情裁掉注释；CLI 等价 root，受服务器 sudo 委托约束。**这不是 Linux 文件级保密边界**：`PROJECTS.tsv` 是 644，能读它的账号都能看到注释，注释里不得填写密码、密钥等秘密。同时编辑不检测冲突，后写者覆盖（last-write-wins）。
+- 展示：只在 `list --json` / `status --json` 的 `note` 字段（空为 `null`）和知识库后台（超管）出现；独立面板网页与人类可读 `srv-project list` 不显示注释。
+- 生命周期：`create`（含 `--takeover`）登记的新行是 5 列（无注释），首次设置注释才把该行扩为 6 列，清除注释删掉第 6 字段；`external remove --cancel-migration` 按列清空来源、注释保留；`delete` 删除整行，注释随之消失、不归档。
+- 部署探测：升级服务器脚本前可用不会写表的非法项目名探测，例如 `srv-project note __probe__ --clear`——新版明确报「项目名不合法」，旧版只打印总用法；不要对真实项目用 `--clear` 探测。
+
 ## 阶段 2：登记设备（申请方 agent）
 
 用户交来 `srvinvite1.…` 后，执行：
@@ -185,7 +205,7 @@ sudo -n srv-project create <项目> --port <同外部服务的端口> --takeover
 
 下面每一步都标了由谁执行。第 3、4 步是服务器终端上的运维动作，知识库后台做不了。
 
-1. **超级管理员**：登记外部服务（`--migrate`），在后台点「迁入为项目」或执行上面的 `create --takeover`，再 `invite` 生成邀请交给维护人。
+1. **超级管理员**：登记外部服务（`--migrate`），在后台点「迁入为项目」或执行上面的 `create --takeover`，再 `invite` 生成邀请交给维护人。需要时用 `note <项目> --set=-` 补一条项目注释（见「项目注释」）。
 2. **维护人的 agent**：凭邀请登记设备，`bootstrap` 部署代码，配置 systemd 用户服务，`enable` 但**先不启动**。新旧服务共用一个端口，新服务必须等旧进程停掉后再启动。
 3. **旧属主，在服务器终端**：对需要的目录逐个执行（这一步不停旧服务，旧服务照常对外提供）：
 
@@ -196,7 +216,7 @@ sudo -n srv-project create <项目> --port <同外部服务的端口> --takeover
    复制到 `/srv/<项目>/<data|config>/<源目录名>`，输出文件数和字节数，据此核对。执行条件全部满足才会动手：该项目是从外部服务迁入的且迁入未结束；调用者是外部服务的属主或 root；源目录是真实路径（路径中无符号链接）、不在 `/srv` 下、属主就是外部服务的属主；目标不存在。读源目录用旧属主的身份、落地用项目账号的身份，root 只建暂存目录和 chown，所以读不到的文件会报错而不是被 root 越权读走。
 4. **旧属主**：停掉旧进程。裸进程用 `kill <pid>`；用户服务用 `systemctl --user stop <服务>` 再 `disable`。
 5. **维护人的 agent**：启动新服务并做健康检查。失败时：停新服务，旧属主重新拉起旧进程（裸进程重新执行原来的启动命令；用户服务 `systemctl --user enable --now <服务>`），再排查。
-6. **超级管理员**：`status --json` 里外部服务的 `migrate_state` 变成「已切换」（监听属主恰好是新项目账号）后，执行 `external remove <名称>` 删除登记；项目的「来源」保留。迁移中途放弃：`external remove <名称> --cancel-migration`，同时清空项目的来源。
+6. **超级管理员**：`status --json` 里外部服务的 `migrate_state` 变成「已切换」（监听属主恰好是新项目账号）后，执行 `external remove <名称>` 删除登记；项目的「来源」保留。迁移中途放弃：`external remove <名称> --cancel-migration`，按列清空项目的来源（第 5 列置空，第 6 列注释保留）。
 
 迁移期间状态面板把旧服务占着端口显示成「迁移中」，不算故障；监听属主既不是旧属主也不是新项目账号才算问题。
 

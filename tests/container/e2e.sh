@@ -211,6 +211,40 @@ sed -i '/^otheru\t/d' /srv/PROJECTS.tsv
 expect_fail "账号不存在且无登记行仍拒绝" "不是 srvproj 项目账号" rt delete ghostp
 expect_fail "外部服务名不能借 delete 清掉" "不是 srvproj 项目账号" rt delete orphsvc
 
+section "12c. 项目注释 note：第 6 列、幂等、校验与 JSON"
+expect_fail "非法项目名的无写入探测" "项目名" adm note __probe__ --clear
+grep -q '^__probe__' /srv/PROJECTS.tsv && bad "探测写入了登记表" || ok "探测未写表"
+expect_fail "未知项目退出码 2" "不存在" adm note nosuchp1 --clear
+expect_ok "set（argv 形态，中文）" adm note plainp "--set=运维备注：迁移自旧 nginx"
+grep -P '^plainp\t[^\t]*\t[^\t]*\t[^\t]*\t[^\t]*\t运维备注：迁移自旧 nginx$' /srv/PROJECTS.tsv >/dev/null && ok "第 6 列写入且前 5 列不变" || { bad "注释列"; grep plainp /srv/PROJECTS.tsv | cat -A; }
+expect_ok "同值 set 幂等" adm note plainp "--set=运维备注：迁移自旧 nginx"
+expect_ok "set（stdin 形态，emoji/空格）" bash -c "printf '%s' '备注 π 🎉' | /usr/local/sbin/srv-project note plainp --set=-"
+grep -q '备注 π 🎉' /srv/PROJECTS.tsv && ok "stdin 正文原样写入" || bad "stdin 注释"
+expect_ok "stdin 经 sudo 透传" bash -c "printf '%s' 'sudo stdin 备注' | runuser -u admin -- sudo -n /usr/local/sbin/srv-project note plainp --set=-"
+grep -q 'sudo stdin 备注' /srv/PROJECTS.tsv && ok "sudo 透传 stdin 写入" || bad "sudo stdin 注释"
+expect_fail "空 --set= 拒绝（清除只能 --clear）" "空白" adm note plainp --set=
+expect_fail "纯空白拒绝" "空白" adm note plainp "--set=   "
+expect_fail "超 200 码点拒绝" "200" bash -c "python3 -c \"print('字'*201,end='')\" | /usr/local/sbin/srv-project note plainp --set=-"
+out=$(printf $'secretX\there' | /usr/local/sbin/srv-project note plainp --set=- 2>&1) && bad "控制字符应被拒绝" || { grep -q 'secretX' <<<"$out" && bad "错误回显了正文" || ok "控制字符拒绝且错误不回显正文"; }
+grep -q 'sudo stdin 备注' /srv/PROJECTS.tsv && ok "失败的写不改表" || bad "注释被破坏"
+expect_ok "clear 回到 5 列" adm note plainp --clear
+awk -F'\t' '$1=="plainp"{exit !(NF==5 && $5=="")}' /srv/PROJECTS.tsv && ok "第 6 列已删、无尾随 tab" || { bad "clear 后的列"; grep plainp /srv/PROJECTS.tsv | cat -A; }
+expect_ok "clear 幂等" adm note plainp --clear
+rt status --json plainp | j "p=d['projects'][0]; assert p['note'] is None, p; print('   note =', p['note'])" && ok "status --json 空注释为 null" || bad "status note null"
+expect_ok "重新 set（供 JSON 核对）" adm note plainp --set=JSON可见
+rt status --json plainp | j "p=d['projects'][0]; assert p['note']=='JSON可见', p; print('   note =', p['note'])" && ok "status --json 展示注释" || bad "status note"
+rt list --json | j "p=[x for x in d['projects'] if x['name']=='plainp'][0]; assert p['note']=='JSON可见'; print('   list --json note =', p['note'])" && ok "list --json 展示注释" || bad "list --json note"
+rt list | grep -q 'JSON可见' && bad "人类 list 不应显示注释" || ok "人类 list 不显示注释"
+expect_ok "登记 ext4（可迁入）" adm external add ext4 --port 9703 --owner admin --migrate
+expect_ok "迁入 app4" adm create app4 --takeover ext4 --port 9703
+expect_ok "给迁入项目 set 注释" adm note app4 --set=迁移期间备注
+expect_ok "cancel-migration" adm external remove ext4 --cancel-migration
+awk -F'\t' '$1=="app4"{exit !($5=="" && $6=="迁移期间备注" && NF==6)}' /srv/PROJECTS.tsv && ok "取消迁移：来源按列清空、注释保留" || { bad "取消迁移保留注释"; grep app4 /srv/PROJECTS.tsv | cat -A; }
+rt status --json app4 | j "p=d['projects'][0]; assert p['note']=='迁移期间备注' and p['source'] is None, p; print('   source =', p['source'], '| note =', p['note'])" && ok "status：来源 null、注释保留" || bad "status 取消迁移"
+expect_ok "disable app4" rt disable app4
+expect_ok "delete app4（整行删除，注释不归档）" rt delete app4 --purge
+grep -q '^app4\t' /srv/PROJECTS.tsv && bad "delete 后仍有残留行" || ok "delete 删除整行（含注释）"
+
 section "13. 迁入模式的 tsv 兼容：list 与 usage"
 rt list | grep -E "newapp" | cut -c1-120
 rt 2>&1 | grep -q "set -euo" && bad "usage 泄漏了脚本代码" || ok "usage 只含头部注释"

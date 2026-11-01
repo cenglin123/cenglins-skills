@@ -40,6 +40,16 @@ class RegistryTests(unittest.TestCase):
     def test_short_row(self):
         self.assertEqual(panel.parse_registry("x\t3000\n")[0]["created"], "")
 
+    def test_parse_note_column(self):
+        """第 6 列 note：6 列行读出注释，旧 4/5 列行按空注释处理。"""
+        text = ("# 项目\t端口\t联系人\t创建时间\t来源\t注释\n"
+                "a\t3000\tc\tt\texternal:x\t备注A\n"
+                "b\t3001\t\tt\t\t\n"
+                "c\t3002\t\tt\n")
+        rows = panel.parse_registry(text)
+        self.assertEqual([r["note"] for r in rows], ["备注A", "", ""])
+        self.assertEqual([r["source"] for r in rows], ["external:x", "", ""])
+
 
 class KeyLineTests(unittest.TestCase):
     def test_with_from(self):
@@ -109,6 +119,31 @@ class UnitTests(unittest.TestCase):
         u = panel.parse_units(text)
         self.assertEqual(u[0]["active"], "active")
         self.assertEqual(u[1]["desc"], "D-Bus User Message Bus")
+
+
+class NoteValidationTests(unittest.TestCase):
+    """项目注释的统一校验谓词：非纯空白、≤200 码点、无控制字符；保存不 strip；错误不回显正文。"""
+
+    def test_ok(self):
+        self.assertIsNone(panel.note_problem("普通备注"))
+        self.assertIsNone(panel.note_problem("  保留首尾空格  "))          # 只校验非空白，不 strip
+        self.assertIsNone(panel.note_problem("中文 + 空格 + emoji 🎉🎉"))
+        self.assertIsNone(panel.note_problem("字" * 200))                  # 恰好 200 码点
+        self.assertIsNone(panel.note_problem("🎉" * 200))                  # 200 个 emoji（码点计数）
+        self.assertIsNone(panel.note_problem("-x"))                        # 以 - 开头的文本安全
+        self.assertIsNone(panel.note_problem("--clear"))
+        self.assertIsNone(panel.note_problem("--"))
+
+    def test_rejects(self):
+        for bad in ("", "   ", "\t", "\n", "a\rb", "a\x00b", "a\x1fb", "a\x7fb", "a\x85b",
+                    "a\u2028b", "a\u2029b", "字" * 201, "🎉" * 201, None):
+            self.assertIsNotNone(panel.note_problem(bad), repr(bad))
+
+    def test_error_does_not_echo_body(self):
+        for bad in ("秘密正文XYZ\x00", "秘密正文XYZ" + "字" * 300):
+            msg = panel.note_problem(bad)
+            self.assertNotIn("秘密正文XYZ", msg)
+            self.assertTrue(msg)
 
 
 class ValidationTests(unittest.TestCase):

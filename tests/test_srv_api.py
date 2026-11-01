@@ -17,7 +17,7 @@ panel = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(panel)
 
 # 计划 §5.1 的字段约定：只能增加，不能删减或改名
-LIST_FIELDS = {"name", "port", "contact", "created", "account_exists", "disabled", "keys"}
+LIST_FIELDS = {"name", "port", "contact", "created", "account_exists", "disabled", "keys", "note"}
 KEY_FIELDS = {"label", "fingerprint", "from"}
 STATUS_EXTRA = {"listening", "listen_owner", "services", "head", "disk_kb", "problems"}
 SERVICE_FIELDS = {"unit", "active", "sub"}
@@ -71,6 +71,13 @@ class ListRecordTests(unittest.TestCase):
     def test_missing_account(self):
         rec = panel.light_record(dict(ENTRY, port="oops"), False, True, [KEYLINE])
         self.assertEqual((rec["account_exists"], rec["disabled"], rec["keys"], rec["port"]), (False, False, [], None))
+        json.dumps(rec)
+
+    def test_note_field(self):
+        """list 记录带 note：没有注释为 null，有注释原样输出（保存不 strip）。"""
+        self.assertIsNone(panel.light_record(ENTRY, True, False, [])["note"])
+        rec = panel.light_record(dict(ENTRY, note="  保留空格 "), True, False, [])
+        self.assertEqual(rec["note"], "  保留空格 ")
         json.dumps(rec)
 
     def test_list_does_not_spawn_processes(self):
@@ -282,6 +289,24 @@ class ApiCliTests(unittest.TestCase):
         self.assertEqual(list(data), ["projects"])
         self.assertEqual(len(data["projects"]), 1)
         self.assertFalse(cp.call_args.kwargs.get("keys", True))
+
+
+    def test_note_options_are_mutually_exclusive_and_required(self):
+        """--set / --clear 互斥且必选：缺省或同给都是用法错误（argparse 退出码 2，与项目不存在同口径）。"""
+        for argv in (["note"], ["note", "demo"], ["note", "demo", "--set=x", "--clear"]):
+            with self.assertRaises(SystemExit) as cm:
+                self.run_cli(argv)
+            self.assertEqual(cm.exception.code, 2, argv)
+
+    def test_note_bad_project_name_exit_2(self):
+        """非法项目名在碰登记表之前就被拒（新版部署探测依赖这一点），退出码 2。"""
+        with patch.object(panel, "load_registry", return_value=list((ENTRY,))), \
+                patch.object(panel, "audit") as aud, \
+                patch.object(panel, "_read_registry_strict", side_effect=AssertionError("不应读登记表")):
+            rc, out, err = self.run_cli(["note", "__probe__", "--clear"])
+        self.assertEqual((rc, out), (2, ""))
+        self.assertIn("项目名不合法", err)
+        self.assertTrue(any(c.args[2] == {"project": "__probe__", "op": "clear"} and c.args[3] == 2 for c in aud.call_args_list))
 
 
 class InviteRevokeProjectTests(unittest.TestCase):

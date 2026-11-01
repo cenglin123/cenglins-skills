@@ -17,7 +17,8 @@
 #   invite  <项目> --label <标签> [--hours N] [--from X]   生成一次性设备邀请（需先装管理面板）
 #   invites <项目>                            列出该项目的邀请及状态
 #   invite-revoke <项目> <邀请编号>           作废该项目下待使用的邀请（编号不属于该项目则报找不到）
-#   list                                      人类可读的项目清单
+#   list                                      人类可读的项目清单（不含注释；注释只进 --json 与知识库后台）
+#   note <项目> --set=<文本> | --set=- | --clear   设置/清除项目注释（≤200 字符，单行）；--set=- 从 stdin 读正文，推荐
 #   JSON / 运维子命令（转调管理面板代码；失败时退出码非 0，原因写 stderr；项目不存在退出码 2）：
 #   list --json                               轻量：只读登记表、shadow、公钥文件
 #   status --json [<项目>]                    全量：监听、属主冲突、服务、git HEAD、磁盘、问题（指定项目时不含 global）
@@ -157,7 +158,7 @@ Match Group $GROUP
     X11Forwarding no
 EOF
     chmod 644 "$SSHD_DROPIN"
-    [ -f "$REGISTRY" ] || printf '# 项目\t端口\t联系人\t创建时间\t来源\n' >"$REGISTRY"
+    [ -f "$REGISTRY" ] || printf '# 项目\t端口\t联系人\t创建时间\t来源\t注释\n' >"$REGISTRY"
     chmod 644 "$REGISTRY"
     reload_sshd
     echo "已安装：组 $GROUP、$KEYS_DIR、$SSHD_DROPIN、$REGISTRY"
@@ -592,6 +593,24 @@ cmd_takeover_copy() {
     panel_api takeover-copy "$@"
 }
 
+# 注释：shell 只做参数透传与基本用法检查（校验、存在性、加锁与原子写都在面板代码里）。
+# 只认 --set=<文本> / --set=- / --clear 三种形态：= 形态消除以 - 开头文本的歧义，正文经 stdin 不进 argv / sudo 日志。
+cmd_note() {
+    local project=${1:-} arg set_opt=0 clear_opt=0
+    [ -n "$project" ] && [ $# -ge 2 ] || die "用法：note <项目> --set=<文本> | note <项目> --set=- | note <项目> --clear"
+    valid_name "$project"
+    need_installed
+    for arg in "${@:2}"; do
+        case $arg in
+            --set=*) set_opt=1 ;;
+            --clear) clear_opt=1 ;;
+            *) die "用法：note <项目> --set=<文本> | note <项目> --set=- | note <项目> --clear" ;;
+        esac
+    done
+    [ "$set_opt" -ne "$clear_opt" ] || die "--set=<文本> 与 --clear 必须二选一"
+    panel_api note "$@"
+}
+
 need_root "$@"
 case ${1:-} in
     install) shift; cmd_install "$@" ;;
@@ -613,5 +632,6 @@ case ${1:-} in
     svc) shift; cmd_svc "$@" ;;
     external) shift; cmd_external "$@" ;;
     takeover-copy) shift; cmd_takeover_copy "$@" ;;
+    note) shift; cmd_note "$@" ;;
     *) sed -n '2,/^set -euo pipefail$/{/^set -euo pipefail$/!p}' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac
