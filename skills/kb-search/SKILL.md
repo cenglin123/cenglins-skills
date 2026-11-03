@@ -31,7 +31,7 @@ description: >-
 
 - `q` 至少 2 个字符，单个字符返回 422；关键词只有一个字时先扩展（补字、换词）再查；
 - `limit` 最大 30，默认 10；
-- 返回 JSON `{total, results}`：`total` 是命中总数，`results` 是条目列表。
+- 返回 JSON `{total, results}`：`total` 是本次返回的条数（不超过 `limit`），不是命中总数；需要更多结果就把 `limit` 调大（最大 30）或换更精确的关键词。
 
 curl 示例（`{url}` 与 `<api_key>` 用第 1 步读到的实际值代入，不回显）：
 
