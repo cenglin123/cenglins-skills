@@ -158,6 +158,33 @@ python <SKILL_DIR>/scripts/safe_push.py enroll '<邀请>'
    - 应用的初始账号和密码，从服务器上读取：`ssh srv-<项目> 'grep INITIAL_ADMIN_PASSWORD ~/config/.env'`。只在对话里交给用户本人，不写进任何文件；
    - 提醒用户首次登录后在应用里改密码。
 
+### 用户单元沙箱模板
+
+第 6 步的单元由申请方 agent 自己写（`srv-project create` 不写单元），写的时候在 `[Service]` 段加上下面的沙箱指令。模板经 Ubuntu 22.04 / systemd 249 用户单元实测生效：
+
+```ini
+[Service]
+WorkingDirectory=%h/repo
+ExecStart=…
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryMax=1G
+TasksMax=64
+```
+
+`WorkingDirectory` 与 `ExecStart` 按项目实际值填写（同第 6 步的单元）；`MemoryMax`、`TasksMax` 的数值按项目的内存占用与并发量调整。
+
+支持矩阵要点（Ubuntu 22.04 / systemd 249 实测，以内核证据为准）：
+
+- **生效**：`NoNewPrivileges`（`/proc/<pid>/status` 中 `NoNewPrivs: 1`）、`RestrictSUIDSGID`、`RestrictAddressFamilies`（seccomp，配合 `NoNewPrivileges`）、`MemoryMax`/`TasksMax`（`app.slice/<单元>/memory.max`、`pids.max` 内核文件实测）。
+- **mount 类静默不生效**：`PrivateTmp`、`ProtectSystem`、`ReadWritePaths` 等 mount 类指令在 user manager 下不报错但也不生效（`/proc/<pid>/mountinfo` 与无沙箱对照完全一致）。不要往单元里加。
+- **加了会启动失败**：`ProtectKernelTunables` / `ProtectKernelModules` / `ProtectKernelControlGroups`、`ProtectClock`、`LockPersonality`、`RestrictRealtime` 在用户单元上启动即失败（status=218，`Failed at step CAPABILITIES`）。不要往单元里加。
+- **cgroup 前提**：`MemoryMax`/`TasksMax` 依赖用户 cgroup v2 delegation，无委托的发行版上这两项不生效。是否生效以内核证据（`/proc/<pid>/status`、`app.slice/<单元>/memory.max`）为准，不以指令是否写在单元里为准。
+- **边界**：要 mount 级的文件系统隔离，需要系统级 unit（`User=<项目>`，root 安装与启停）或容器，不在本技能范围。
+
+用户单元下真正可用的是三类：防提权（`NoNewPrivileges`）、seccomp 地址族限制（`RestrictAddressFamilies`）、cgroup 资源上限（`MemoryMax`/`TasksMax`）。
+
 ## 备用：不经面板的申请制
 
 面板不可用时（比如还没装、或者申请方连不上面板端口），走手工流程：
