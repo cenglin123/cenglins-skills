@@ -113,7 +113,6 @@ python scripts/update-readme.py --check
 | [`bilibili-comment-extractor`](skills/bilibili-comment-extractor/SKILL.md) | B 站视频评论批量抓取 |
 | [`crlf-guard`](skills/crlf-guard/SKILL.md) | CRLF Guard |
 | [`foxmail-grep`](skills/foxmail-grep/SKILL.md) | foxmail-grep |
-| [`kb-search`](skills/kb-search/SKILL.md) | 公司知识库检索（kb-search） |
 | [`powershell-guard`](skills/powershell-guard/SKILL.md) | PowerShell Guard |
 | [`push-to-server`](skills/push-to-server/SKILL.md) | Push To Server |
 | [`utf8-guard`](skills/utf8-guard/SKILL.md) | UTF-8 Guard |
