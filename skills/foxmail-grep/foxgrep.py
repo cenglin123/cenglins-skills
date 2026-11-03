@@ -806,6 +806,14 @@ def _temp_cache_find(m):
                 break
     return found
 
+
+def _temp_stats():
+    """渲染缓存现状（用于 extract 失败时的本机判定文案）: (Temp-* 目录数, Attach 子目录数)。"""
+    base = os.path.join(os.environ.get('APPDATA', ''), 'Foxmail7')
+    n_temp = len(glob.glob(os.path.join(glob.escape(base), 'Temp-*')))
+    n_att = len(glob.glob(os.path.join(glob.escape(base), 'Temp-*', 'Attach')))
+    return n_temp, n_att
+
 def _pop3_login():
     import poplib
     rec0 = os.path.join(default_account_root(), 'Accounts', 'Account.rec0')
@@ -1051,14 +1059,19 @@ def main():
                         a['_data'] = x['_data']
                 print('已从服务器取回邮件原文', file=sys.stderr)
         if all(a.get('_data') is None for a in m['attachments']):
+            n_temp, n_att_dir = _temp_stats()
             sys.exit('提取失败（四级兜底均未命中）:\n'
                      '  1) 语料库 .eml 副本: 无\n'
                      '  2) 按大小匹配语料库: 无\n'
-                     '  3) Foxmail 渲染缓存(Temp-*\\Attach): 未命中\n'
+                     '  3) Foxmail 渲染缓存: 本机 %d 个 Temp-* 目录、%d 个 Attach 子目录，未命中\n'
                      '  4) POP3 服务器: 未取到（账号若为收后即删，服务器通常为 0 封）\n'
-                     '说明: 本机邮件文件为加密存储，附件正文只能由 Foxmail 自身解密。\n'
-                     '出路: (a) Foxmail 中右键附件 -> 保存全部附件;\n'
-                     '      (b) 邮件列表多选 -> 右键导出邮件(.eml) -> 语料库模式 extract。')
+                     '判定: 本机邮件文件为加密存储，附件正文只能由 Foxmail 自身解密——\n'
+                     '      继续重试 extract 没有意义，一次失败即停。\n'
+                     '下一步: 按 refs/render-harvest-recipe.md「路径 A」批量导出 .eml\n'
+                     '      （可用 cua-driver 按元素 token 驱动 Foxmail 完成全部 7 步，无需人工），\n'
+                     '      .eml 落地后用 scripts/extract-eml-attachments.py 解附件；\n'
+                     '      单封可用路径 B（预览区右键「保存全部附件」）。'
+                     % (n_temp, n_att_dir))
         for a in m['attachments']:
             if a.get('_data') is None:
                 print(f"警告: 附件未取得: {a['name']}", file=sys.stderr)

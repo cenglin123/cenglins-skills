@@ -117,8 +117,10 @@ fg.cmd --v6 <Foxmail6根目录> grep <关键词>
 拒绝提取（防拿错别人的附件）；不加 `--strict` 时提取照常，但结果要人工核对。
 
 **加密存储库**：邮件文件全库加密时（新版常态），附件明文只能由 Foxmail 自身解密，
-四级兜底全空属预期，工具不破解（边界）。出路两条（详见 `refs/render-harvest-recipe.md`）：
+四级兜底全空属预期，工具不破解（边界）。**失败一次即停，不要反复重试 extract**，
+按决策树转出路（详见 `refs/render-harvest-recipe.md`，含 7 步可执行流程与 GUI 纪律）：
 
 - **路径 A（推荐，可批量）**：Foxmail 邮件列表多选 → 右键「导出邮件」(.eml) →
-  .eml 放进技能目录 `corpus\` → 默认模式 `extract`（一次 GUI，之后全 CLI）
+  .eml 放进技能目录 `corpus\` → 默认模式 `extract`（一次 GUI，之后全 CLI）；
+  GUI 操作可用 cua-driver 按元素 token 驱动完成（配方已实测，勿用坐标/SendKeys）
 - **路径 B（单封）**：预览区右键附件 → 「保存全部附件」
