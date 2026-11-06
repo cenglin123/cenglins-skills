@@ -69,7 +69,8 @@ node <SKILL_DIR>/scripts/extract-article.mjs --url "https://zhuanlan.zhihu.com/p
 **三条实测事实（2026-10，决定了它的实现方式）：**
 
 1. **HTML 层有 `zse-ck` 挑战**：纯 `fetch` / 无签名请求一律 403（挑战页）。因此必须走
-   stealth 浏览器；脚本自动找 Chrome/Edge（含 Edge 兜底），无浏览器时报错退出。
+   stealth 浏览器；脚本自动找 Chromium 内核浏览器（`CHROME_PATH` 环境变量 > Chrome > Edge 兜底，
+   **全部四个带浏览器的脚本统一此逻辑**），无浏览器时报错退出。
 2. **API 层帮不上忙**：`/api/v4/articles/<id>` 要求 `x-zse-96` 请求签名，未实现绕过
    （403 code 10003「请求参数异常」）；旧 `zhuanlan.zhihu.com/api/posts/<id>` 已 404。
 3. **匿名即可读公开文章，脚本不注入 Cookie**：登录墙 / 付费 / 仅关注者可见的文章

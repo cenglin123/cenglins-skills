@@ -16,12 +16,11 @@
  *   - Cookie 有效期约 6 个月，过期需重新获取
  */
 
-import { existsSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import {
   EXTERNAL_COOKIE, loadPuppeteer, ensureExternalHome, writeSecretFile, isZhihuDomain, stripCtrl,
-  resolveMaxWaitSeconds, waitForEnterOrExit,
+  resolveMaxWaitSeconds, waitForEnterOrExit, requireChromium,
 } from './lib/env.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -84,22 +83,6 @@ const NO_WAIT = ARGV.includes('--no-wait');
 // ═══════════════════════════════════════════════════════════════
 // ▲▲▲ 配置区结束 ▲▲▲
 // ═══════════════════════════════════════════════════════════════
-
-// 自动检测 Chrome 路径
-function findChrome() {
-  const candidates = [
-    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
-    process.env.LOCALAPPDATA + '\\Google\\Chrome\\Application\\chrome.exe',
-    '/usr/bin/google-chrome',
-    '/usr/bin/google-chrome-stable',
-    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-  ];
-  for (const p of candidates) {
-    if (existsSync(p)) return p;
-  }
-  throw new Error('未找到 Chrome，请手动指定 CHROME_PATH');
-}
 
 // CDP 获取所有 Cookie
 async function getCookiesFromCDP(page) {
@@ -176,7 +159,7 @@ async function main() {
   // 1. 启动浏览器
   console.log('[1/3] 启动浏览器...');
   const browser = await puppeteer.launch({
-    executablePath: findChrome(),
+    executablePath: requireChromium(),
     headless: false,
     defaultViewport: null,
     args: ['--no-first-run', '--disable-blink-features=AutomationControlled', '--lang=zh-CN', '--window-size=1280,900'],

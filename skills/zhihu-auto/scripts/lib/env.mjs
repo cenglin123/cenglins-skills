@@ -273,3 +273,46 @@ export function requireDepsOrExit() {
   console.error('   请先运行:  node "' + join(SCRIPTS_DIR, 'setup.mjs') + '"');
   process.exit(2);
 }
+
+/**
+ * 自动检测 Chromium 内核浏览器可执行文件（供 puppeteer 的 executablePath 用）。
+ * 优先级：CHROME_PATH 环境变量 > Chrome > Edge（Windows 下 Edge 系统自带，
+ * 纯 Edge 机器上不该因为「没装 Chrome」而失败——2026-11 实测发生过）。
+ * 找不到返回 null（不抛错），由调用方决定报错文案与退出方式。
+ */
+export function findChromium() {
+  const candidates = [
+    process.env.CHROME_PATH,
+    // Chrome（Windows）
+    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+    join(process.env.LOCALAPPDATA || '', 'Google\\Chrome\\Application\\chrome.exe'),
+    // Edge（Windows）
+    'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
+    'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+    join(process.env.LOCALAPPDATA || '', 'Microsoft\\Edge\\Application\\msedge.exe'),
+    // Linux
+    '/usr/bin/google-chrome',
+    '/usr/bin/google-chrome-stable',
+    '/usr/bin/chromium',
+    '/usr/bin/chromium-browser',
+    '/usr/bin/microsoft-edge',
+    '/snap/bin/chromium',
+    // macOS
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+  ];
+  for (const p of candidates) {
+    if (p && existsSync(p)) return p;
+  }
+  return null;
+}
+
+/** findChromium 的「找不到即抛错」版：统一错误文案，调用方不必各自处理 null。 */
+export function requireChromium() {
+  const exe = findChromium();
+  if (!exe) {
+    throw new Error('未找到 Chrome / Edge。请安装，或设置 CHROME_PATH 指向 Chromium 内核浏览器可执行文件。');
+  }
+  return exe;
+}

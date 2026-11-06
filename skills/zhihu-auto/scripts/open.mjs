@@ -13,7 +13,7 @@
 import { readFileSync, existsSync } from 'fs';
 import { resolve, dirname, join } from 'path';
 import { fileURLToPath } from 'url';
-import { resolveCookieFile, loadPuppeteer, EXTERNAL_HOME, parseNetscapeCookieText, isZhihuDomain, stripCtrl } from './lib/env.mjs';
+import { resolveCookieFile, loadPuppeteer, EXTERNAL_HOME, parseNetscapeCookieText, isZhihuDomain, stripCtrl, requireChromium } from './lib/env.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -29,22 +29,6 @@ const TARGET_URL = 'https://www.zhihu.com/question/XXXXXXXX';  // 目标页面 U
 
 const COOKIE_FILE = resolveCookieFile();
 const PROFILE_DIR = join(EXTERNAL_HOME, 'chrome-profile'); // 放 skill 之外，避免重装清空
-
-// 自动检测 Chrome 路径
-function findChrome() {
-  const candidates = [
-    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
-    process.env.LOCALAPPDATA + '\\Google\\Chrome\\Application\\chrome.exe',
-    '/usr/bin/google-chrome',
-    '/usr/bin/google-chrome-stable',
-    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-  ];
-  for (const p of candidates) {
-    if (existsSync(p)) return p;
-  }
-  throw new Error('未找到 Chrome，请手动指定 CHROME_PATH');
-}
 
 function parseCookieFile(path) {
   if (!existsSync(path)) {
@@ -63,7 +47,7 @@ async function main() {
 console.log(`加载 ${cookies.length} 个 Cookie`);
 
 const browser = await puppeteer.launch({
-  executablePath: findChrome(),
+  executablePath: requireChromium(),
   headless: false,
   defaultViewport: null,
   userDataDir: PROFILE_DIR,

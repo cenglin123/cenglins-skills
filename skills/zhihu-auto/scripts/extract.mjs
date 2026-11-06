@@ -19,7 +19,7 @@
 import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { resolveCookieFile, loadPuppeteer, parseNetscapeCookieText, isZhihuDomain, stripCtrl } from './lib/env.mjs';
+import { resolveCookieFile, loadPuppeteer, parseNetscapeCookieText, isZhihuDomain, stripCtrl, requireChromium } from './lib/env.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -129,21 +129,6 @@ const {
 const COOKIE_FILE = resolveCookieFile();
 
 // 自动检测 Chrome 路径
-function findChrome() {
-  const candidates = [
-    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
-    process.env.LOCALAPPDATA + '\\Google\\Chrome\\Application\\chrome.exe',
-    '/usr/bin/google-chrome',
-    '/usr/bin/google-chrome-stable',
-    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-  ];
-  for (const p of candidates) {
-    if (existsSync(p)) return p;
-  }
-  throw new Error('未找到 Chrome，请在脚本中手动指定 CHROME_PATH');
-}
-
 // ── Cookie 解析（Netscape 格式）──────────────────────────────
 function parseCookieFile(path) {
   if (!existsSync(path)) {
@@ -308,7 +293,7 @@ async function main() {
 
   const { puppeteer, StealthPlugin } = await loadPuppeteer();
   puppeteer.use(StealthPlugin());
-  const chromePath = findChrome();
+  const chromePath = requireChromium();
 
   // 1. 加载 Cookie
   const cookies = parseCookieFile(COOKIE_FILE);

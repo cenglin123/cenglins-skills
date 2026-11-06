@@ -25,23 +25,11 @@
 
 import { writeFileSync, existsSync } from 'fs';
 import { resolve } from 'path';
-import { loadPuppeteer, stripCtrl } from './lib/env.mjs';
+import { loadPuppeteer, stripCtrl, requireChromium } from './lib/env.mjs';
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
 
-// ── Chrome 自动检测（Chromium 内核均可；含 Edge 兜底）──
-function findChromium() {
-  const cands = [
-    process.env.LOCALAPPDATA + '\\Google\\Chrome\\Application\\chrome.exe',
-    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
-    process.env.LOCALAPPDATA + '\\Microsoft\\Edge\\Application\\msedge.exe',
-    'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
-    'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
-  ];
-  for (const c of cands) { try { if (c && existsSync(c)) return c; } catch { /* ignore */ } }
-  return null;
-}
+// ── Chrome 自动检测：统一走 lib/env.mjs 的 requireChromium()（CHROME_PATH > Chrome > Edge）──
 
 function printHelp() {
   console.log(`用法：node extract-article.mjs --url <专栏文章URL|文章id> [选项]
@@ -121,11 +109,7 @@ async function main() {
   const opts = parseArgs(process.argv.slice(2));
   if (opts.help) return printHelp();
 
-  const exe = findChromium();
-  if (!exe) {
-    console.error('❌ 未找到 Chrome / Edge。请安装，或设置 CHROME_PATH 指向 Chromium 内核浏览器可执行文件。');
-    process.exit(1);
-  }
+  const exe = requireChromium();
   console.log(`[1/4] 浏览器: ${exe}`);
   const { puppeteer, StealthPlugin } = await loadPuppeteer();
   puppeteer.use(StealthPlugin());
