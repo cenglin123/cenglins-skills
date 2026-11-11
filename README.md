@@ -117,6 +117,7 @@ python scripts/update-readme.py --check
 | [`push-to-server`](skills/push-to-server/SKILL.md) | Push To Server |
 | [`utf8-guard`](skills/utf8-guard/SKILL.md) | UTF-8 Guard |
 | [`video-to-srt`](skills/video-to-srt/SKILL.md) | 视频转字幕工作流 |
+| [`wechat-grep`](skills/wechat-grep/SKILL.md) | wechat-grep |
 | [`win-pup-forensics-cleanup`](skills/win-pup-forensics-cleanup/SKILL.md) | Windows 流氓软件取证与清理 |
 | [`winx-wt-takeover`](skills/winx-wt-takeover/SKILL.md) | Win+X → Windows Terminal 接管 / 控制台交接排障 |
 | [`zhihu-auto`](skills/zhihu-auto/SKILL.md) | 知乎自动化（zhihu-auto） |
