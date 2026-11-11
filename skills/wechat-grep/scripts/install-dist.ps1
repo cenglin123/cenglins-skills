@@ -1,4 +1,4 @@
-# install-dist.ps1 - wechat-grep 大件分发安装（bin/weflow.exe + models/ + wheels/）
+﻿# install-dist.ps1 - wechat-grep 大件分发安装（bin/weflow.exe + models/ + wheels/）
 # 触发: SKILL 部署时检测 bin\weflow.exe 缺失时运行; 也可手动执行。
 # 幂等: 已存在且可用时直接退出 0。
 # 来源: 优先 -ZipPath 本地包(内网离线携带)，否则从 GitHub Release 下载。
