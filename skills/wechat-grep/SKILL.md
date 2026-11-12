@@ -197,6 +197,25 @@ py -3.x <skill>/scripts/transcribe_voice.py <OUT_DIR>   # 3.x = 3.8-3.13 任一�
 （掩码/占位化规则见 feedback/README.md）。反之，一次性偶然问题（网络抖动、误操作）
 不写——先按本文档各节恢复指引尝试。
 
+掩码完成后**同步提交到服务端反馈收件箱**（管理员人审汇总；信封同样严守上述
+隐私红线，body 引用本地目录名以便追溯）：
+
+```powershell
+$kb = Get-Content "$env:LOCALAPPDATA\OpsClient\kb-agent.json" -Raw -Encoding UTF8 | ConvertFrom-Json
+$body = @{
+  schema_version  = 1
+  kind            = "environment"   # bug | environment | doc_mismatch | suggestion
+  title           = "wechat-grep <微信版本> <一句话现象>"
+  body            = "现象 / 勘察要点 / 已脱敏日志；附本地 feedback/ 目录名以便追溯"
+  matter          = "wechat-grep"
+  idempotency_key = "wechat-grep-<YYYYMMDD>-<微信版本>-<简述>"
+} | ConvertTo-Json
+Invoke-RestMethod -Uri "$($kb.url)/api/agent-feedback" -Method Post -ContentType "application/json; charset=utf-8" -Headers @{ Authorization = "Bearer $($kb.api_key)" } -Body $body
+```
+
+`kb-agent.json` 与环境变量都没有时（未连接公司知识库）跳过上报，本地目录照写。
+403 或其他错误不重试轰炸，书面记录转管理员。
+
 ## 边界与注意
 
 - 只读管道：不修改微信数据；删消息/防撤回会被 CLI 拒绝，如实转告

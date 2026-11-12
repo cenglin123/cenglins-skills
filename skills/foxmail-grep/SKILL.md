@@ -91,7 +91,25 @@ fg.cmd --v6 <Foxmail6根目录> grep <关键词>
 参考 `refs/research-methodology.md` 的研究方法勘察当前版本的数据结构
 （版本确认 → 目录勘察 → 魔数识别 → 数据优先/索引绕行 → 小样本验证 → 全量回归），
 按 `refs/research-report-template.md` 产出研究报告，连同 foxgrep.py 的 unified diff
-写入 `feedback/YYYYMMDD-<版本号>-<简述>/`（约定见 `feedback/README.md`）反馈上游维护者。
+写入 `feedback/YYYYMMDD-<版本号>-<简述>/`（约定见 `feedback/README.md`；本地目录保留作
+掩码工作区）。掩码完成后**同步提交到服务端反馈收件箱**（管理员人审汇总；密钥明文、
+邮件内容等隐私同样不入反馈信封）：
+
+```powershell
+$kb = Get-Content "$env:LOCALAPPDATA\OpsClient\kb-agent.json" -Raw -Encoding UTF8 | ConvertFrom-Json
+$body = @{
+  schema_version  = 1
+  kind            = "environment"   # bug | environment | doc_mismatch | suggestion
+  title           = "foxmail-grep <版本> <一句话现象>"
+  body            = "现象 / 勘察要点 / 已脱敏日志；附本地 feedback/ 目录名以便追溯"
+  matter          = "foxmail-grep"
+  idempotency_key = "foxmail-grep-<YYYYMMDD>-<版本号>-<简述>"
+} | ConvertTo-Json
+Invoke-RestMethod -Uri "$($kb.url)/api/agent-feedback" -Method Post -ContentType "application/json; charset=utf-8" -Headers @{ Authorization = "Bearer $($kb.api_key)" } -Body $body
+```
+
+`kb-agent.json` 与环境变量都没有时（未连接公司知识库）跳过上报，本地目录照写。
+403 或其他错误不重试轰炸，书面记录转管理员。
 研究原则：数据文件优先、索引最后考虑；先实证后假设；不破解加密、不写入用户数据。
 
 ## 边界
@@ -117,10 +135,8 @@ fg.cmd --v6 <Foxmail6根目录> grep <关键词>
 拒绝提取（防拿错别人的附件）；不加 `--strict` 时提取照常，但结果要人工核对。
 
 **加密存储库**：邮件文件全库加密时（新版常态），附件明文只能由 Foxmail 自身解密，
-四级兜底全空属预期，工具不破解（边界）。**失败一次即停，不要反复重试 extract**，
-按决策树转出路（详见 `refs/render-harvest-recipe.md`，含 7 步可执行流程与 GUI 纪律）：
+四级兜底全空属预期，工具不破解（边界）。出路两条（详见 `refs/render-harvest-recipe.md`）：
 
 - **路径 A（推荐，可批量）**：Foxmail 邮件列表多选 → 右键「导出邮件」(.eml) →
-  .eml 放进技能目录 `corpus\` → 默认模式 `extract`（一次 GUI，之后全 CLI）；
-  GUI 操作可用 cua-driver 按元素 token 驱动完成（配方已实测，勿用坐标/SendKeys）
+  .eml 放进技能目录 `corpus\` → 默认模式 `extract`（一次 GUI，之后全 CLI）
 - **路径 B（单封）**：预览区右键附件 → 「保存全部附件」
