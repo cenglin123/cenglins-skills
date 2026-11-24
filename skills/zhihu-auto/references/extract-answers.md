@@ -1,0 +1,123 @@
+# 分手册：抓取知乎问题回答（extract-answers）
+
+把某问题下的高赞回答抓成结构化 txt。走 **API 枚举 + puppeteer 渲染**（渲染页才能拿到完整正文/折叠内容）。
+
+## 头一次：获取 Cookie
+
+两种方式，都写到外部路径 `~/.zhihu-auto/www.zhihu.com_cookies.txt`（跨 skill 重装存活）：
+
+- **一键**：`node <SKILL_DIR>/scripts/get-cookie.mjs` → 打开浏览器 → 用户手动登录 → 自动导出。
+  - `--no-wait`：存好 Cookie 后**立即关闭浏览器退出**，不等 Enter。**agent / 无人值守场景必加**
+    （不加时脚本会等 Enter；stdin 若是管道或被关闭，最多 30 秒后也会自动关闭，不会挂住）。
+  - `--max-wait <秒>`（也接受 `--max-wait=秒`）：最长等待登录时间，>= 60，默认 300。
+    无效值会**报错退出（exit 2）而不静默回退默认**。等价环境变量：`ZHIHU_MAX_WAIT_MS`（毫秒）。
+  - `--help` 打印用法；未知参数同样 exit 2。
+- **手动**：登录 zhihu.com → 用 Cookie-Editor 等导出 Netscape 格式 → 存到上面那个路径（脚本也兼容 skill 内旧路径）。
+
+> ⚠️ Cookie 含 `z_c0` 登录凭证，任何拿到它的人都能以你身份访问知乎；别分享、别入库。有效期约 6 个月。
+
+## 抓取
+
+```powershell
+node <SKILL_DIR>/scripts/extract.mjs `
+  --url "https://www.zhihu.com/question/XXXXXXXX" `
+  --count 50 `
+  --output "<OUTPUT_FILE>"
+```
+
+- `--count` 默认 50；省略 `--output` 存到脚本目录；`--max-wait <秒>` 调最长加载时间（默认 180）。
+- 依赖缺失时**脚本会自愈**：自动从外部备份 `~/.zhihu-auto/deps/` 重建软链再继续（cc-switch 重装后无需手动处理）；仅当外部备份也没有时才跑 `node <SKILL_DIR>/scripts/setup.mjs`。
+
+## 加载机制（2026-09 经验，页面结构可能变）
+
+首屏只静态渲染前几条；更多回答靠「查看剩余 N 条回答」按钮加载。该按钮是 React pointer 事件，
+页内 `el.click()` 合成事件无效，脚本在 Node 侧用 `elementHandle.click()` 发**真实 CDP 鼠标事件**；
+点击后可能转无限滚动，脚本保留滚动兜底。停止条件：达目标数、加载到页面报告总数、出现「无更多」提示、
+滚动末端持续无新增、或**触发登录墙**。输出文件会记「停止原因/目标数量/本次抓取」——
+数量不足时**按停止原因判断**，别把「无新增」当抓取完成。
+
+## 输出格式（节选）
+
+```
+知乎问题：…
+URL: …
+话题: …
+关注者: … / 被浏览: … / N 个回答
+本次抓取: 50 条回答
+目标数量: 50 条回答
+停止原因: 达到目标数量 50
+编号说明: #N 是页面渲染顺序，不是 strat-sample 的 rid（rid 是赞数降序名次，每次重跑会重排）；aid 是回答唯一 id，可与 _census.json 的 rows[].id、_ledger.json 的 rows[].id、_comments.json 的 answers[].answer_id 对齐（值相同、字段名不同）。
+aid 覆盖: 50/50（未取到的行标 (aid=?)）
+================================================================================
+【回答 #1】作者 (aid=12345678901) (签名)
+赞同: 2520
+
+正文…
+```
+
+## 专栏文章（zhuanlan.zhihu.com/p/*）
+
+问题页脚本 `extract.mjs` **不支持**专栏文章 —— 解析器是问题页专用的。
+专栏文章用另一个脚本：
+
+```powershell
+node <SKILL_DIR>/scripts/extract-article.mjs --url "https://zhuanlan.zhihu.com/p/<id>" [--out <文件>] [--no-links] [--timeout <秒>] [--images]
+```
+
+`--url` 也接受纯数字 id；输出 txt = 元信息头 + 正文 + 外链附录 + 图片附录。
+
+**三条实测事实（2026-10，决定了它的实现方式）：**
+
+1. **HTML 层有 `zse-ck` 挑战**：纯 `fetch` / 无签名请求一律 403（挑战页）。因此必须走
+   stealth 浏览器；脚本自动找 Chromium 内核浏览器（`CHROME_PATH` 环境变量 > Chrome > Edge 兜底，
+   **全部四个带浏览器的脚本统一此逻辑**），无浏览器时报错退出。
+2. **API 层帮不上忙**：`/api/v4/articles/<id>` 要求 `x-zse-96` 请求签名，未实现绕过
+   （403 code 10003「请求参数异常」）；旧 `zhuanlan.zhihu.com/api/posts/<id>` 已 404。
+3. **匿名即可读公开文章，脚本不注入 Cookie**：登录墙 / 付费 / 仅关注者可见的文章
+   **明确不支持**（报错退出而非把登录态带进浏览器进程）。
+
+**LinkCard 要单独处理**：知乎外链卡片（如「项目仓库已开源：」后面那张卡）的 `<a>`
+**没有 innerText**，只取正文会丢掉最关键的链接。脚本会扫正文里的全部 `<a href>`、
+解码 `link.zhihu.com/?target=<urlencoded>` 还原真实目标，并过滤站内
+`topic/people/pin/question/zhida` 链接，附在输出末尾。
+
+**正文图片要留痕**：`innerText` 不含图片，脚本在每张图的位置写入 `[图 N]` 占位（表情图不计），
+文末「附录：正文图片」按编号列出原始尺寸与图片地址（取 `data-original` > `data-actualsrc` > `src`，
+后两者是页面显示版）。带 `--images` 时在同一浏览器会话里另开一页逐张取图（单张限时 30 秒），
+存到 `<输出文件名>_img/img-NN.<ext>`（扩展名取自响应的 Content-Type），重跑先清掉目录里的 `img-*`。
+单张失败只在附录该行标注「下载失败」，不影响其余图片，退出码不变。
+存库时按 `[图 N]` ↔ `img-NN` 对位，把占位换成嵌入或保留为占位。
+
+退出码：0 成功；1 被风控拦截 / 需登录 / 未取到正文；2 用法错误（未知参数、缺值同 exit 2）。
+
+## 想法（www.zhihu.com/pin/*）
+
+想法用另一个脚本，**比文章简单得多 —— 纯 fetch、零依赖、无浏览器**：
+
+```powershell
+node <SKILL_DIR>/scripts/extract-pin.mjs --url "https://www.zhihu.com/pin/<id>" [--out <文件>]
+```
+
+`--url` 也接受纯数字 id。**Cookie 可选**：存在则携带，缺失则匿名尝试（公开想法通常可读）。
+
+**与文章的关键差异（2026-10 实测）：`/api/v4/pins/<id>` 不要求 `x-zse-96` 签名**，
+带 Cookie 即 200 —— 和专栏文章 API（必须走 stealth 浏览器）正好相反。
+知乎的签名策略是按端点粒度的，不是全局。
+
+**三条已知边界：**
+
+1. `content` 是**数组**（text / link / image 混排），不是单段 HTML；本脚本按类型拼接。
+2. **图片里的文字不可得**：想法常配截图（恰是作者想强调的部分），输出里只有 `[图]` 占位 ——
+   需要截图内容时得另行 OCR，或让用户直接看图。
+3. 转发类想法带 `source_pin_id`，输出会注明；`is_deleted` 的想法报错退出。
+
+退出码：0 成功；1 已删除 / 需登录 / 被风控 / 未取到内容；2 用法错误。
+
+## 常见问题
+
+| 现象 | 原因 | 解决 |
+|---|---|---|
+| 返回 40362 / 重定向登录页 | Cookie 过期或失效 | 重跑 `get-cookie.mjs`（注意 `z_c0` 纸面未过期也可能被吊销） |
+| 停止原因=触发登录墙 | 会话被服务端吊销（问题页匿名可看，但展开更多回答时强制登录） | 看页面右上角是否「登录/注册」；重跑 `get-cookie.mjs` |
+| 数量不够 | 总数不足 / 登录墙 / 折叠 / 超时 / 结构变化 | 看输出「停止原因」；必要时加大 `--max-wait` |
+| `Cannot find package 'puppeteer-extra'` | 依赖被重装清空（软链没了） | **脚本会自动自愈**（从 `~/.zhihu-auto/deps/` 重建软链）；若仍失败（外部备份也没了）再跑 `node <SKILL_DIR>/scripts/setup.mjs` |

@@ -1,0 +1,122 @@
+{
+  "schemaVersion": 1,
+  "caseId": "<case-id>",
+  "computer": "<computer-name>",
+  "userSid": "S-1-5-21-111111111-222222222-333333333-1001",
+  "pupPattern": "VendorExample",
+  "allowedRoots": [
+    "%ProgramFiles%",
+    "%APPDATA%",
+    "%LOCALAPPDATA%",
+    "%ProgramData%",
+    "%USERPROFILE%\\Desktop"
+  ],
+  "paths": [
+    {
+      "path": "%ProgramFiles%\\VendorExample",
+      "kind": "directory"
+    },
+    {
+      "path": "%USERPROFILE%\\Desktop\\VendorExample.lnk",
+      "kind": "shortcut",
+      "expectedTarget": "C:\\Program Files\\VendorExample\\app.exe --from=desk"
+    }
+  ],
+  "registryKeys": [
+    "HKCU:\\SOFTWARE\\VendorExample"
+  ],
+  "registryValues": [
+    {
+      "key": "HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
+      "name": "VendorExample",
+      "expectedData": "\"C:\\Program Files\\VendorExample\\app.exe\" /autorun"
+    }
+  ],
+  "services": [
+    {
+      "name": "VendorExampleGuard",
+      "expectedPath": "C:\\Windows\\SysWOW64\\svchost.exe -k VendorExampleGp"
+    }
+  ],
+  "drivers": [
+    {
+      "name": "VendorExampleProtect",
+      "expectedPath": "C:\\Program Files\\VendorExample\\Protect.sys"
+    }
+  ],
+  "tasks": [
+    {
+      "path": "\\",
+      "name": "VendorExampleTask",
+      "expectedActions": "C:\\Program Files\\VendorExample\\app.exe /autorun"
+    }
+  ],
+  "processes": [
+    {
+      "path": "%ProgramFiles%\\VendorExample\\app.exe"
+    }
+  ],
+  "svchostGroups": [
+    {
+      "name": "VendorExampleGp",
+      "expectedMembers": [
+        "VendorExampleGuard"
+      ]
+    }
+  ],
+  "manualChecks": [
+    {
+      "name": "browser-policies-extensions",
+      "status": "SKIP",
+      "evidence": "",
+      "reviewedAt": "",
+      "phase": "final",
+      "contextId": "<new-review-batch-id>"
+    },
+    {
+      "name": "shell-com-bho",
+      "status": "SKIP",
+      "evidence": "",
+      "reviewedAt": "",
+      "phase": "final",
+      "contextId": "<new-review-batch-id>"
+    },
+    {
+      "name": "injection-wmi-winsock",
+      "status": "SKIP",
+      "evidence": "",
+      "reviewedAt": "",
+      "phase": "final",
+      "contextId": "<new-review-batch-id>"
+    },
+    {
+      "name": "other-user-profiles",
+      "status": "SKIP",
+      "evidence": "",
+      "reviewedAt": "",
+      "phase": "final",
+      "contextId": "<new-review-batch-id>"
+    },
+    {
+      "name": "post-reboot-observation",
+      "status": "SKIP",
+      "evidence": "",
+      "reviewedAt": "",
+      "phase": "final",
+      "contextId": "<new-review-batch-id>"
+    },
+    {
+      "name": "preserved-software",
+      "status": "SKIP",
+      "evidence": "",
+      "reviewedAt": "",
+      "phase": "final",
+      "contextId": "<new-review-batch-id>"
+    }
+  ],
+  "reviewContext": {
+    "id": "<new-review-batch-id>",
+    "phase": "final",
+    "notBefore": "<ISO-8601-time-with-offset>"
+  }
+}

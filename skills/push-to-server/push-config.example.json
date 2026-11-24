@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "server": {
+    "host": "your-server.example.com",
+    "user": "deploy",
+    "port": 22,
+    "remote_repo_dir": "/srv/your-app",
+    "ssh_key_path": null
+  },
+  "runtime_paths": [
+    ".env",
+    "backend/data/",
+    "uploads/"
+  ],
+  "post_sync_script": "scripts/update_server.sh",
+  "health_checks": [
+    "scripts/health_check.sh"
+  ],
+  "backup_retention": 5,
+  "expected_branch": "main"
+}

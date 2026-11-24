@@ -1,0 +1,4 @@
+scripts/node_modules/
+scripts/www.bilibili.com_cookies.txt
+scripts/.chrome-profile/
+*.txt

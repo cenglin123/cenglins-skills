@@ -1,0 +1,6 @@
+bin/
+models/
+wheels/
+wechat-grep-dist.zip
+__pycache__/
+*.pyc
