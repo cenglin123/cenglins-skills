@@ -1,5 +1,13 @@
 # 更新日志
 
+## 2026-11-26 · 1.0.7（证据来源补强）
+
+- 来源：同日的 Kingsoft/猎豹残留案卷（Windows 7、PowerShell 2.0、仅 WinRM）。
+- `references/known-threats.md` 新增「常见证据来源」：推装时间线（临时/下载目录安装包的 ProductName、签名主体与文件修改时间；lite 采集器只给路径/大小/时间）、弹窗投放（厂商弹窗追踪目录中的素材/截图）、主页/搜索（用户级与机器级三处注册表、SearchScopes 覆盖范围与渠道号）。补一条 `fltmc` 只列已加载 minifilter 的判读说明。
+- `references/case-history.md` 的 2026-11-26 案例补三类可复用证据：主页三处写入与「360搜索」项、`PopWndTrackerLog` 弹窗横幅图与 `%TEMP%` 三个奇虎签名安装包的推装时间线、`KNBDrv` 注册为过滤驱动但当时未加载的残留形态。
+- `SKILL.md` 的识别线索入口与 lite 采集覆盖说明同步细化。
+- 未改脚本，`tests/run-tests.ps1` 不受影响。
+
 ## 2026-11-26 · 1.0.6（独立审计修正）
 
 - 来源：两个独立上下文的整体审计（含 `openai/gpt-6.2-sol`）对 1.0.5 的 12 项阻断/若干非阻断；同日 Kingsoft 毒霸/卫士残留案卷（Windows 7、PowerShell 2.0、仅 WinRM）暴露的处置与复核缺口。规则来源随案例记入 `references/case-history.md`。

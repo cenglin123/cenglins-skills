@@ -77,6 +77,12 @@ E05：§10.5 记载 NStore 随后下载了腾讯签名的正版 WeMeet 安装文
 
 本案还确认：PowerShell 2.0 目标不能用完整采集器（`Get-CimInstance`、`Get-ScheduledTask`、`ConvertTo-Json`、`Get-FileHash` 均不可用），改用 WMI、任务 XML 与单文本输出；WinRM 会话里 `Shell.Application` 压缩会挂起，备份按文件取回并在分析机计算哈希；`robocopy` 退出码 1 表示已复制；`sc delete` 删除驱动后注册键可能仍在，需要补删。
 
+本案的三类证据可直接复用（方法与判据复用，路径与名称按本机证据替换）：
+
+- **主页/搜索**：IE `Start Page` 在 HKCU、HKLM 与 `HKLM\SOFTWARE\Wow6432Node` 三处均为 `https://hao.360.com/?a1004`，另有「360搜索」SearchScope（`so.com`）；默认搜索仍是百度，只看默认项会漏。
+- **弹窗投放**：`C:\ProgramData\360sd\PopWndTrackerLog` 留有 2026-11-19、2026-11-20 的两张弹窗横幅图（300×59，文件名标注「biz_helper-右下角弹窗」），说明组件当时仍在生成弹窗素材；`%TEMP%` 里 2026-10-16 / 10-30 / 11-12 三个奇虎签名安装包（产品名取自安装包副本的 VersionInfo：360AI图片、360壁纸 服务组件、小程序中心 服务组件）串起推装时间线。
+- **驱动残留**：`KNBDrv` 注册为 `FSFilter Anti-Virus`、四个驱动文件同在 `system32\drivers`；`fltmc filters` 只列系统自带的 `luafv` 与 `FileInfo`，WMI 状态为 `Stopped`，即当时未加载。
+
 ## 沉淀到技能的经验
 
 优先还原下载链和多渠道时间线；采集系统宿主服务及驱动，不能按系统目录排除；持久化既有服务/驱动，也有任务、COM、菜单、浏览器和推广快捷方式。清单必须从现场证据生成，自保护处置、重启和卸载顺序按实际状态选择，最终结论依赖清理后的范围复核。

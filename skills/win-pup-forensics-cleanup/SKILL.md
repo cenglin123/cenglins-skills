@@ -25,7 +25,7 @@ compatibility: Windows 10/11；64 位 Windows PowerShell 5.1 或 PowerShell 7；
 - 不自动重启。执行结果若需要重启，先保存状态，让用户安排重启。
 - 加载本机和项目适用规则。采集浏览器记录、其他用户配置前核对权限及范围；不自动上传样本或全量历史。
 
-脚本运行前读 [安全与执行要点](references/pitfalls.md)；编制清单时读 [清单格式与操作方法](references/plan-format.md)。识别本例相关家族时按需读 [识别线索](references/known-threats.md) 和 [案例经过](references/case-history.md)。
+脚本运行前读 [安全与执行要点](references/pitfalls.md)；编制清单时读 [清单格式与操作方法](references/plan-format.md)。识别本例相关家族，或补充证据来源（近期安装包、弹窗日志、主页/搜索）时，按需读 [识别线索](references/known-threats.md) 和 [案例经过](references/case-history.md)。
 
 目标机只有 WinRM、且 PowerShell 低于 5.1 时，见本文件「仅 WinRM / PowerShell 2.0」一节；完整采集器不能在该环境运行。
 
@@ -148,7 +148,7 @@ OutDir 必须尚不存在，防止覆盖证据（-Resume 时除外）。首次�
 
 1. 经远程工具把 `scripts/collect-lite-ps2.ps1` 作为单个脚本发送执行（纯 ASCII，不依赖 `$PSScriptRoot`，不写 JSON）；默认输出 `%TEMP%\collect-lite.txt`，可用 `-OutFile` 指定。输出文件已存在时拒绝执行，需换新路径或显式 `-Force`。
 2. 用同一通道取回该文件，在分析机计算 SHA256 并归档。不要把目标机 `certutil` 的输出当作可靠哈希，也不要用 `Shell.Application` 打包（WinRM 会话会挂起）。
-3. 脚本为只读，覆盖身份、卸载项、服务、驱动、Run/RunOnce、计划任务 XML、IE 主页/搜索、BHO、安全中心、代理、近期临时安装器、Prefetch、启动目录、hosts 与 fltmc。浏览器配置、其他用户配置单元与注入面仍需手工补证。
+3. 脚本为只读，覆盖身份、卸载项、服务、驱动、Run/RunOnce、计划任务 XML、IE 主页（HKCU、HKLM、Wow6432Node 三处）与 HKCU/HKLM 的 SearchScopes（32 位视图的 SearchScopes 需手工补）、BHO、安全中心、代理、近期临时安装器（仅路径/大小/修改时间，产品名与签名需另查）、Prefetch、启动目录、hosts 与 fltmc。浏览器配置、其他用户配置单元与注入面仍需手工补证。
 4. 状态看文本内的 `#` 行：`# SECTION ERROR` / `# SECTION ERRORS` / `# fltmc ... exit N` 表示该段或该命令不可读/不可用，不能当作“没有”。该脚本不做续采、不产出哈希清单，每次执行生成新文件。
 
 PowerShell 2.0 替代：`Get-CimInstance`→`Get-WmiObject`；`Get-ScheduledTask`→解析 `System32\Tasks` 下的任务 XML；`ConvertTo-Json`→逐行文本；`Get-FileHash`→取回后在分析机计算。
