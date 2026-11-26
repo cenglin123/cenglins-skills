@@ -1,5 +1,25 @@
 # 更新日志
 
+## 2026-11-26 · 1.0.6（独立审计修正）
+
+- 来源：两个独立上下文的整体审计（含 `openai/gpt-6.2-sol`）对 1.0.5 的 12 项阻断/若干非阻断；同日 Kingsoft 毒霸/卫士残留案卷（Windows 7、PowerShell 2.0、仅 WinRM）暴露的处置与复核缺口。规则来源随案例记入 `references/case-history.md`。
+- 处置归属：`cleanup-residue.ps1` 增加任务、自启值与进程处理，固定顺序为任务 → 自启值 → 进程 → 目录与文件 → 注册表键，跳过硬保护阶段不再漏项目；`unprotect.ps1` 的任务处置改用 `common.ps1` 的共享函数，XML 为空/不可解析/无 `Task` 元素时阻止注销。
+- 安全边界：`Assert-SafeTarget` 拒绝任何已列出的 allowedRoots 根（含嵌套根）作为目标；`registryValues.name` 为 `null` 时拒绝清单（空串才表示默认值）。
+- 重启后删除：删除异常先记为候选，只有 `PendingFileRenameOperations` 写入并读回核验成功后才记 PENDING 并请求重启；登记失败逐项记 ERROR。
+- 复核：新增全部运行中服务/驱动的孤儿检查（注册键、原始 ImagePath、还原后的文件，svchost 宿主再核对 ServiceDll），缺键或文件缺失记 FAIL，无法解析记 ERROR；文档明确自动检查与发现扫描的覆盖差异。
+- 持久化：`File.Replace` 的备份参数在 PowerShell 5.1 传 `$null` 会绑定失败，改用 `[NullString]::Value`；状态/哈希/证据写入显式检查返回值，失败时该段 ERROR 且不写 DONE；`reg export` 额外校验 `.reg` 头，任务 XML 要求 `Task` 元素且有主体。
+- 降级采集：`collect-lite-ps2.ps1` 默认拒绝覆盖已有输出（`-Force` 才覆盖），达到行数上限仍写出 TRUNCATED/结束行，`fltmc` 非零退出与各段静默错误写入 `# SECTION ERRORS`，写文件失败时不再打印 saved。
+- 采集完整性：产物哈希失败时不写 DONE 并退出 1；状态、哈希、DONE 按序原子写入（DONE 最后）；`-Resume` 绑定计算机、用户 SID、完整参数集与保留文件哈希，任一不符拒绝；Prefetch/BAM/ShimCache/SRUDB/DNS 的预算命中记 PARTIAL；fltmc 失败记 itemErrors；`collection-status.json` 增加 `parameters` 与 `hashErrors`。
+- 新增 `scripts/collect-lite-ps2.ps1`：PowerShell 2.0 兼容的只读降级采集（WMI、任务 XML、单文本输出），供仅 WinRM 的目标使用。
+- 文档：清理案例日期与单机细节移入 `case-history.md`；备份范围改为“注册表/任务自动导出，目录与文件只记清单”；浏览器主页/搜索改为按变更前证据恢复；补充状态与退出码契约、baseline/final 两轮清单流程、备份保管与准删条件、示例 `expectedPath` 使用原始 ImagePath。
+- 回归：`tests/run-tests.ps1` 75 例在 Windows PowerShell 5.1.19041.7802 通过；新增嵌套根、任务独立处置、任务 XML 无效、PENDING 登记失败、孤儿服务、续采身份/参数/哈希、示例清单可加载等用例。
+
+## 2026-11-26 · 1.0.5（执行要点补强）
+
+- `references/pitfalls.md` 环境与编码：新增「解析采集结果要用字面量分隔符、不用 `awk -F` 带转义写法」；「用脚本改别的文件时按字面量匹配并断言命中」；「类型转换与成员访问要显式加括号」；「目标机为 PowerShell 2.0 时的 cmdlet 替代与 `ps @文件` 约束」；「WinRM 会话里 `Shell.Application` 压缩会挂起」
+- `references/pitfalls.md` 取证与结论：新增「复核脚本里的键名/路径/服务名必须取自本次采集结果」「报不存在要用独立信号交叉核对」「驱动与服务路径需先还原 `\??\`、`\SystemRoot\` 与启动参数再判断」
+- `SKILL.md` 新增「维护约定」节：规范态写作、内容落位、规则须有可指认来源、脚本改动跑回归、准则/流程改动派独立子代理按八项复核
+
 ## 2026-11-17 · 1.0.4（复核修正 R1）
 
 - R1：`collection-status.json` 的 `resumeSkipped` 原用 `$( … )` 包装，空数组被拆包（PowerShell 5.1 序列化为 `{}`、7 为 `null`）。改为先构造局部 `[string[]]` 再赋值，与 `itemErrors` 同一写法；补断言——非续采运行时 `resumeSkipped` 必须是空数组，续采时须按列表序列化

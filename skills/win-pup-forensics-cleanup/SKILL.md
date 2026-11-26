@@ -14,7 +14,7 @@ compatibility: Windows 10/11；64 位 Windows PowerShell 5.1 或 PowerShell 7；
 | --- | --- |
 | 分析来源、是否可疑 | 只读取证、复盘和取证报告，完成后结束 |
 | 根据现有材料写报告 | 阅读材料，标注缺口，不自动采集或清理本机 |
-| 排查并清理 | 取证 → 确认处置清单 → 按条件拆自保护 → 按序处置（任务 → 目录与注册表键 → 主页/搜索恢复 → 卸载）→ 复核 → 报告 |
+| 排查并清理 | 取证 → 确认处置清单 → 按需拆自保护（服务/驱动/Svchost）→ 任务 → 自启值 → 停止进程 → 目录与文件 → 注册表键 → 主页/搜索恢复 → 卸载 → 复核 → 报告 |
 | 普通卸载，无自保护或回装证据 | 取证留档 → 正规卸载 → 残留检查和复核 |
 | 已拆保护且等待重启，或重启后续办 | 读取案件状态与执行结果，核对当前机器、用户、目标后继续 |
 
@@ -26,6 +26,8 @@ compatibility: Windows 10/11；64 位 Windows PowerShell 5.1 或 PowerShell 7；
 - 加载本机和项目适用规则。采集浏览器记录、其他用户配置前核对权限及范围；不自动上传样本或全量历史。
 
 脚本运行前读 [安全与执行要点](references/pitfalls.md)；编制清单时读 [清单格式与操作方法](references/plan-format.md)。识别本例相关家族时按需读 [识别线索](references/known-threats.md) 和 [案例经过](references/case-history.md)。
+
+目标机只有 WinRM、且 PowerShell 低于 5.1 时，见本文件「仅 WinRM / PowerShell 2.0」一节；完整采集器不能在该环境运行。
 
 登录/启动缓慢、周期调用系统工具或资源堆积时按需读 [性能与资源取证](references/performance-forensics.md)。通用方法可复用，未完成验证的归因链或软件关联不收录为技能案例。
 
@@ -42,7 +44,7 @@ compatibility: Windows 10/11；64 位 Windows PowerShell 5.1 或 PowerShell 7；
 
 OutDir 必须尚不存在，防止覆盖证据（-Resume 时除外）。首次发现不带案例特征，采集全量目录时间、服务和驱动，其他类别有下表所述限制。建议在目标用户身份下提权，不能用另一管理员的 HKCU 和 APPDATA 代替目标用户。
 
-每个类别采集完立即落盘：`collection-status.json` 与 `evidence-hashes.json` 逐段更新，全部完成写 `collection-done.json`（DONE 标记）。进程被中断（如被安全软件结束）后用 `-Resume` 继续：已完成类别跳过，失败类别重新采集（旧文件保留为 `*.prev-<时间>`，执行痕迹的 raw 产物同样处理；备份失败时拒绝覆盖并另存 `*.unpreserved-<时间>`）；已有 DONE 标记的目录拒绝续采，必须换新目录。
+每个类别采集完立即落盘：`collection-status.json` 与 `evidence-hashes.json` 先写临时文件再替换，状态与哈希都成功后才写 `collection-done.json`（DONE 标记，最后写）。任一产物哈希失败时不写 DONE，退出码按采集错误处理。进程被中断（如被安全软件结束）后用 `-Resume` 继续：续采只接受同一计算机、同一用户 SID、同一参数集（含正则、预算、可选路径）与同一目录，并按 `evidence-hashes.json` 逐个核对保留文件；任一不符拒绝续采。已完成类别跳过，失败类别重新采集（旧文件保留为 `*.prev-<时间>`，执行痕迹的 raw 产物同样处理；备份失败时拒绝覆盖并另存 `*.unpreserved-<时间>`）；已有 DONE 标记的目录拒绝续采，必须换新目录。
 
 | 文件 | 采集范围与限制 |
 | --- | --- |
@@ -59,10 +61,10 @@ OutDir 必须尚不存在，防止覆盖证据（-Resume 时除外）。首次�
 | 11–14 可选证据文件 | 临时目录规模、系统工具调用者日志、显式配置调度/域名字段、目录创建时间桶；默认关闭，参数与限制见性能取证方法 |
 | 15-execution-artifacts.txt | Prefetch 文件列表与时间、ShimCache 原始值（预算内保留 raw + SHA256）、BAM 逐用户执行记录（FILETIME 解码）、SRUDB.dat（-MaxSruBytes 内复制，-SkipSruDatabase 关闭；受保护路径不可读按单项记录） |
 | 16-security-status.txt | SecurityCenter2 全部 AntiVirusProduct、WinDefend 服务与 Defender 策略值/排除项、MpPreference（模块不可用时按单项记录） |
-| collection-status.json | 采集身份、环境、时间、参数、各类别错误及覆盖限制 |
-| evidence-hashes.json | 本次输出文件的 SHA256 清单；不等于外部原始证据已全部归档 |
+| collection-status.json | 采集身份、环境、时间、完整参数集（`parameters`）、各类别状态/错误/覆盖限制、`hashErrors` 与 `complete` |
+| evidence-hashes.json | 本次证据文件的 SHA256 清单（不含 collection-status.json、collection-done.json 与哈希文件自身）；不等于外部原始证据已全部归档 |
 
-采集退出码 0 表示已启用类别在声明范围内无已记录错误/截断，1 表示采集错误，2 表示预算截断或非提权范围不完整。状态分别记录未启用、无命中、完成、部分和错误；默认关闭的可选模块不单独导致退出码 2。PowerShell 错误和 DNS 原生命令非零退出码均进入对应类别错误，先处理错误，不能把空结果当成没有驻留。单项缺陷（属性缺失、受保护注册表不可读、fltmc 未提权）写入该类别 `itemErrors` 与证据中的 `# ITEM ERROR` 行，不把整段判为 ERROR；整段错误仍按采集错误处理。
+采集退出码：0 = 已启用类别在声明范围内无错误/截断；1 = 采集错误（含任一产物哈希失败或状态写入失败）；2 = 预算截断（PARTIAL）、非提权，或脚本内可判断的前置拒绝（OutDir 已存在、正则无效、续采身份/参数/哈希不符）。DONE 只表示执行到收尾，不代表结果干净，DONE 目录内仍可能有 ERROR/PARTIAL。状态分别记录未启用、无命中、完成、部分和错误；预算命中（记录数、字节数、raw 未保留）标记 PARTIAL，默认关闭的可选模块不单独导致退出码 2。PowerShell 错误和 DNS 原生命令非零退出码均进入对应类别错误，先处理错误，不能把空结果当成没有驻留。单项缺陷（属性缺失、受保护注册表不可读、fltmc 未提权）写入该类别 `itemErrors` 与证据中的 `# ITEM ERROR` 行，不把整段判为 ERROR；逐项防御已覆盖服务、驱动、执行痕迹与安全状态；01/07/08 等直接枚举类别中不可读的项会使该段 ERROR，需按错误处理后重采。整段错误仍按采集错误处理。
 
 手工补查按线索选择：
 - 浏览器历史与下载链、实际文件及签名、推广日志与配置。数据库正在使用时采用一致性快照；仅复制单个 SQLite 主文件可能遗漏 WAL 数据。
@@ -84,43 +86,47 @@ OutDir 必须尚不存在，防止覆盖证据（-Resume 时除外）。首次�
 
 按 references/plan-format.md 生成 schemaVersion=1 的 plan.json，绑定计算机、目标用户 SID，填写精确服务/驱动名称、原始 ImagePath、任务动作、注册表键或值、进程路径、文件/目录/快捷方式和允许根目录。WOW6432Node 视图前缀会剥离后检查共享分支，Policies、Clients 等共享区域不能整树删除；其已确认恶意配置使用精确值处置或单独评审的恢复流程。
 
-仅填已证实且获准处置的目标。明确保留项与共享依赖，写入案件状态文件。运行 -DryRun，把日志和计划 SHA256 呈现给用户。正式执行使用同一份文件和 -ApprovedPlanHash；清单修改后重新预览与核对授权。旧版 PupPattern/GuardNames/residue.json 接口不再用于破坏性脚本。
+仅填已证实且获准处置的目标。明确保留项与共享依赖，写入案件状态文件。运行 -DryRun，把日志和计划 SHA256 呈现给用户。正式执行使用同一份文件和 -ApprovedPlanHash；清单修改后重新预览与核对授权。破坏性脚本只接受本清单格式（schemaVersion=1）；PupPattern、GuardNames、residue.json 只是历史接口名，不是执行入口。
 
 ## 4. 按条件拆自保护、重启与卸载
 
 确有保护驱动、守护拉活或回装证据时，先运行 unprotect.ps1；只有普通程序时跳过。
 
-清单内处置项按固定顺序执行：先注销计划任务（导出 XML 备份），再删目录与注册表键（每项先备份并写“备份文件 ↔ 目标”索引），主页/搜索等恢复原值的操作单独手工完成（脚本不碰，见第 5 节），卸载程序放在最后。卸载器通常只删自己登记的文件，先卸载反而丢失可比对的现场；卸载器缺失时按下段处理。
+清单内处置项按固定顺序执行：先注销计划任务（导出 XML 备份），再停用/删除服务与驱动，删除自启值，停止进程，然后删目录与文件，最后删注册表键；主页/搜索等恢复原值的操作单独手工完成（脚本不碰，见第 5 节），卸载程序放在最后。卸载器通常只删自己登记的文件，先卸载反而丢失可比对的现场；卸载器缺失时按下段处理。
 
-脚本对清单服务/驱动先备份、检查 ImagePath，再停用、停止并删除注册；对 Svchost 检查成员，删除对应组值；任务先导出 XML；注册表值先导出所属键。任何备份失败会阻止对应修改。失败目标记录 ERROR，必须处理后再推进相关目标。
+两个脚本的分工与重叠：`unprotect.ps1` 负责服务、驱动、Svchost 组、任务、自启值和进程；`cleanup-residue.ps1` 同样处理任务、自启值、进程（目标已清时记 Already absent），因此跳过硬保护阶段时不会漏掉持久化项。先跑 `unprotect.ps1`、再跑 `cleanup-residue.ps1` 时两步都会执行；只有普通程序时可只跑 `cleanup-residue.ps1`。
+
+自动备份范围：服务/驱动注册键、任务（XML）、注册表键与注册表值在修改前导出，并写入“备份文件 ↔ 目标”索引，导出为空或不可解析时阻止对应修改。目录与文件不自动备份，删除前只把路径/大小/时间写入本次运行的 `deletion-inventory.txt`；需保留的数据必须事先另行复制。文件删除没有撤销。
+
+服务/驱动先备份、核对注册表原始 ImagePath，再停用、停止并删除注册；Svchost 先核对全部成员都在本次服务清单且已停用，再删除对应组值；任务导出 XML 并确认可解析后才注销。失败目标记录 ERROR，必须处理后再推进相关目标。
 
 退出码 2 或 results.json 的 rebootRequired=true 表示需重启/继续处置，不能当成清理完成。保存 case-state.md 后让用户重启；回来后核对目标驱动/服务状态再卸载。StartMode 不能单独决定驱动能否在线卸载，重启必要性以实际状态和结果为准。
 
 优先使用正规卸载入口。只有卸载失败或残留明确时考虑强制卸载工具；下载工具前告知用户，校验来源和签名。对未知来源卸载器先核实身份，不盲目运行。
 
-卸载器缺失或指向失效时，先确认 UninstallString 与 QuietUninstallString 指向的文件是否还在；不在则按“文件清单 + 签名 + SHA256 + 注册表备份”留证后手工清除，不强行寻找绿色卸载入口（11-17：影视大全 unins000.exe 已缺失，留证后手工清除）。
+卸载器缺失或指向失效时，先确认 UninstallString 与 QuietUninstallString 指向的文件是否还在；不在则按“文件清单 + 签名 + SHA256 + 注册表备份”留证后手工清除，不强行寻找绿色卸载入口。
 
 ## 5. 清残留
 
-用同一清单运行 cleanup-residue.ps1。所有删除路径必须是 allowedRoots 的严格子路径；拒绝盘符、用户/程序/数据根目录、Windows 目录及祖先路径，拒绝重解析点。目录先检查树，再按叶子到父目录删除。
+用同一清单运行 cleanup-residue.ps1。执行顺序为任务 → 自启值 → 进程 → 目录与文件 → 注册表键；所有删除路径必须是 allowedRoots 的严格子路径，任一列出的根（含嵌套根）本身都不能是目标；拒绝盘符、用户/程序/数据根目录、Windows 目录及祖先路径，拒绝重解析点。目录先检查树，再按叶子到父目录删除。
 
 快捷方式必须列出精确路径及期望目标。COM/BHO/外壳等残留用精确叶键或值表达，不按购物/AI 名称自动删除。对系统已有组件的覆盖式劫持，先判断应恢复原值还是移除用户覆盖，不盲删系统类。
 
-主页与搜索恢复单独手工执行：先导出 HKCU/HKLM 的 Main、SearchScopes 及 32/64 位两视图，再改值；主页恢复为 about:blank，删除推广 SearchScope 并把 DefaultScope 指回 Bing。脚本不修改浏览器配置。
+主页与搜索恢复单独手工执行：先导出 HKCU/HKLM 的 Main、SearchScopes 及 32/64 位两视图，记录变更前的实际值和生效范围（浏览器、用户配置单元、企业策略），再把值改回变更前的原值并删除推广项。原值不可得时记录缺口并由用户确认替代值，不能把 about:blank 或 Bing 当作通用默认值；策略来自域或管理端时先确认来源，不直接改用户值。脚本不修改浏览器配置。
 
-默认将删不掉的文件记为错误，不推断原因。只有确认来源且重启后删除获准时使用 -ScheduleLockedFiles；脚本备份原 PendingFileRenameOperations、保留其他已有操作、写入后核验。PENDING 必须重启后复核消失。文件删除不提供自动恢复；重要数据先另行备份。
+默认将删不掉的文件记为错误，不推断原因。只有确认来源且重启后删除获准时使用 -ScheduleLockedFiles；脚本备份原 PendingFileRenameOperations、保留其他已有操作、写入后核验。只有核验通过的文件才记 PENDING 并请求重启；登记失败记为 ERROR。PENDING 必须重启后复核消失。文件删除不提供自动恢复；重要数据先另行备份。
 
 ## 6. 复核与恢复状态
 
-处置前运行 verify-clean.ps1 -Config '<case>\plan.json' -CaseDir '<case>' -Phase baseline；最终重启后用 -Phase final，作为基线与最终结果。核对精确目标，同时运行本机候选正则发现扫描。
+处置前运行 verify-clean.ps1 -Config '<case>\plan.json' -CaseDir '<case>' -Phase baseline；最终重启后用 -Phase final，作为基线与最终结果。自动检查覆盖清单内精确目标，并枚举全部运行中的服务/驱动核对注册键、原始 ImagePath 与可执行文件（缺失即残留，无法解析即 ERROR）；有 pupPattern 时另做发现扫描，按卸载项、目录、进程、任务、服务与启动值匹配名称/路径，不解析每个运行对象的注册与文件。没有 pupPattern 时发现扫描记 SKIP，复核退出码至少为 2（存在 FAIL/ERROR 时为 1）；发现扫描的命中是候选，仍需按案件证据判断。
 
-复核要覆盖“孤儿驱动/僵尸服务”形态：服务状态为 Running 而 \CurrentControlSet\Services 下已无对应注册键（11-06：360 卸载后 6 个驱动仍运行、注册键缺失）。按运行状态枚举服务与驱动后逐一核对注册键、ImagePath 与文件，缺键或路径失效都按残留处理，不能因注册表查不到就判定干净。
+复核要覆盖“孤儿驱动/僵尸服务”形态：服务状态为 Running 而 \CurrentControlSet\Services 下已无对应注册键，或注册仍在但 ImagePath 指向的文件已不存在。按运行状态枚举服务与驱动后逐一核对注册键、ImagePath 与文件，缺键或路径失效都按残留处理，不能因注册表查不到就判定干净。
 
 状态：PASS 已核验；FAIL 有残留；ERROR 查询/权限/执行失败；SKIP 未覆盖或缺少手工证据；PENDING 等待重启。处置/复核退出码 0 表示该阶段无错误和待办，1 表示 FAIL/ERROR，2 表示 SKIP/PENDING/待重启。
 
-浏览器、COM/BHO、注入/WMI/WinSock、其他用户、重启后的回装观察和保留软件功能检查需要手工证据，写入 manualChecks。每个 PASS/FAIL 必须绑定当前 reviewContext.id 和 phase，带有效的 reviewedAt 及案件内非空证据文件。reviewContext.notBefore 表示本轮复核开始时间，基线与最终复核使用不同批次；外部卸载和最后重启完成后才建立 final 批次。
+浏览器、COM/BHO、注入/WMI/WinSock、其他用户、重启后的回装观察和保留软件功能检查需要手工证据，写入 manualChecks。每个手工复核的 PASS/FAIL 必须绑定当前 reviewContext.id 和 phase，带有效的 reviewedAt 及案件内非空证据文件；自动检查的 PASS 只证明该查询在声明范围内未命中，不覆盖上述手工面。reviewContext.notBefore 表示本轮复核开始时间，基线与最终复核使用不同批次；外部卸载和最后重启完成后才建立 final 批次。
 
-脚本在修改系统前及处置阶段结束时保存 last-mutation.json，最终复核只接受晚于该记录和本轮起点的手工记录。旧阶段、旧批次、无效/未来时间、缺失文件都显示 SKIP。文件存在与时间校验不代替内容审阅。更新复核记录后如需再次清理，重新预览变更后的计划哈希。
+脚本在修改系统前及处置阶段结束时保存 last-mutation.json；存在该记录时，最终复核只接受不早于它和本轮起点的手工记录。记录缺失说明本案件没有经过脚本处置，需在 case-state.md 说明手工卸载/外部工具过程，否则不得以 final PASS 收尾。旧阶段、旧批次、无效/未来时间、缺失文件都显示 SKIP。文件存在与时间校验不代替内容审阅。更新复核记录后如需再次清理，重新预览变更后的计划哈希。
 
 重启前在 case-state.md 保存：当前阶段、计划路径及哈希、目标身份、已确认授权范围、已执行结果目录、错误/待办、重启原因、下一步、保留软件。复核记录引用当前阶段证据，不能把清理前的 PASS 自动沿用到清理后。
 
@@ -136,13 +142,32 @@ OutDir 必须尚不存在，防止覆盖证据（-Resume 时除外）。首次�
 - 每条关键结论引用证据，主文以连贯段落为主，软件清单与前后对照可用表格。
 - 用户需要 Word 时使用当前可用的 Word/文档生成技能；指定公文模板技能存在时优先遵循。缺失时用可用替代技能并遵循其渲染验证流程，不依赖某一私有 Node/MSI 套件。
 
+## 仅 WinRM / PowerShell 2.0
+
+完整采集器要求 64 位 PowerShell 5.1+（使用 `Get-CimInstance`、`Get-ScheduledTask`、`ConvertTo-Json`、`Get-FileHash`）。目标机只有 WinRM 且是 PowerShell 2.0 时：
+
+1. 经远程工具把 `scripts/collect-lite-ps2.ps1` 作为单个脚本发送执行（纯 ASCII，不依赖 `$PSScriptRoot`，不写 JSON）；默认输出 `%TEMP%\collect-lite.txt`，可用 `-OutFile` 指定。输出文件已存在时拒绝执行，需换新路径或显式 `-Force`。
+2. 用同一通道取回该文件，在分析机计算 SHA256 并归档。不要把目标机 `certutil` 的输出当作可靠哈希，也不要用 `Shell.Application` 打包（WinRM 会话会挂起）。
+3. 脚本为只读，覆盖身份、卸载项、服务、驱动、Run/RunOnce、计划任务 XML、IE 主页/搜索、BHO、安全中心、代理、近期临时安装器、Prefetch、启动目录、hosts 与 fltmc。浏览器配置、其他用户配置单元与注入面仍需手工补证。
+4. 状态看文本内的 `#` 行：`# SECTION ERROR` / `# SECTION ERRORS` / `# fltmc ... exit N` 表示该段或该命令不可读/不可用，不能当作“没有”。该脚本不做续采、不产出哈希清单，每次执行生成新文件。
+
+PowerShell 2.0 替代：`Get-CimInstance`→`Get-WmiObject`；`Get-ScheduledTask`→解析 `System32\Tasks` 下的任务 XML；`ConvertTo-Json`→逐行文本；`Get-FileHash`→取回后在分析机计算。
+
+## 维护约定
+
+- 本文件与 `references/` 正文保持规范态：只写现行规则与做法，不写改动经过、日期标记或旧做法；变更原因记 `CHANGELOG.md`。
+- 落位：阶段与方法在本文件；执行安全规则在 [安全与执行要点](references/pitfalls.md)；清单格式在 [清单格式](references/plan-format.md)；识别线索在 [识别线索](references/known-threats.md)；性能取证在 [性能取证](references/performance-forensics.md)；案例分析在 [案例经过](references/case-history.md)。
+- 新增或修改规则必须来自可指认的事件（评审记录、案件记录或用户指令）；写不出来源的规则不入册。
+- 改脚本后运行 `tests/run-tests.ps1`；改准则、流程或增删规则后，派独立上下文的子代理按「结构 / 引用 / 收录标准 / 一致性 / 规范外问题 / 判断项 / 非回归 / 冷启动」八项复核，问题当次修正再提交。
+
 ## 文件入口
 
-scripts/collect-forensics.ps1：只读取证。
+scripts/collect-forensics.ps1：只读取证（PowerShell 5.1+，64 位）。
+scripts/collect-lite-ps2.ps1：PowerShell 2.0 兼容的只读降级采集（单文本输出）。
 scripts/unprotect.ps1：按清单拆自保护。
 scripts/cleanup-residue.ps1：按清单清残留。
 scripts/verify-clean.ps1：按清单和证据复核。
 scripts/common.ps1：清单、路径、备份、身份与结果辅助。
 scripts/bounded-probes.ps1 / bounded-worker.ps1：受限只读目录、哈希与文本采集。
 references/plan.example.json：占位化的清单示例，不能直接在本机执行。
-tests/run-tests.ps1：仅使用临时夹具与模拟系统接口的回归检查。
+tests/run-tests.ps1：回归检查。以临时夹具和模拟系统接口为主；个别用例只读枚举本机计划任务，或以无效参数运行采集器入口，均不修改系统状态。

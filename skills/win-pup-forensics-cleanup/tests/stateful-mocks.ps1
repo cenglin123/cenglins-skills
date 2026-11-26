@@ -79,7 +79,7 @@ function reg.exe {
     if ($key -in @($global:PupMockState.failBackup)) {
         Save-MockState "backup-fail:$key"; $global:LASTEXITCODE=5; return 'Simulated denied'
     }
-    [IO.File]::WriteAllText($file,'Fixture registry export only')
+    [IO.File]::WriteAllText($file, "Windows Registry Editor Version 5.00`r`n`r`n[HKEY_FIXTURE]`r`n")
     Save-MockState "backup:$key"
     $global:LASTEXITCODE=0
     return 'Exported fixture'
@@ -127,6 +127,7 @@ function Export-ScheduledTask {
     param([string]$TaskPath,[string]$TaskName)
     Save-MockState "task-export:$TaskName"
     if($global:PupMockState.failTaskExport){ throw 'Simulated task export failure' }
+    if($global:PupMockState.badTaskExport){ return 'not xml <' }
     return '<Task><Actions><Exec><Command>fixture.exe</Command></Exec></Actions></Task>'
 }
 function Unregister-ScheduledTask {

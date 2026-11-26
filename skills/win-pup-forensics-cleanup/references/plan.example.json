@@ -35,7 +35,7 @@
   "services": [
     {
       "name": "VendorExampleGuard",
-      "expectedPath": "C:\\Windows\\SysWOW64\\svchost.exe -k VendorExampleGp"
+      "expectedPath": "%SystemRoot%\\SysWOW64\\svchost.exe -k VendorExampleGp"
     }
   ],
   "drivers": [

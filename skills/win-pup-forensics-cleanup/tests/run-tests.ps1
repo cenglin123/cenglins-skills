@@ -33,6 +33,10 @@ Test-Case 'literal-path-boundary-and-normalization' {
     Reject { Assert-SafeTarget (Join-Path $run 'allowed-other\Vendor') @($allowed) }
     Reject { Assert-SafeTarget (Join-Path $allowed '..\outside') @($allowed) }
     Reject { Assert-SafeTarget $allowed @($allowed) }
+    # A nested allowed root is still a root: neither it nor its parent may be a target.
+    $nested=Join-Path $allowed 'nested-root'; [void](New-Item -ItemType Directory $nested)
+    Reject { Assert-SafeTarget $nested @($allowed,$nested) }
+    Assert ((Assert-SafeTarget (Join-Path $nested 'child') @($allowed,$nested)) -eq (Join-Path $nested 'child')) 'Descendant of nested root rejected'
     Reject { Assert-SafeTarget '%UNDEFINED_TEST_ENV_945%\Vendor' @($allowed) }
     Reject { Assert-SafeTarget (Join-Path $allowed 'Vendor. \child') @($allowed) }
     Reject { Assert-SafeTarget (Join-Path $allowed 'Vendor:stream') @($allowed) }
@@ -60,6 +64,18 @@ Test-Case 'registry-containers-rejected-leaves-supported' {
     Assert-RegKey 'HKCU:\SOFTWARE\Classes\CLSID\{0002DF01-0000-0000-C000-000000000046}\LocalServer32'
     Assert-RegKey 'HKCU:\SOFTWARE\Classes\WOW6432Node\CLSID\{0002DF01-0000-0000-C000-000000000046}\LocalServer32'
     Assert-RegKey 'HKLM:\SOFTWARE\Classes\*\shell\VendorAction'
+}
+Test-Case 'plan-example-is-loadable' {
+    $example=Join-Path $source 'references/plan.example.json'
+    $plan=Read-Plan $example
+    Assert ($plan.schemaVersion -eq 1 -and $plan.caseId) 'Example plan does not load'
+    Reject {
+        $bad=Join-Path $run 'null-value-name.json'
+        $copy=$plan|ConvertTo-Json -Depth 12|ConvertFrom-Json
+        $copy.registryValues=@([pscustomobject]@{key='HKCU:\SOFTWARE\FixtureNull';name=$null;expectedData='x'})
+        [IO.File]::WriteAllText($bad,($copy|ConvertTo-Json -Depth 12),[Text.Encoding]::UTF8)
+        Read-Plan $bad | Out-Null
+    }
 }
 Test-Case 'same-timestamp-directory-evidence-retained' {
     $items=@([pscustomobject]@{FullName='A';CreationTime=[datetime]'2026-10-08'},[pscustomobject]@{FullName='B';CreationTime=[datetime]'2026-10-08'})
@@ -152,6 +168,9 @@ function Get-CimInstance {
     if($env:PUP_TEST_SCENARIO -eq 'loaded-driver' -and $ClassName -eq 'Win32_SystemDriver') {
         return [pscustomobject]@{Name='FixtureProtect';State='Running';DisplayName='Fixture';PathName='C:\Fixture\guard.sys'}
     }
+    if($env:PUP_TEST_SCENARIO -eq 'orphan-service' -and $ClassName -eq 'Win32_Service') {
+        return [pscustomobject]@{Name='FixtureOrphan';State='Running';DisplayName='Fixture';PathName='C:\Fixture\orphan.exe'}
+    }
     return @()
 }
 function Get-ScheduledTask { return @() }
@@ -223,7 +242,7 @@ Test-Case 'missing-evidence-or-wrong-context-is-skip' {
 }
 Test-Case 'review-before-last-mutation-is-skip' {
     $plan=Make-Plan
-    $marker=[pscustomobject]@{caseId=$plan.caseId;computer=$plan.computer;userSid=$plan.userSid;updatedAt=[DateTimeOffset]::UtcNow.ToString('o')}
+    $marker=[pscustomobject]@{caseId=$plan.caseId;computer=$plan.computer;userSid=$plan.userSid;updatedAt=[DateTimeOffset]::UtcNow.AddMinutes(2).ToString('o')}
     [IO.File]::WriteAllText((Join-Path $run 'last-mutation.json'),($marker|ConvertTo-Json))
     Assert ((Run-Fixture $plan 'verify-clean.ps1' 'stale-mutation') -eq 2) 'Pre-mutation review accepted'
 }
@@ -235,6 +254,9 @@ Test-Case 'verification-existing-target-is-fail' {
 Test-Case 'deleted-registration-but-loaded-driver-is-fail' {
     $plan=Make-Plan; $plan.drivers=@([pscustomobject]@{name='FixtureProtect';expectedPath='C:\Fixture\guard.sys'})
     Assert ((Run-Fixture $plan 'verify-clean.ps1' 'loaded-driver') -eq 1) 'Loaded driver missed after registration deletion'
+}
+Test-Case 'orphan-running-service-without-registration-is-fail' {
+    Assert ((Run-Fixture (Make-Plan) 'verify-clean.ps1' 'orphan-service') -eq 1) 'Orphan service outside the plan missed'
 }
 Test-Case 'changed-plan-hash-blocks-execution' {
     Assert ((Run-Fixture (Make-Plan) 'unprotect.ps1' 'bad-hash' @('-ApprovedPlanHash','invalid')) -eq 1) 'Hash mismatch accepted'
@@ -292,7 +314,7 @@ foreach ($name in @('common.ps1','unprotect.ps1','cleanup-residue.ps1','verify-c
 }
 [IO.File]::AppendAllText((Join-Path $stateToolDir 'common.ps1'), "`r`n"+[IO.File]::ReadAllText((Join-Path $PSScriptRoot 'stateful-mocks.ps1')),[Text.Encoding]::ASCII)
 function New-State {
-    return [pscustomobject]@{events=@();failBackup=@();failSc='';failTaskExport=$false;dropPendingWrite=$false;lockedFiles=@();processes=@();
+    return [pscustomobject]@{events=@();failBackup=@();failSc='';failTaskExport=$false;badTaskExport=$false;dropPendingWrite=$false;lockedFiles=@();processes=@();
         registry=@(
             [pscustomobject]@{path='HKLM:\SYSTEM\CurrentControlSet\Services\FixtureGuard';values=@(
                 [pscustomobject]@{name='ImagePath';data='C:\Fixture\guard.exe'},[pscustomobject]@{name='Start';data=2})},
@@ -367,6 +389,21 @@ Test-Case 'task-export-failure-blocks-deletion' {
     $result=Run-Stateful $plan $state 'unprotect.ps1' 'task-failure'
     Assert ($result.code -eq 1 -and @($result.state.tasks).Count -eq 1) 'Task deleted without XML backup'
 }
+Test-Case 'unparsable-task-xml-blocks-deletion' {
+    $plan=Make-Plan; $state=New-State; $state.badTaskExport=$true
+    $plan.tasks=@([pscustomobject]@{path='\';name='FixtureTask';expectedActions='fixture.exe /autorun'})
+    $result=Run-Stateful $plan $state 'cleanup-residue.ps1' 'task-bad-xml'
+    Assert ($result.code -eq 1 -and @($result.state.tasks).Count -eq 1) 'Task deleted with unparsable XML'
+    Assert ('task-delete:FixtureTask' -notin @($result.state.events)) 'Deletion reached after bad XML'
+}
+Test-Case 'cleanup-handles-tasks-without-unprotect' {
+    $plan=Make-Plan; $state=New-State
+    $plan.tasks=@([pscustomobject]@{path='\';name='FixtureTask';expectedActions='fixture.exe /autorun'})
+    $result=Run-Stateful $plan $state 'cleanup-residue.ps1' 'cleanup-task-only'
+    Assert ($result.code -eq 0 -and @($result.state.tasks).Count -eq 0) $result.output
+    Assert (($result.state.events -join '|') -eq 'task-export:FixtureTask|task-delete:FixtureTask') 'Cleanup did not remove the task first'
+    Assert (@($result.summary.results | Where-Object target -like 'task:*').Count -eq 1) 'Task outcome missing from results'
+}
 Test-Case 'registry-key-backup-precedes-successful-delete' {
     $plan=Make-Plan; $state=New-State; $plan.registryKeys=@('HKCU:\SOFTWARE\FixtureProduct')
     $result=Run-Stateful $plan $state 'cleanup-residue.ps1' 'key-success'
@@ -421,6 +458,8 @@ Test-Case 'pending-write-mismatch-is-error' {
     $plan.paths=@([pscustomobject]@{path=$path;kind='file'})
     $result=Run-Stateful $plan $state 'cleanup-residue.ps1' 'pending-mismatch' @('-ScheduleLockedFiles')
     Assert ($result.code -eq 1 -and $result.output.Contains('Pending rename write verification failed')) 'Pending mismatch missed'
+    Assert (@($result.summary.results | Where-Object status -eq 'PENDING').Count -eq 0) 'Unregistered deletion reported as PENDING'
+    Assert (@($result.summary.results | Where-Object status -eq 'ERROR').Count -eq 1) 'Failed registration not reported as ERROR'
 }
 [IO.File]::WriteAllText((Join-Path $run 'test-results.json'),(@($results.ToArray())|ConvertTo-Json -Depth 6),[Text.Encoding]::UTF8)
 Write-Host "Test results: $run"

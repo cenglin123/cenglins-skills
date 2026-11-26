@@ -17,6 +17,9 @@ try {
     Write-Host "Plan SHA256: $hash"
 } catch { Write-Error $_; exit 1 }
 $reboot = $false
+foreach ($entry in @(Get-Field $plan 'tasks' @())) {
+    Invoke-Checked "task:$($entry.path)$($entry.name)" { Remove-PlannedTask $entry $DryRun }
+}
 foreach ($entry in @(Get-Field $plan 'services' @()) + @(Get-Field $plan 'drivers' @())) {
     Invoke-Checked "service/driver:$($entry.name)" {
         $key = "HKLM:\SYSTEM\CurrentControlSet\Services\$($entry.name)"
@@ -52,22 +55,6 @@ foreach ($entry in @(Get-Field $plan 'svchostGroups' @())) {
         Mark-Mutation
         Remove-ItemProperty -LiteralPath $key -Name $entry.name
         if ($entry.name -in (Get-Item -LiteralPath $key).GetValueNames()) { throw 'Svchost value remains' }
-    }
-}
-foreach ($entry in @(Get-Field $plan 'tasks' @())) {
-    Invoke-Checked "task:$($entry.path)$($entry.name)" {
-        $task = @(Get-ScheduledTask | Where-Object { $_.TaskPath -eq $entry.path -and $_.TaskName -eq $entry.name })
-        if (-not $task.Count) { Write-Host 'Already absent'; return }
-        $actions = ($task[0].Actions | ForEach-Object { "$($_.Execute) $($_.Arguments)" }) -join ' ; '
-        if ($actions -cne $entry.expectedActions) { throw "Task actions changed: $actions" }
-        if ($DryRun) { Write-Host "[would] remove task $actions"; return }
-        $xml = Export-ScheduledTask -TaskPath $entry.path -TaskName $entry.name
-        $file = Join-Path $script:RunDir ('task-' + [guid]::NewGuid().ToString('N') + '.xml')
-        [IO.File]::WriteAllText($file, $xml, [Text.Encoding]::Unicode)
-        [IO.File]::AppendAllText((Join-Path $script:RunDir 'backup-index.txt'), "$file`t$($entry.path)$($entry.name)`r`n", [Text.Encoding]::UTF8)
-        Mark-Mutation
-        Unregister-ScheduledTask -TaskPath $entry.path -TaskName $entry.name -Confirm:$false
-        if (@(Get-ScheduledTask | Where-Object { $_.TaskPath -eq $entry.path -and $_.TaskName -eq $entry.name }).Count) { throw 'Task remains' }
     }
 }
 foreach ($entry in @(Get-Field $plan 'registryValues' @())) {

@@ -39,7 +39,10 @@ function Assert-SafeTarget([string]$Path, [string[]]$AllowedRoots) {
     if (Test-Within $full (Resolve-TargetPath $env:SystemRoot)) { throw "Windows directory forbidden: $full" }
     $allowed = $false
     foreach ($root in $AllowedRoots) {
-        if (Test-Within $full (Resolve-TargetPath $root)) { $allowed = $true }
+        $rootFull = Resolve-TargetPath $root
+        # Nested roots must not let a listed root itself become a deletion target.
+        if ($full -eq $rootFull) { throw "Allowed root itself cannot be deleted: $full" }
+        if (Test-Within $full $rootFull) { $allowed = $true }
     }
     if (-not $allowed) { throw "Outside allowedRoots (must be a strict descendant): $full" }
     # Check existing ancestors without following junctions/symlinks.
@@ -127,7 +130,7 @@ function Read-Plan([string]$Path) {
         $key = Get-Field $entry 'key' ''
         if ($key -notmatch '^(HKLM|HKCU):\\SOFTWARE\\.+|^Registry::HKEY_USERS\\S-1-5-21-[\d-]+\\SOFTWARE\\.+') { throw "Invalid value key: $key" }
         if ($key -match '[*?]' -or $key -match '(^|\\)\.\.?($|\\)') { throw "Invalid value key: $key" }
-        if (-not $entry.PSObject.Properties['name']) { throw 'Registry value name required (empty means default)' }
+        if (-not $entry.PSObject.Properties['name'] -or $null -eq $entry.name) { throw 'Registry value name required (empty string means the default value)' }
         if (-not $entry.PSObject.Properties['expectedData']) { throw 'Registry expectedData required' }
     }
     foreach ($entry in @(Get-Field $plan 'services' @()) + @(Get-Field $plan 'drivers' @())) {
@@ -210,6 +213,69 @@ function Stop-PlannedProcess($Entry, [bool]$Preview) {
     }
 }
 
+function Get-BinaryPath([string]$Command) {
+    # Expand a raw ImagePath/PathName into the executable path; no existence check.
+    if ([string]::IsNullOrWhiteSpace($Command) -or $Command -eq '(absent)') { return '' }
+    $p = [Environment]::ExpandEnvironmentVariables($Command.Trim())
+    if ($p -match '^"([^"]+)"') { $p = $matches[1] }
+    elseif ($p -match '^(.+?\.(exe|sys|dll))(\s|$)') { $p = $matches[1] }
+    $p = $p -replace '^\\\?\?\\',''
+    $p = $p -replace '^\\SystemRoot', $env:SystemRoot
+    if ($p -match '^System32\\') { $p = Join-Path $env:SystemRoot $p }
+    return $p
+}
+
+function Get-TaskActionsText($Task) {
+    # Returns $null when any action has no Execute (ComHandler and other non-Exec
+    # actions cannot be matched or removed by this workflow).
+    if (-not $Task.PSObject.Properties['Actions'] -or $null -eq $Task.Actions) { return $null }
+    $parts = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($action in @($Task.Actions)) {
+        if ($null -eq $action -or -not $action.PSObject.Properties['Execute']) { return $null }
+        $execute = [string]$action.Execute
+        $arguments = if ($action.PSObject.Properties['Arguments']) { [string]$action.Arguments } else { '' }
+        $parts.Add($execute + ' ' + $arguments)
+    }
+    return ($parts -join ' ; ')
+}
+
+function Remove-PlannedTask($Entry, [bool]$Preview) {
+    $found = @(Get-ScheduledTask | Where-Object { $_.TaskPath -eq $Entry.path -and $_.TaskName -eq $Entry.name })
+    if (-not $found.Count) { Write-Host 'Already absent'; return }
+    $actions = Get-TaskActionsText $found[0]
+    if ($null -eq $actions) { throw 'Task uses non-Exec actions; remove manually after review' }
+    if ($actions -cne $Entry.expectedActions) { throw "Task actions changed: $actions" }
+    if ($Preview) { Write-Host "[would] remove task $actions"; return }
+    $xml = Export-ScheduledTask -TaskPath $Entry.path -TaskName $Entry.name
+    if ([string]::IsNullOrWhiteSpace($xml)) { throw 'Task XML export empty; deletion blocked' }
+    $parsed = $null
+    try { $parsed = [xml]$xml } catch { throw 'Task XML export unparsable; deletion blocked' }
+    if ($null -eq $parsed.DocumentElement -or $parsed.DocumentElement.LocalName -ne 'Task' -or
+        $parsed.DocumentElement.ChildNodes.Count -eq 0) {
+        throw 'Task XML export has no Task body; deletion blocked'
+    }
+    $file = Join-Path $script:RunDir ('task-' + [guid]::NewGuid().ToString('N') + '.xml')
+    [IO.File]::WriteAllText($file, $xml, [Text.Encoding]::Unicode)
+    if (-not (Test-Path -LiteralPath $file) -or (Get-Item -LiteralPath $file).Length -eq 0) {
+        throw 'Task XML backup empty; deletion blocked'
+    }
+    [IO.File]::AppendAllText((Join-Path $script:RunDir 'backup-index.txt'), "$file`t$($Entry.path)$($Entry.name)`r`n", [Text.Encoding]::UTF8)
+    Mark-Mutation
+    Unregister-ScheduledTask -TaskPath $Entry.path -TaskName $Entry.name -Confirm:$false
+    if (@(Get-ScheduledTask | Where-Object { $_.TaskPath -eq $Entry.path -and $_.TaskName -eq $Entry.name }).Count) { throw 'Task remains' }
+}
+
+function Write-TextFile([string]$Path, [string]$Text) {
+    # Write beside the target and swap; a partial write never replaces the old file.
+    $tmp = Join-Path (Split-Path -Parent $Path) ('tmp-' + [guid]::NewGuid().ToString('N') + '.tmp')
+    [IO.File]::WriteAllText($tmp, $Text, (New-Object Text.UTF8Encoding $false))
+    if (Test-Path -LiteralPath $Path) {
+        try { [IO.File]::Replace($tmp, $Path, [NullString]::Value); return }
+        catch { [IO.File]::Delete($Path) }
+    }
+    [IO.File]::Move($tmp, $Path)
+}
+
 function Start-CaseRun([string]$CaseDir, [string]$Stage, [string]$PlanPath) {
     $dir = Join-Path $CaseDir ($Stage + '-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '-' + [guid]::NewGuid().ToString('N').Substring(0,8))
     [void](New-Item -ItemType Directory -Path $dir -Force)
@@ -231,8 +297,8 @@ function Mark-Mutation {
         userSid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value;
         stage=$script:RunStage;runId=(Split-Path $script:RunDir -Leaf);planHash=$script:PlanHash;
         updatedAt=[DateTimeOffset]::UtcNow.ToString('o')}
-    [IO.File]::WriteAllText((Join-Path $script:CaseRoot 'last-mutation.json'),
-        ($marker | ConvertTo-Json), [Text.Encoding]::UTF8)
+    $text = $marker | ConvertTo-Json
+    Write-TextFile (Join-Path $script:CaseRoot 'last-mutation.json') $text
     $script:MutationAttempted = $true
 }
 
@@ -298,6 +364,11 @@ function Backup-Reg([string]$Path) {
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $file) -or (Get-Item -LiteralPath $file).Length -eq 0) {
         throw "Backup failed; mutation blocked: $Path $output"
     }
+    $header = ''
+    try { $header = [string](Get-Content -LiteralPath $file -TotalCount 1 -ErrorAction Stop) } catch { }
+    if ($header -notmatch 'Windows Registry Editor|REGEDIT4') {
+        throw "Backup is not a registry export; mutation blocked: $Path"
+    }
     [IO.File]::AppendAllText((Join-Path $script:RunDir 'backup-index.txt'), "$file`t$Path`r`n", [Text.Encoding]::UTF8)
 }
 
@@ -315,7 +386,7 @@ function Finish-CaseRun([string]$Stage, [bool]$DryRun = $false, [bool]$RebootReq
     $summary = [pscustomobject]@{stage=$Stage;dryRun=$DryRun;rebootRequired=$RebootRequired;verificationPhase=$script:VerificationPhase;
         planHash=$script:PlanHash;computer=$env:COMPUTERNAME;userSid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value;
         errors=$bad;skipped=$skipped;results=@($script:Results.ToArray());time=(Get-Date).ToString('o')}
-    [IO.File]::WriteAllText((Join-Path $script:RunDir 'results.json'), ($summary | ConvertTo-Json -Depth 12), [Text.Encoding]::UTF8)
+    Write-TextFile (Join-Path $script:RunDir 'results.json') ($summary | ConvertTo-Json -Depth 12)
     Stop-Transcript | Out-Null
     Write-Host "Results: $script:RunDir"
     if ($bad) { return 1 }

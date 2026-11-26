@@ -49,6 +49,34 @@ E05：§10.5 记载 NStore 随后下载了腾讯签名的正版 WeMeet 安装文
 
 指纹仅用于样本比对；版本变化后不能用未命中排除推广行为。
 
+## 补充案例索引
+
+以下记录只用于说明判据来源，不是其他机器的处置授权。日期为案件归档日。
+
+### 2026-10 推广链（NStore / 鲁大师）
+
+报告中的产品候选包括 WinClean、MasterPDF、AnyWhere、ProZip、EasyClean、OmniImage、CleanCut、AIBiZhi、TaskbarFX、ZipGo、YqdWxClean；守护对象包括 FolderGlance、SysMate、GHallProtect、LudashiProtect、ProtectFilter、ExtensionProtect；配置项包括 lockhomepage、StarGatherAge、DeskIcon{GUID}、keytask。核对下载链、共享签名证书描述、siteid=2105 / VendorID=byimp_2105、原始 ImagePath、ServiceDll 与组成员。正式采集以本机实际路径、签名和版本为准，不把这些名称复制成通用删除正则。
+
+### 2026-11-06 卸载后驱动仍在运行
+
+某机卸载 360 后，6 个驱动仍处于运行状态而注册键已缺失，WMI 仍能枚举到停止中的对象。由此确定复核必须枚举运行中的服务/驱动并核对注册与文件，不能只看注册表。
+
+同案发现下载器把文件投放到系统盘之外的盘符（F:\360Downloads 一类），因此时间线采集必须覆盖非系统盘。
+
+### 2026-11-11 注册表残留检索
+
+某机靠 `reg query /f <词> /s` 在 HKCU\SOFTWARE 中额外找到两个按目录和卸载项遗漏的残留键；该方式成为删后收口复查的标准步骤。
+
+### 2026-11-17 卸载器缺失与 ComHandler 任务
+
+某影视软件的 unins000.exe 已缺失，按“文件清单 + 签名 + SHA256 + 注册表备份”留证后手工清除，没有另找绿色卸载入口。同案复核扫描 146 个内置任务，其中 79 个是 ComHandler 动作（无 Execute 属性），直接取属性会让整轮扫描报 ERROR，因此引入按动作类型防御式读取。
+
+### 2026-11-26 安全软件残留与办公软件共享组件
+
+某内网 Windows 7 主机（PowerShell 2.0，仅 WinRM 可达）残留 360 推广组件、猎豹浏览器驱动与用户数据、金山毒霸/卫士注册表与数据目录，WPS 与毒霸共用 `Kingsoft` 注册表根和 `ProgramData\kingsoft` 目录。处置按所有者拆分：`Antivirus`、`antivirus`、`kwspriEx`、`KISCommon`、`KISWsc`、`liebaocopy`、`KBROWSER` 及 `duba/kis/nse/kdata/kdesk/KSafeCommon/KIS` 等目录判为毒霸/卫士；`Office`、`wpscloud`、`KVip`、`PDF` 与两处 `office6` 判为 WPS 并逐项复核保留。归属不清的键值（`nemesis`、`kintranetauthsdk`、`kfp`、`Logger` 等）不删。
+
+本案还确认：PowerShell 2.0 目标不能用完整采集器（`Get-CimInstance`、`Get-ScheduledTask`、`ConvertTo-Json`、`Get-FileHash` 均不可用），改用 WMI、任务 XML 与单文本输出；WinRM 会话里 `Shell.Application` 压缩会挂起，备份按文件取回并在分析机计算哈希；`robocopy` 退出码 1 表示已复制；`sc delete` 删除驱动后注册键可能仍在，需要补删。
+
 ## 沉淀到技能的经验
 
 优先还原下载链和多渠道时间线；采集系统宿主服务及驱动，不能按系统目录排除；持久化既有服务/驱动，也有任务、COM、菜单、浏览器和推广快捷方式。清单必须从现场证据生成，自保护处置、重启和卸载顺序按实际状态选择，最终结论依赖清理后的范围复核。

@@ -63,6 +63,7 @@ $script:AcquisitionErrors = New-Object 'System.Collections.Generic.List[string]'
 $script:ItemErrors = New-Object 'System.Collections.Generic.List[string]'
 $script:HashCache = @{}
 $script:ResumeSkip = @()
+$script:SectionTruncated = $false
 $Error.Clear()
 # PowerShell names are case-insensitive: never reuse 'EvidenceBuf' as a loop variable.
 $script:EvidenceBuf = New-Object System.Collections.Generic.List[string]
@@ -74,11 +75,58 @@ function Get-PropText($Object,[string]$Name){
   if($null -ne $Object -and $Object.PSObject.Properties[$Name]){ return [string]$Object.$Name }
   return '(absent)'
 }
+function Get-ConfigValue([string]$Name,$Default=$null){
+  $variable=Get-Variable -Name $Name -Scope Script -ErrorAction Ignore
+  if($variable){ return $variable.Value }
+  return $Default
+}
+function Get-CollectorParameters {
+  # The exact acquisition scope. Resume refuses a changed parameter set.
+  [pscustomobject]@{
+    pupPattern=[string](Get-ConfigValue 'PupPattern' '')
+    dnsPattern=[string](Get-ConfigValue 'DnsPattern' '')
+    probeSeconds=[int](Get-ConfigValue 'ProbeSeconds' 0)
+    maxEntries=[int](Get-ConfigValue 'MaxEntries' 0)
+    maxRecords=[int](Get-ConfigValue 'MaxRecords' 0)
+    maxHashFiles=[int](Get-ConfigValue 'MaxHashFiles' 0)
+    maxHashBytes=[long](Get-ConfigValue 'MaxHashBytes' 0)
+    maxTextBytes=[int](Get-ConfigValue 'MaxTextBytes' 0)
+    maxShimBytes=[int](Get-ConfigValue 'MaxShimBytes' 0)
+    maxSruBytes=[long](Get-ConfigValue 'MaxSruBytes' 0)
+    skipHashes=[bool](Get-ConfigValue 'SkipHashes' $false)
+    skipSruDatabase=[bool](Get-ConfigValue 'SkipSruDatabase' $false)
+    collectTempFootprint=[bool](Get-ConfigValue 'CollectTempFootprint' $false)
+    collectToolLogs=[bool](Get-ConfigValue 'CollectToolLogs' $false)
+    collectTimelineBuckets=[bool](Get-ConfigValue 'CollectTimelineBuckets' $false)
+    tempRoots=[string[]]@(Get-ConfigValue 'TempRoots' @() | ForEach-Object { [string]$_ })
+    toolLogPaths=[string[]]@(Get-ConfigValue 'ToolLogPaths' @() | ForEach-Object { [string]$_ })
+    candidateConfigFiles=[string[]]@(Get-ConfigValue 'CandidateConfigFiles' @() | ForEach-Object { [string]$_ })
+  }
+}
+function Write-TextAtomic([string]$Path,[string]$Text){
+  # A reader never sees a partially written JSON file. Returns $false on failure;
+  # callers must not treat an unwritten artifact as evidence.
+  $tmp=Join-Path (Split-Path -Parent $Path) ('tmp-' + [guid]::NewGuid().ToString('N') + '.tmp')
+  try {
+    [IO.File]::WriteAllText($tmp,$Text,[Text.Encoding]::UTF8)
+    if(Test-Path -LiteralPath $Path){
+      try { [IO.File]::Replace($tmp,$Path,[NullString]::Value); return $true }
+      catch { [IO.File]::Delete($Path) }
+    }
+    [IO.File]::Move($tmp,$Path)
+    return $true
+  } catch { return $false }
+}
 function Add-ItemError([string]$Item,[string]$Message){
   # Per-item failures are recorded in the section but do not fail the whole section.
   $script:ItemErrors.Add(('{0}: {1}' -f $Item,$Message))
   W ('# ITEM ERROR: {0}: {1}' -f $Item,$Message)
   if($Error.Count -gt 0){ $Error.RemoveAt(0) }
+}
+function Add-Truncation([string]$Item,[string]$Message){
+  # A budget hit is a coverage gap: record it and make the section PARTIAL.
+  $script:SectionTruncated=$true
+  Add-ItemError $Item $Message
 }
 function Get-ResumeFlag {
   $variable=Get-Variable -Name ResumeActive -Scope Script -ErrorAction Ignore
@@ -105,7 +153,7 @@ function Get-EvidenceHashList {
   $cacheVariable=Get-Variable -Name HashCache -Scope Script -ErrorAction Ignore
   $cache=@{}
   if($cacheVariable -and $cacheVariable.Value){ $cache=$cacheVariable.Value }
-  @(Get-ChildItem -LiteralPath $OutDir -File -Recurse | Where-Object { $_.Extension -ne '.tmp' -and $_.Name -ne 'evidence-hashes.json' } | ForEach-Object {
+  @(Get-ChildItem -LiteralPath $OutDir -File -Recurse | Where-Object { $_.Extension -ne '.tmp' -and $_.Name -notin @('evidence-hashes.json','collection-status.json','collection-done.json') } | ForEach-Object {
     $key=$_.FullName
     $stamp=('{0}|{1}' -f $_.Length,$_.LastWriteTimeUtc.Ticks)
     $cached=$cache[$key]
@@ -124,21 +172,16 @@ function Get-EvidenceHashList {
   Set-Variable -Name HashCache -Value $cache -Scope Script
 }
 function Write-CollectionState([bool]$Complete){
-  if(-not $OutDir){ return }
+  if(-not $OutDir){ return 0 }
+  $parameters=Get-CollectorParameters
+  # Hash first: the status must not say complete when a hash could not be computed,
+  # and the DONE marker is written only after both files are durable.
+  $hashes=@(Get-EvidenceHashList)
+  $hashErrors=@($hashes | Where-Object { [string]$_.sha256 -like '(hash-failed*' }).Count
   $startedVariable=Get-Variable -Name StartedAt -Scope Script -ErrorAction Ignore
   $startedValue=if($startedVariable){$startedVariable.Value}else{$null}
-  $pupVariable=Get-Variable -Name PupPattern -Scope Script -ErrorAction Ignore
-  $pupValue=if($pupVariable){$pupVariable.Value}else{''}
-  $dnsVariable=Get-Variable -Name DnsPattern -Scope Script -ErrorAction Ignore
-  $dnsValue=if($dnsVariable){$dnsVariable.Value}else{''}
-  $probeVariable=Get-Variable -Name ProbeSeconds -Scope Script -ErrorAction Ignore
-  $probeValue=if($probeVariable){$probeVariable.Value}else{0}
-  $entriesVariable=Get-Variable -Name MaxEntries -Scope Script -ErrorAction Ignore
-  $entriesValue=if($entriesVariable){$entriesVariable.Value}else{0}
-  $recordsVariable=Get-Variable -Name MaxRecords -Scope Script -ErrorAction Ignore
-  $recordsValue=if($recordsVariable){$recordsVariable.Value}else{0}
   $resumeVariable=Get-Variable -Name ResumeActive -Scope Script -ErrorAction Ignore
-  $resumeValue=if($resumeVariable){$resumeVariable.Value}else{$false}
+  $resumeValue=if($resumeVariable){[bool]$resumeVariable.Value}else{$false}
   $skipVariable=Get-Variable -Name ResumeSkip -Scope Script -ErrorAction Ignore
   $skipValue=if($skipVariable){$skipVariable.Value}else{@()}
   # Build the typed array outside the object literal: $( ... ) over an empty array is
@@ -151,20 +194,31 @@ function Write-CollectionState([bool]$Complete){
     userSid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     powershell=$PSVersionTable.PSVersion.ToString();is64Bit=[Environment]::Is64BitProcess
     elevated=([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-    pupPattern=$pupValue;dnsPattern=$dnsValue
-    probeSeconds=$probeValue;maxEntries=$entriesValue;maxRecords=$recordsValue
-    complete=$Complete;resumed=[bool]$resumeValue
+    pupPattern=$parameters.pupPattern;dnsPattern=$parameters.dnsPattern
+    probeSeconds=$parameters.probeSeconds;maxEntries=$parameters.maxEntries;maxRecords=$parameters.maxRecords
+    parameters=$parameters
+    complete=($Complete -and $hashErrors -eq 0);hashErrors=$hashErrors
+    resumed=[bool]$resumeValue
     resumeSkipped=$resumeSkipped
     sections=@($sections.ToArray())
     scope='Current identity and loaded hives only; browser/policies/unloaded profiles require manual review'
   }
-  [IO.File]::WriteAllText((Join-Path $OutDir 'collection-status.json'),($status|ConvertTo-Json -Depth 8),[Text.Encoding]::UTF8)
-  $hashes=@(Get-EvidenceHashList)
-  [IO.File]::WriteAllText((Join-Path $OutDir 'evidence-hashes.json'),($hashes|ConvertTo-Json -Depth 5),[Text.Encoding]::UTF8)
+  $hashesOk=Write-TextAtomic (Join-Path $OutDir 'evidence-hashes.json') ($hashes|ConvertTo-Json -Depth 5)
+  $statusOk=Write-TextAtomic (Join-Path $OutDir 'collection-status.json') ($status|ConvertTo-Json -Depth 8)
+  if(-not $hashesOk -or -not $statusOk){
+    [Console]::Error.WriteLine('Cannot persist collection state (status/hashes write failed)')
+    return -1
+  }
+  return $hashErrors
 }
 function Complete-Collection {
   $script:FinishedAt=(Get-Date).ToString('o')
-  Write-CollectionState $true
+  $hashErrors=Write-CollectionState $true
+  if($hashErrors -lt 0){ return 1 }
+  if($hashErrors -gt 0){
+    [Console]::Error.WriteLine('Evidence hashing failed for ' + $hashErrors + ' file(s); DONE marker not written')
+    return $hashErrors
+  }
   $done=[pscustomobject]@{complete=$true;startedAt=$script:StartedAt;finishedAt=$script:FinishedAt;
     computer=$env:COMPUTERNAME;userSid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     sections=@($sections.ToArray()).Count
@@ -172,8 +226,8 @@ function Complete-Collection {
     partial=@($sections|Where-Object status -eq 'PARTIAL').Count
     skipped=@($sections|Where-Object status -eq 'SKIP').Count
     resumed=[bool]$script:ResumeActive}
-  [IO.File]::WriteAllText((Join-Path $OutDir 'collection-done.json'),($done|ConvertTo-Json),[Text.Encoding]::UTF8)
-  Write-CollectionState $true
+  Write-TextAtomic (Join-Path $OutDir 'collection-done.json') ($done|ConvertTo-Json)
+  return 0
 }
 function Get-ResumePlan([string]$Path){
   # Returns {refused, skip, sections}; throwing is unreliable under ErrorActionPreference=SilentlyContinue.
@@ -185,14 +239,47 @@ function Get-ResumePlan([string]$Path){
     return [pscustomobject]@{refused='no-status';skip=@();sections=@()}
   }
   $previous=[IO.File]::ReadAllText($statusPath,[Text.Encoding]::UTF8)|ConvertFrom-Json
+  # Bind the batch identity and the full acquisition scope. A different machine,
+  # account, pattern, budget or optional path set is a different batch.
+  $prevComputer=''; if($null -ne $previous -and $previous.PSObject.Properties['computer']){ $prevComputer=[string]$previous.computer }
+  $prevSid=''; if($null -ne $previous -and $previous.PSObject.Properties['userSid']){ $prevSid=[string]$previous.userSid }
+  $currentSid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+  if($prevComputer -ne $env:COMPUTERNAME -or $prevSid -ne $currentSid){
+    return [pscustomobject]@{refused='identity';skip=@();sections=@()}
+  }
+  if($null -eq $previous -or -not $previous.PSObject.Properties['parameters']){
+    return [pscustomobject]@{refused='no-parameters';skip=@();sections=@()}
+  }
+  $now=Get-CollectorParameters
+  if(($now|ConvertTo-Json -Compress) -cne ($previous.parameters|ConvertTo-Json -Compress)){
+    return [pscustomobject]@{refused='parameters';skip=@();sections=@()}
+  }
+  $hashesPath=Join-Path $Path 'evidence-hashes.json'
+  if(-not (Test-Path -LiteralPath $hashesPath)){
+    return [pscustomobject]@{refused='no-hashes';skip=@();sections=@()}
+  }
+  $hashMap=@{}
+  $hashRecords=[IO.File]::ReadAllText($hashesPath,[Text.Encoding]::UTF8)|ConvertFrom-Json
+  foreach($record in @($hashRecords)){
+    if($record -and $record.PSObject.Properties['file']){
+      $hashMap[[string]$record.file]=[string]$record.sha256
+    }
+  }
   $skip=@(); $kept=@()
   foreach($entry in @($previous.sections)){
     $file=[string]$entry.file
     if(-not $file){ continue }
     $evidence=Join-Path $Path $file
-    if($entry.status -in @('PASS','PARTIAL','SKIP') -and (Test-Path -LiteralPath $evidence) -and (Get-Item -LiteralPath $evidence).Length -gt 0){
-      $skip+=$file; $kept+=$entry
-    }
+    if($entry.status -notin @('PASS','PARTIAL','SKIP')){ continue }
+    if(-not (Test-Path -LiteralPath $evidence) -or (Get-Item -LiteralPath $evidence).Length -le 0){ continue }
+    # Never reuse an artifact whose recorded hash is missing or no longer matches.
+    $expected=$hashMap[$file]
+    if(-not $expected -or $expected -like '(hash-failed*'){ continue }
+    $actual=''
+    try { $actual=(Get-FileHash -LiteralPath $evidence -Algorithm SHA256 -ErrorAction Stop).Hash }
+    catch { continue }
+    if($actual -ne $expected){ continue }
+    $skip+=$file; $kept+=$entry
   }
   return [pscustomobject]@{refused='';skip=[string[]]$skip;sections=@($kept)}
 }
@@ -218,10 +305,22 @@ function Save($name,[bool]$Enabled=$true,[string]$DataState='AUTO',$Details=$nul
   $failures = @($Error | Where-Object { $_.FullyQualifiedErrorId -notmatch '^(PathNotFound|ItemNotFound|GetContentReaderFileNotFoundError)' } | ForEach-Object { $_.ToString() }) + @($script:AcquisitionErrors.ToArray())
   $rows=@($script:EvidenceBuf|Where-Object { $_ -and -not $_.StartsWith('#') }).Count
   if(-not $Enabled){$DataState='NOT_ENABLED'}elseif($DataState -eq 'AUTO'){$DataState=if($rows){'COMPLETE'}else{'NO_MATCH'}}
+  $truncatedVariable=Get-Variable -Name SectionTruncated -Scope Script -ErrorAction Ignore
+  if($truncatedVariable -and $truncatedVariable.Value -and $DataState -ne 'ERROR' -and $Enabled){ $DataState='PARTIAL' }
   $status = if($failures.Count -or $DataState -eq 'ERROR'){'ERROR'}elseif(-not $Enabled){'SKIP'}elseif($DataState -eq 'PARTIAL'){'PARTIAL'}else{'PASS'}
   W "# COLLECTION STATUS: $status (means acquisition succeeded, not clean)"
   foreach($failure in $failures){ W "# ERROR: $failure" }
-  [IO.File]::WriteAllText($writeTarget, ($script:EvidenceBuf -join "`r`n"), [Text.Encoding]::UTF8)
+  # Write the section artifact; a failed write makes the section ERROR.
+  $writer=Get-Command -Name Write-TextAtomic -CommandType Function -ErrorAction Ignore
+  if($writer){ $written=Write-TextAtomic $writeTarget ($script:EvidenceBuf -join "`r`n") }
+  else {
+    $written=$false
+    try { [IO.File]::WriteAllText($writeTarget, ($script:EvidenceBuf -join "`r`n"), [Text.Encoding]::UTF8); $written=$true } catch { }
+  }
+  if(-not $written){
+    $failures=@($failures) + ('Evidence write failed: ' + $writeTarget)
+    $status='ERROR'
+  }
   $itemErrorsVariable=Get-Variable -Name ItemErrors -Scope Script -ErrorAction Ignore
   # [string[]] over an empty array is $null in PowerShell; build an explicit empty array.
   $itemErrors=[string[]]::new(0)
@@ -232,6 +331,8 @@ function Save($name,[bool]$Enabled=$true,[string]$DataState='AUTO',$Details=$nul
     details=$Details;itemErrors=$itemErrors;errors=$failures;time=(Get-Date).ToString('o')})
   $script:EvidenceBuf.Clear(); $script:AcquisitionErrors.Clear()
   if($itemErrorsVariable){ $itemErrorsVariable.Value.Clear() }
+  $truncatedVariable=Get-Variable -Name SectionTruncated -Scope Script -ErrorAction Ignore
+  if($truncatedVariable){ $truncatedVariable.Value=$false }
   $Error.Clear()
   # Persist status and hashes immediately so a killed run leaves resumable state.
   # (Legacy unit tests extract Save alone; skip when the writer is not loaded.)
@@ -312,6 +413,7 @@ function Add-FilterDriverState {
       foreach($line in $result.lines){ if([string]$line -match '\S'){ W ('fltmc ' + $command + ': ' + ([string]$line).Trim()) } }
     } else {
       W ('fltmc ' + $command + ': unavailable (exit ' + $result.code + ')')
+      Add-ItemError ('fltmc ' + $command) ('unavailable (exit ' + $result.code + ')')
     }
   }
 }
@@ -330,7 +432,9 @@ function Collect-Prefetch([string]$PrefetchDir,[int]$Limit){
   }
   $errorBaseline=$Error.Count
   try {
-    $files=@(Get-ChildItem -LiteralPath $PrefetchDir -File -ErrorAction Stop | Sort-Object LastWriteTime -Descending | Select-Object -First $Limit)
+    $all=@(Get-ChildItem -LiteralPath $PrefetchDir -File -ErrorAction Stop | Sort-Object LastWriteTime -Descending)
+    $files=@($all | Select-Object -First $Limit)
+    if($all.Count -gt $Limit){ Add-Truncation 'Prefetch' ('record limit reached: ' + $Limit) }
   } catch { $files=@(); Add-ItemError 'Prefetch' $_.Exception.Message; W ('(Prefetch read denied: ' + $_.Exception.Message + ')') }
   finally { while($Error.Count -gt $errorBaseline){ $Error.RemoveAt(0) } }
   if(-not $files.Count){ W '(no .pf files visible)' }
@@ -353,11 +457,15 @@ function Collect-ShimCache([string]$KeyPath,[string]$EvidenceDir,[int]$MaxBytes)
     $backupCommand=Get-Command -Name Backup-EvidenceFile -CommandType Function -ErrorAction Ignore
     $canWrite=if($backupCommand){ Backup-EvidenceFile $destination } else { -not (Test-Path -LiteralPath $destination) }
     if($canWrite){
-      [IO.File]::WriteAllBytes($destination,$blob)
-      W 'raw: execution-artifacts/appcompatcache.bin'
+      try {
+        [IO.File]::WriteAllBytes($destination,$blob)
+        if((Get-Item -LiteralPath $destination).Length -ne $blob.Length){ throw 'raw length mismatch' }
+        W 'raw: execution-artifacts/appcompatcache.bin'
+      } catch { Add-ItemError 'ShimCache' ('raw write failed: ' + $_.Exception.Message); W ('raw write failed: ' + $_.Exception.Message) }
     } else { W 'raw not preserved: existing appcompatcache.bin could not be backed up; refusing to overwrite' }
   } else {
     W ('raw not preserved: exceeds -MaxShimBytes (' + $MaxBytes + ')')
+    Add-Truncation 'ShimCache' 'raw not preserved: exceeds -MaxShimBytes'
   }
 }
 function Collect-Bam([string]$BaseKey,[int]$Limit){
@@ -375,7 +483,7 @@ function Collect-Bam([string]$BaseKey,[int]$Limit){
     finally { while($Error.Count -gt $errorBaseline){ $Error.RemoveAt(0) } }
     if(-not $key){ continue }
     foreach($valueName in @($key.GetValueNames())){
-      if($count -ge $Limit){ W ('(limit reached: ' + $Limit + ')'); return }
+      if($count -ge $Limit){ W ('(limit reached: ' + $Limit + ')'); Add-Truncation 'BAM' ('record limit reached: ' + $Limit); return }
       $errorBaseline=$Error.Count
       try {
         $value=$key.GetValue($valueName,$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
@@ -410,7 +518,7 @@ function Collect-SruDatabase([string]$DbPath,[long]$MaxBytes,[string]$EvidenceDi
   finally { while($Error.Count -gt $errorBaseline){ $Error.RemoveAt(0) } }
   if(-not $item){ return }
   W ('size=' + $item.Length + ' lastWrite=' + $item.LastWriteTime.ToString('o'))
-  if($item.Length -gt $MaxBytes){ W ('not copied: exceeds -MaxSruBytes (' + $MaxBytes + ')'); return }
+  if($item.Length -gt $MaxBytes){ W ('not copied: exceeds -MaxSruBytes (' + $MaxBytes + ')'); Add-Truncation 'SRUDB' 'raw not copied: exceeds -MaxSruBytes'; return }
   $directory=Join-Path $EvidenceDir 'execution-artifacts'
   [void](New-Item -ItemType Directory -Force -Path $directory)
   $destination=Join-Path $directory 'SRUDB.dat'
@@ -697,7 +805,11 @@ Save '08-injection.txt'
 if(-not (Test-Skip '09-network.txt')){
 W "# Network: DNS cache + connections of suspicious processes"
 $dnsEnabled=$DnsPattern -ne '(?!)';$tcpEnabled=$PupPattern -ne '(?!)'
-if($dnsEnabled){Invoke-EvidenceNative 'ipconfig.exe' @('/displaydns') | ForEach-Object { [string]$_ } | Where-Object { $_ -match $DnsPattern } | Select-Object -Unique | Select-Object -First 60 | ForEach-Object { W $_.Trim() }}
+if($dnsEnabled){
+  $dnsLines=@(Invoke-EvidenceNative 'ipconfig.exe' @('/displaydns') | ForEach-Object { [string]$_ } | Where-Object { $_ -match $DnsPattern } | Select-Object -Unique)
+  if($dnsLines.Count -gt 60){ Add-Truncation 'DNS' 'record limit reached: 60'; $dnsLines=@($dnsLines | Select-Object -First 60) }
+  foreach($line in $dnsLines){ W $line.Trim() }
+}
 if($tcpEnabled){
   $procs=Get-CimInstance Win32_Process | Where-Object { $_.Name -match $PupPattern -or $_.ExecutablePath -match $PupPattern }
   $pids=$procs.ProcessId
@@ -782,9 +894,11 @@ Save '16-security-status.txt'
 }
 
 Write-Host ("Forensics written to: " + $OutDir)
-Complete-Collection
+$hashErrors=Complete-Collection
 
+if($hashErrors -ne 0){ exit 1 }
 if(@($sections | Where-Object status -eq 'ERROR').Count){ exit 1 }
 if(@($sections | Where-Object status -eq 'PARTIAL').Count){ exit 2 }
 $elevated=([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if(-not $elevated){ Write-Warning 'Non-elevated collection is incomplete'; exit 2 }
+exit 0

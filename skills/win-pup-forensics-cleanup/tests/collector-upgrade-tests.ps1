@@ -10,11 +10,11 @@ function Get-ScriptFunction([string]$Name,[string]$ScriptFile='collect-forensics
     return [scriptblock]::Create($node.Extent.Text)
 }
 function Initialize-CollectorFixture([string[]]$Names) {
-    foreach ($name in $Names) { . (Get-ScriptFunction $name) }
+    foreach ($name in @('Get-ConfigValue','Get-CollectorParameters','Add-ItemError','Add-Truncation','Write-TextAtomic') + $Names) { . (Get-ScriptFunction $name) }
     $script:EvidenceBuf=New-Object 'System.Collections.Generic.List[string]'
     $script:ItemErrors=New-Object 'System.Collections.Generic.List[string]'
     $script:AcquisitionErrors=New-Object 'System.Collections.Generic.List[string]'
-    $script:ResumeSkip=@(); $script:ResumeActive=$false; $script:HashCache=@{}
+    $script:ResumeSkip=@(); $script:ResumeActive=$false; $script:HashCache=@{}; $script:SectionTruncated=$false
     $PupPattern='(?!)'; $DnsPattern='(?!)'; $ProbeSeconds=15; $MaxEntries=20000; $MaxRecords=2000
     $Error.Clear()
 }
@@ -45,26 +45,53 @@ Test-Case 'collector-persists-status-and-hashes-per-section' {
     Assert (Test-Path -LiteralPath (Join-Path $OutDir 'collection-done.json')) 'DONE marker missing after completion'
     $state=[IO.File]::ReadAllText((Join-Path $OutDir 'collection-status.json'))|ConvertFrom-Json
     Assert ($state.complete -eq $true) 'Final status not marked complete'
+    Assert ($state.hashErrors -eq 0 -and $null -ne $state.parameters) 'Status contract missing hashErrors/parameters'
     $hashes=[IO.File]::ReadAllText((Join-Path $OutDir 'evidence-hashes.json'))|ConvertFrom-Json
-    Assert (@($hashes|Where-Object file -eq 'collection-done.json').Count -eq 1) 'DONE marker not hashed'
+    # DONE is a marker, not evidence; it is written after the hash list on purpose.
+    Assert (@($hashes|Where-Object file -eq 'collection-done.json').Count -eq 0) 'DONE marker must not be hashed'
 }
 
-Test-Case 'resume-plan-skips-completed-sections-and-refuses-done' {
-    . Initialize-CollectorFixture @('Get-ResumePlan')
+Test-Case 'resume-plan-binds-identity-parameters-and-hashes' {
+    . Initialize-CollectorFixture @('Get-ResumePlan','Get-CollectorParameters','Get-ConfigValue')
     $dir=Join-Path $run 'resume'; [void](New-Item -ItemType Directory -Path $dir)
-    foreach($name in 'a.txt','b.txt','c.txt'){ [IO.File]::WriteAllText((Join-Path $dir $name),'fixture') }
-    $state=[pscustomobject]@{complete=$false;sections=@(
-        [pscustomobject]@{file='a.txt';status='PASS'},
-        [pscustomobject]@{file='b.txt';status='ERROR'},
-        [pscustomobject]@{file='c.txt';status='SKIP'},
-        [pscustomobject]@{file='d.txt';status='PASS'})}
-    [IO.File]::WriteAllText((Join-Path $dir 'collection-status.json'),($state|ConvertTo-Json -Depth 6),[Text.Encoding]::UTF8)
+    foreach($name in 'a.txt','b.txt','c.txt'){ [IO.File]::WriteAllText((Join-Path $dir $name),('fixture-'+$name)) }
+    $hashItems=@(foreach($name in 'a.txt','b.txt','c.txt'){
+        [pscustomobject]@{file=$name;sha256=(Get-FileHash -LiteralPath (Join-Path $dir $name) -Algorithm SHA256).Hash}})
+    [IO.File]::WriteAllText((Join-Path $dir 'evidence-hashes.json'),($hashItems|ConvertTo-Json -Depth 4),[Text.Encoding]::UTF8)
+    $state=[pscustomobject]@{complete=$false;computer=$env:COMPUTERNAME
+        userSid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        parameters=(Get-CollectorParameters)
+        sections=@(
+            [pscustomobject]@{file='a.txt';status='PASS'},
+            [pscustomobject]@{file='b.txt';status='ERROR'},
+            [pscustomobject]@{file='c.txt';status='SKIP'},
+            [pscustomobject]@{file='d.txt';status='PASS'})}
+    $statusPath=Join-Path $dir 'collection-status.json'
+    [IO.File]::WriteAllText($statusPath,($state|ConvertTo-Json -Depth 8),[Text.Encoding]::UTF8)
     $plan=Get-ResumePlan $dir
     Assert (-not $plan.refused -and (@($plan.skip) -join ',') -eq 'a.txt,c.txt') ('Unexpected resume skip list: ' + (@($plan.skip) -join ','))
     Assert (@($plan.sections).Count -eq 2) 'Previous section records not restored'
+    # A kept artifact whose hash changed must be re-collected, not silently reused.
+    [IO.File]::WriteAllText((Join-Path $dir 'c.txt'),'rewritten')
+    $plan=Get-ResumePlan $dir
+    Assert ((@($plan.skip) -join ',') -eq 'a.txt') 'Changed artifact reused'
+    # Identity and parameter changes make it a different batch.
+    $state.computer='OTHER-COMPUTER'
+    [IO.File]::WriteAllText($statusPath,($state|ConvertTo-Json -Depth 8),[Text.Encoding]::UTF8)
+    Assert ((Get-ResumePlan $dir).refused -eq 'identity') 'Identity change not refused'
+    $state.computer=$env:COMPUTERNAME
+    $originalPup=$state.parameters.pupPattern
+    $state.parameters.pupPattern='OtherPattern'
+    [IO.File]::WriteAllText($statusPath,($state|ConvertTo-Json -Depth 8),[Text.Encoding]::UTF8)
+    Assert ((Get-ResumePlan $dir).refused -eq 'parameters') 'Parameter change not refused'
+    $state.parameters.pupPattern=$originalPup
+    [IO.File]::WriteAllText($statusPath,($state|ConvertTo-Json -Depth 8),[Text.Encoding]::UTF8)
+    Remove-Item -LiteralPath (Join-Path $dir 'evidence-hashes.json')
+    Assert ((Get-ResumePlan $dir).refused -eq 'no-hashes') 'Missing hash list not refused'
+    [IO.File]::WriteAllText((Join-Path $dir 'evidence-hashes.json'),($hashItems|ConvertTo-Json -Depth 4),[Text.Encoding]::UTF8)
     [IO.File]::WriteAllText((Join-Path $dir 'collection-done.json'),'{"complete":true}')
     Assert ((Get-ResumePlan $dir).refused -eq 'completed') 'Completed collection not refused'
-    Remove-Item -LiteralPath (Join-Path $dir 'collection-status.json')
+    Remove-Item -LiteralPath $statusPath
     [IO.File]::Delete((Join-Path $dir 'collection-done.json'))
     Assert ((Get-ResumePlan $dir).refused -eq 'no-status') 'Missing status not refused'
 }
@@ -207,7 +234,7 @@ Test-Case 'security-status-tolerates-missing-security-center' {
 }
 
 Test-Case 'filter-driver-state-collected-and-failure-is-item-level' {
-    . Initialize-CollectorFixture @('W','Invoke-NativeText','Add-FilterDriverState')
+    . Initialize-CollectorFixture @('W','Invoke-NativeText','Add-ItemError','Add-FilterDriverState')
     function Invoke-NativeText { param([string]$Command,[string[]]$Arguments)
         return [pscustomobject]@{ok=$true;code=0;lines=@('Filter Name                     Num Instances','FileInfo                       3')} }
     Add-FilterDriverState
@@ -221,6 +248,7 @@ Test-Case 'filter-driver-state-collected-and-failure-is-item-level' {
     $text=$script:EvidenceBuf -join "`n"
     Assert ($text.Contains('fltmc filters: unavailable (exit 1)')) 'fltmc failure not recorded'
     Assert ($script:AcquisitionErrors.Count -eq 0) 'fltmc failure escalated to a section error'
+    Assert ($script:ItemErrors.Count -gt 0) 'fltmc failure not recorded as an item error'
 }
 
 

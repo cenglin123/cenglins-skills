@@ -61,6 +61,44 @@ foreach ($entry in @(Get-Field $plan 'services' @()) + @(Get-Field $plan 'driver
         }
     }
 }
+# Orphan/zombie shape across ALL running services and drivers: registration key gone
+# or its binary missing. Unresolvable paths are ERROR, never PASS.
+$orphanProblems = New-Object 'System.Collections.Generic.List[string]'
+$orphanUnknown = New-Object 'System.Collections.Generic.List[string]'
+foreach ($className in @('Win32_Service','Win32_SystemDriver')) {
+    try {
+        foreach ($running in @(Get-CimInstance $className | Where-Object { $_.State -eq 'Running' })) {
+            $name = [string]$running.Name
+            try {
+                $key = "HKLM:\SYSTEM\CurrentControlSet\Services\$name"
+                if (-not (Test-Path -LiteralPath $key)) { $orphanProblems.Add("$className ${name}: registration key missing"); continue }
+                $raw = [string](Get-Item -LiteralPath $key).GetValue('ImagePath', $null,
+                    [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                if ([string]::IsNullOrWhiteSpace($raw)) { $orphanUnknown.Add("$className ${name}: ImagePath unavailable"); continue }
+                $binary = Get-BinaryPath $raw
+                if ($binary -notmatch '^[A-Za-z]:\\') { $orphanUnknown.Add("$className ${name}: unresolved path $raw"); continue }
+                if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) { $orphanProblems.Add("$className ${name}: file missing $binary"); continue }
+                if ($className -eq 'Win32_Service' -and (Split-Path -Leaf $binary) -ieq 'svchost.exe') {
+                    # Hosted service: the service key may carry ServiceDll directly or under Parameters.
+                    $dll = [string](Get-Item -LiteralPath $key).GetValue('ServiceDll', $null,
+                        [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                    $parameters = Join-Path $key 'Parameters'
+                    if (-not $dll -and (Test-Path -LiteralPath $parameters)) {
+                        $dll = [string](Get-Item -LiteralPath $parameters).GetValue('ServiceDll', $null,
+                            [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                    }
+                    if (-not $dll) { $orphanUnknown.Add("$className ${name}: ServiceDll unavailable"); continue }
+                    $dllPath = Get-BinaryPath $dll
+                    if ($dllPath -notmatch '^[A-Za-z]:\\') { $orphanUnknown.Add("$className ${name}: unresolved ServiceDll $dll"); continue }
+                    if (-not (Test-Path -LiteralPath $dllPath -PathType Leaf)) { $orphanProblems.Add("$className ${name}: ServiceDll missing $dllPath") }
+                }
+            } catch { $orphanUnknown.Add("$className ${name}: $($_.Exception.Message)") }
+        }
+    } catch { $orphanUnknown.Add("$className enumeration: $($_.Exception.Message)") }
+}
+if ($orphanProblems.Count) { Add-Result 'orphan:running-services-and-drivers' 'FAIL' ($orphanProblems -join '; ') }
+elseif ($orphanUnknown.Count) { Add-Result 'orphan:running-services-and-drivers' 'ERROR' ($orphanUnknown -join '; ') }
+else { Add-Result 'orphan:running-services-and-drivers' 'PASS' }
 foreach ($entry in @(Get-Field $plan 'tasks' @())) {
     Check-Surface "task:$($entry.path)$($entry.name)" {
         Get-ScheduledTask | Where-Object { $_.TaskPath -eq $entry.path -and $_.TaskName -eq $entry.name } |
