@@ -13,6 +13,7 @@
 - 新增 `scripts/collect-lite-ps2.ps1`：PowerShell 2.0 兼容的只读降级采集（WMI、任务 XML、单文本输出），供仅 WinRM 的目标使用。
 - 文档：清理案例日期与单机细节移入 `case-history.md`；备份范围改为“注册表/任务自动导出，目录与文件只记清单”；浏览器主页/搜索改为按变更前证据恢复；补充状态与退出码契约、baseline/final 两轮清单流程、备份保管与准删条件、示例 `expectedPath` 使用原始 ImagePath。
 - 回归：`tests/run-tests.ps1` 75 例在 Windows PowerShell 5.1.19041.7802 通过；新增嵌套根、任务独立处置、任务 XML 无效、PENDING 登记失败、孤儿服务、续采身份/参数/哈希、示例清单可加载等用例。
+- 发布：ZIP 内容通道；服务端版本号按上传递增，本版发布为 1.0.6。
 
 ## 2026-11-26 · 1.0.5（执行要点补强）
 
